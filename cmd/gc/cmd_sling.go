@@ -2032,6 +2032,7 @@ func rigPrefixForAgent(a config.Agent, cfg *config.City) string {
 // checkCrossRig returns a non-empty error message if a bead's rig prefix
 // doesn't match the target agent's rig prefix. Returns "" when the check
 // passes or can't be performed (missing prefix, city-wide agent, no rig).
+// City-scope (HQ) beads are allowed to dispatch to any rig within the city.
 func checkCrossRig(beadID string, a config.Agent, cfg *config.City) string {
 	bp := sling.BeadPrefixForCity(cfg, beadID)
 	if bp == "" {
@@ -2042,6 +2043,11 @@ func checkCrossRig(beadID string, a config.Agent, cfg *config.City) string {
 		return ""
 	}
 	if bp == rp {
+		return ""
+	}
+	// City-scope (HQ prefix) beads can be dispatched to any rig-scoped agent
+	// because rigs are part of the city. Only cross-rig (rig A → rig B) is blocked.
+	if sling.IsHQPrefix(cfg, bp) {
 		return ""
 	}
 	return fmt.Sprintf("gc sling: cross-rig routing blocked — bead %s (prefix %q) targets %s (rig prefix %q); use --force to override",

@@ -972,6 +972,36 @@ func TestCheckCrossRigSling(t *testing.T) {
 			t.Errorf("expected no warning, got %q", msg)
 		}
 	})
+
+	t.Run("HQ prefix to rig agent allowed", func(t *testing.T) {
+		// City-scope beads (HQ prefix) should be dispatchable to any rig-scoped
+		// agent because rigs are part of the city.
+		cfgWithHQ := &config.City{
+			Workspace: config.Workspace{Name: "proving-grounds", Prefix: "pg"},
+			Rigs: []config.Rig{
+				{Name: "myrig", Path: "/myrig", Prefix: "pgt"},
+			},
+		}
+		a := config.Agent{Name: "worker", Dir: "myrig"}
+		if msg := CheckCrossRig("pg-42", a, cfgWithHQ); msg != "" {
+			t.Errorf("expected no warning for HQ bead to rig agent, got %q", msg)
+		}
+	})
+
+	t.Run("rig to different rig still blocked", func(t *testing.T) {
+		// Cross-rig routing (rig A to rig B) should still be blocked.
+		cfgWithHQ := &config.City{
+			Workspace: config.Workspace{Name: "proving-grounds", Prefix: "pg"},
+			Rigs: []config.Rig{
+				{Name: "rig-a", Path: "/rig-a", Prefix: "ra"},
+				{Name: "rig-b", Path: "/rig-b", Prefix: "rb"},
+			},
+		}
+		a := config.Agent{Name: "worker", Dir: "rig-b"}
+		if msg := CheckCrossRig("ra-42", a, cfgWithHQ); msg == "" {
+			t.Error("expected cross-rig warning for rig-a bead to rig-b agent")
+		}
+	})
 }
 
 // --- DoSling integration tests (structured result) ---
@@ -1135,6 +1165,30 @@ func TestDoSlingCrossRigBlocks(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Error("runner should not have been called")
+	}
+}
+
+func TestDoSlingHQPrefixToRigAgentAllowed(t *testing.T) {
+	// City-scope (HQ prefix) beads should route to rig-scoped agents without error.
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "proving-grounds", Prefix: "pg"},
+		Rigs: []config.Rig{
+			{Name: "myrig", Path: "/myrig", Prefix: "pgt"},
+		},
+	}
+	a := config.Agent{Name: "worker", Dir: "myrig", MaxActiveSessions: intPtr(1)}
+
+	deps := testDeps(cfg, sp, runner.run)
+	deps.Store = seededStore("pg-42")
+	_, err := DoSling(testOpts(a, "pg-42"), deps, nil)
+
+	if err != nil {
+		t.Fatalf("expected HQ-prefix bead to route to rig agent without error, got: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Errorf("expected 1 runner call, got %d", len(runner.calls))
 	}
 }
 

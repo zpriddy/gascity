@@ -626,6 +626,8 @@ func (e *CrossRigError) Error() string {
 }
 
 // CrossRigRouteError returns a typed cross-rig error when routing is unsafe.
+// City-scope (HQ) beads are allowed to dispatch to any rig within the city
+// because the city is the parent scope of all rigs.
 func CrossRigRouteError(beadID string, a config.Agent, cfg *config.City) *CrossRigError {
 	if cfg == nil || a.Dir == "" {
 		return nil
@@ -639,6 +641,11 @@ func CrossRigRouteError(beadID string, a config.Agent, cfg *config.City) *CrossR
 		return nil
 	}
 	if strings.EqualFold(bp, rp) {
+		return nil
+	}
+	// City-scope (HQ prefix) beads can be dispatched to any rig-scoped agent
+	// because rigs are part of the city. Only cross-rig (rig A → rig B) is blocked.
+	if IsHQPrefix(cfg, bp) {
 		return nil
 	}
 	return &CrossRigError{
