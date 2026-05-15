@@ -160,6 +160,16 @@ func resolveSessionIDWithOptions(
 	} else if !errors.Is(err, session.ErrSessionNotFound) {
 		return "", err
 	}
+	// Fall back to title-based matching (path-alias): pool sessions surface
+	// their qualified agent name as the bead Title, which is the stable
+	// identifier operators use (e.g. "mayor", "my-rig/claude"). The API layer
+	// resolves these via resolveLiveSessionByPathAlias; wire the same logic
+	// for CLI commands like `gc mail send` and `gc session nudge`.
+	if id, ok, err := resolveLiveSessionByTitle(store, identifier); err != nil {
+		return "", err
+	} else if ok {
+		return id, nil
+	}
 	if opts.allowClosed {
 		if cfg != nil {
 			cityName := config.EffectiveCityName(cfg, filepath.Base(cityPath))
@@ -212,4 +222,55 @@ func resolveOpenQualifiedAliasBasename(store beads.Store, identifier string) (st
 		}
 		return "", fmt.Errorf("%w: %q matches %d sessions: %s", session.ErrAmbiguous, identifier, len(matches), strings.Join(labels, ", "))
 	}
+}
+
+// resolveLiveSessionByTitle matches identifier against the Title of an active
+// pool-session bead. Pool sessions surface their qualified agent name as the
+// bead Title (the same string `gc session list` shows under TARGET/TITLE).
+// Their session_name is a synthetic internal ID (s-gc-NNN) invisible to
+// session.ResolveSessionID's session_name/alias indexes.
+//
+// State filter: active, awake, and empty (legacy none) states match.
+// Configured named-session beads are skipped so the named-session resolver
+// chain still owns those identifiers.
+//
+// On duplicate matching Titles (rare misconfiguration), the most recently
+// created bead wins.
+func resolveLiveSessionByTitle(store beads.Store, identifier string) (string, bool, error) {
+	if store == nil {
+		return "", false, nil
+	}
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return "", false, nil
+	}
+	all, err := store.List(beads.ListQuery{Label: session.LabelSession})
+	if err != nil {
+		return "", false, fmt.Errorf("resolveLiveSessionByTitle: listing sessions: %w", err)
+	}
+	var best beads.Bead
+	found := false
+	for _, b := range all {
+		if !session.IsSessionBeadOrRepairable(b) {
+			continue
+		}
+		if session.IsNamedSessionBead(b) {
+			continue
+		}
+		if strings.TrimSpace(b.Title) != identifier {
+			continue
+		}
+		state := session.State(b.Metadata["state"])
+		if state != session.StateActive && state != session.StateAsleep && state != session.StateNone {
+			continue
+		}
+		if !found || b.CreatedAt.After(best.CreatedAt) {
+			best = b
+			found = true
+		}
+	}
+	if !found {
+		return "", false, nil
+	}
+	return best.ID, true, nil
 }
