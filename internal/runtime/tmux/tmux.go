@@ -1416,6 +1416,14 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 	if err := client.write([]byte{'\r'}); err != nil {
 		return true, err
 	}
+	// Claude Code requires a second Enter to submit (first Enter ends the
+	// input line, second Enter on the empty line triggers submission).
+	if t.needsDoubleEnter(target) {
+		time.Sleep(100 * time.Millisecond)
+		if err := client.write([]byte{'\r'}); err != nil {
+			return true, err
+		}
+	}
 	return true, nil
 }
 
@@ -1493,6 +1501,10 @@ func (t *Tmux) pasteLiteralText(target, text string) error {
 // sendKeysLiteralWithRetry sends literal text to a tmux target, retrying on
 // transient errors (e.g., "not in a mode" during agent TUI startup).
 // This is the core retry loop used by both NudgeSession and NudgePane.
+//
+// For Claude Code targets with long messages (>256 chars), uses tmux
+// paste-buffer with bracketed paste for reliable delivery. Short messages
+// use send-keys -l which is faster for the common case.
 //
 // Returns nil on success, or the last error after all retries are exhausted.
 // Non-transient errors (session not found, no server) fail immediately.
@@ -1589,6 +1601,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	t.WakePaneIfDetached(session)
 
 	// 5. Send Enter with retry (critical for message submission)
+	doubleEnter := t.needsDoubleEnter(target)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -1598,7 +1611,17 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			lastErr = err
 			continue
 		}
-		// 6. Wake again so the submitted turn is processed promptly.
+		// 6. For Claude Code, send a second Enter to actually submit.
+		// Claude's input model treats the first Enter as ending the current
+		// line; a second Enter on the resulting empty line triggers submission.
+		if doubleEnter {
+			time.Sleep(100 * time.Millisecond)
+			if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		// 7. Wake again so the submitted turn is processed promptly.
 		t.WakePaneIfDetached(session)
 		return nil
 	}
@@ -1636,6 +1659,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	t.WakePaneIfDetached(pane)
 
 	// 5. Send Enter with retry (critical for message submission)
+	doubleEnterPane := t.needsDoubleEnter(pane)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -1645,7 +1669,16 @@ func (t *Tmux) NudgePane(pane, message string) error {
 			lastErr = err
 			continue
 		}
-		// 6. Wake again so the submitted turn is processed promptly.
+		// 6. For Claude Code, send a second Enter to actually submit.
+		// See NudgeSession for detailed rationale.
+		if doubleEnterPane {
+			time.Sleep(100 * time.Millisecond)
+			if _, err := t.run("send-keys", "-t", pane, "Enter"); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		// 7. Wake again so the submitted turn is processed promptly.
 		t.WakePaneIfDetached(pane)
 		return nil
 	}
@@ -1683,6 +1716,32 @@ func (t *Tmux) nudgeSubmitDebounce(target string) time.Duration {
 		return 1500 * time.Millisecond
 	}
 	return 500 * time.Millisecond
+}
+
+// needsDoubleEnter reports whether the target provider requires two Enter
+// presses to submit input. Based on testing (2026-05-12): Claude Code maps
+// Enter (CR/0x0D) directly to chat:submit and Ctrl+J (LF/0x0A) to chat:newline.
+// A single Enter ALWAYS submits. However, when send-keys -l delivers text with
+// embedded LFs, the cursor may be mid-line; the first Enter closes the line and
+// a second Enter on the resulting empty line triggers submission in some edge
+// cases. With paste-buffer -p (bracketed paste) this is unnecessary since paste
+// content is atomic and one Enter always submits.
+//
+// Keep double-Enter for non-paste delivery (short messages via send-keys -l)
+// as a safety margin. The paste-buffer path only needs one Enter.
+func (t *Tmux) needsDoubleEnter(target string) bool {
+	provider, err := t.GetEnvironment(target, "GC_PROVIDER")
+	if err == nil {
+		switch strings.TrimSpace(provider) {
+		case "claude":
+			return true
+		case "codex", "gemini", "opencode":
+			return false
+		default:
+			// Unrecognized provider — fall through to process-tree detection.
+		}
+	}
+	return t.targetLooksLikeProvider(target, "claude")
 }
 
 func (t *Tmux) targetLooksLikeProvider(target, provider string) bool {

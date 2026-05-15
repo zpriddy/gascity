@@ -26,6 +26,9 @@ func newInternalCmd(stdout, stderr io.Writer) *cobra.Command {
 	}
 	cmd.AddCommand(newInternalMaterializeSkillsCmd(stdout, stderr))
 	cmd.AddCommand(newInternalProjectMCPCmd(stdout, stderr))
+	cmd.AddCommand(newInternalCityWindowPaneCmd(stdout, stderr))
+	cmd.AddCommand(newInternalCityWindowMenuCmd(stdout, stderr))
+	cmd.AddCommand(newInternalCityWindowFocusCmd(stdout, stderr))
 	return cmd
 }
 
