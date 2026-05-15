@@ -133,7 +133,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		if err := managedDoltPreflightCleanupFn(cityPath); err != nil {
 			return report, err
 		}
-		if err := writeManagedDoltConfigFile(layout.ConfigFile, host, strconv.Itoa(currentPort), layout.DataDir, logLevel, archiveLevel); err != nil {
+		if err := writeManagedDoltConfigFile(layout.ConfigFile, host, strconv.Itoa(currentPort), layout.DataDir, logLevel, archiveLevel, cityPath); err != nil {
 			return report, err
 		}
 

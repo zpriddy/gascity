@@ -1463,6 +1463,24 @@ type DoltConfig struct {
 	// 1 enables archive compaction (higher CPU on startup).
 	// nil (omitted) defaults to 0.
 	ArchiveLevel *int `toml:"archive_level,omitempty" jsonschema:"default=0"`
+	// AutoGc controls whether Dolt's auto_gc behavior is enabled in the
+	// managed dolt-config.yaml. Accepted values:
+	//   "true" / "on" / "enabled"   → auto_gc_behavior.enable=true,
+	//                                  dolt_auto_gc_enabled="ON"
+	//   "false" / "off" / "disabled" → auto_gc_behavior.enable=false,
+	//                                   dolt_auto_gc_enabled="OFF"
+	// Empty (default) → "true". Override globally with env GC_DOLT_AUTO_GC.
+	// Note: dolt#10944's load-avg gate means upstream auto_gc may not fire
+	// in practice on busy machines; pair with `gc dolt compact` for
+	// guaranteed cleanup.
+	AutoGc string `toml:"auto_gc,omitempty" jsonschema:"default=true"`
+	// Autocommit controls Dolt's session-level autocommit behavior in the
+	// managed dolt-config.yaml. Accepted values:
+	//   "batch" / "off"   → behavior.autocommit=false (group writes, fewer
+	//                       commits — recommended for managed gas-city use)
+	//   "on" / "true"     → behavior.autocommit=true  (commit per statement)
+	// Empty (default) → "batch". Override globally with env GC_DOLT_AUTOCOMMIT.
+	Autocommit string `toml:"autocommit,omitempty" jsonschema:"default=batch"`
 }
 
 // FormulasConfig holds legacy formula directory settings.

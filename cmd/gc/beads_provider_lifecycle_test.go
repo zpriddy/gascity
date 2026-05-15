@@ -8976,7 +8976,7 @@ func TestManagedDoltConfigGoWriterMatchesShellFallbackSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	goConfigPath := filepath.Join(t.TempDir(), "go", "dolt-config.yaml")
-	if err := writeManagedDoltConfigFile(goConfigPath, "0.0.0.0", "3311", filepath.Join(cityPath, ".beads", "dolt"), "info", 0); err != nil {
+	if err := writeManagedDoltConfigFile(goConfigPath, "0.0.0.0", "3311", filepath.Join(cityPath, ".beads", "dolt"), "info", 0, cityPath); err != nil {
 		t.Fatalf("writeManagedDoltConfigFile: %v", err)
 	}
 

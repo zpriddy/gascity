@@ -2392,11 +2392,25 @@ type DoltConfigExpectedValue struct {
 // follows the same GC_DOLT_WAIT_TIMEOUT environment override as config
 // generation. Dynamic values such as data_dir are checked by DoltConfigCheck
 // because they depend on the inspected city path.
+//
+// Auto-gc and autocommit are configurable: their expected values follow the
+// same resolution chain as the writer (env → city.toml [dolt] → ~/.gc/dolt-config.yaml
+// → defaults). Pass cityPath="" for static defaults (auto_gc=true,
+// autocommit=false/batch).
 func DoltConfigExpectedValues() []DoltConfigExpectedValue {
+	return DoltConfigExpectedValuesForCity("")
+}
+
+// DoltConfigExpectedValuesForCity returns expected dolt-config.yaml values
+// after resolving auto_gc and autocommit from env/city/global config.
+func DoltConfigExpectedValuesForCity(cityPath string) []DoltConfigExpectedValue {
+	autoGcEnable, autoGcSysVar := resolveExpectedAutoGc(cityPath)
+	autocommit := resolveExpectedAutocommit(cityPath)
 	values := []DoltConfigExpectedValue{
-		{"behavior.auto_gc_behavior.enable", false},
+		{"behavior.autocommit", autocommit},
+		{"behavior.auto_gc_behavior.enable", autoGcEnable},
 		{"behavior.auto_gc_behavior.archive_level", 0},
-		{"system_variables.dolt_auto_gc_enabled", "OFF"},
+		{"system_variables.dolt_auto_gc_enabled", autoGcSysVar},
 		{"system_variables.dolt_stats_enabled", "OFF"},
 		{"system_variables.dolt_stats_gc_enabled", "OFF"},
 		{"system_variables.dolt_stats_memory_only", "ON"},
@@ -2430,6 +2444,82 @@ func managedDoltConfigExpectedWaitTimeout() int {
 		return 0
 	}
 	return n
+}
+
+// resolveExpectedAutoGc returns (behavior.auto_gc_behavior.enable,
+// system_variables.dolt_auto_gc_enabled) per the same priority chain as the
+// writer in cmd/gc/cmd_dolt_config.go: env GC_DOLT_AUTO_GC → city.toml [dolt]
+// auto_gc → ~/.gc/dolt-config.yaml dolt.auto_gc → default (true / "ON").
+func resolveExpectedAutoGc(cityPath string) (bool, string) {
+	enabled := resolveAutoGcExpectedBool(cityPath)
+	if enabled {
+		return true, "ON"
+	}
+	return false, "OFF"
+}
+
+func resolveAutoGcExpectedBool(cityPath string) bool {
+	if v, ok := parseAutoGcConfigValue(os.Getenv("GC_DOLT_AUTO_GC")); ok {
+		return v
+	}
+	if cityPath != "" {
+		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); err == nil && cfg != nil {
+			if v, ok := parseAutoGcConfigValue(cfg.Dolt.AutoGc); ok {
+				return v
+			}
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(home, ".gc", "city.toml")); err == nil && cfg != nil {
+			if v, ok := parseAutoGcConfigValue(cfg.Dolt.AutoGc); ok {
+				return v
+			}
+		}
+	}
+	return true
+}
+
+// resolveExpectedAutocommit returns the expected behavior.autocommit boolean
+// using the same chain as the writer.
+func resolveExpectedAutocommit(cityPath string) bool {
+	if v, ok := parseAutocommitConfigValue(os.Getenv("GC_DOLT_AUTOCOMMIT")); ok {
+		return v
+	}
+	if cityPath != "" {
+		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); err == nil && cfg != nil {
+			if v, ok := parseAutocommitConfigValue(cfg.Dolt.Autocommit); ok {
+				return v
+			}
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(home, ".gc", "city.toml")); err == nil && cfg != nil {
+			if v, ok := parseAutocommitConfigValue(cfg.Dolt.Autocommit); ok {
+				return v
+			}
+		}
+	}
+	return false
+}
+
+func parseAutoGcConfigValue(raw string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true", "on", "enabled", "yes", "1":
+		return true, true
+	case "false", "off", "disabled", "no", "0":
+		return false, true
+	}
+	return false, false
+}
+
+func parseAutocommitConfigValue(raw string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "true", "yes", "1":
+		return true, true
+	case "batch", "off", "false", "no", "0":
+		return false, true
+	}
+	return false, false
 }
 
 // lookupYAMLPath walks a dotted key path through a decoded YAML map and
@@ -2541,7 +2631,7 @@ func (c *DoltConfigCheck) Run(_ *CheckContext) *CheckResult {
 	}
 
 	var drifted []string
-	for _, exp := range DoltConfigExpectedValues() {
+	for _, exp := range DoltConfigExpectedValuesForCity(c.cityPath) {
 		got, present := lookupYAMLPath(doc, exp.Path)
 		if !present {
 			drifted = append(drifted, exp.Path+" (missing)")
