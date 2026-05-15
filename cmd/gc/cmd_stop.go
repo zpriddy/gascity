@@ -247,6 +247,8 @@ func cmdStopBody(cityPath string, cfg *config.City, force bool, stdout, stderr i
 
 	store, _ := openCityStoreAt(cityPath)
 	markCityStopSessionSleepReason(store, stderr)
+	// Close session beads so aliases are released for next start.
+	closeCitySessionBeads(cityPath, stderr)
 
 	// If a controller is running, ask it to shut down (it stops agents).
 	if tryStopControllerWithForce(cityPath, stdout, force) {
@@ -254,6 +256,8 @@ func cmdStopBody(cityPath string, cfg *config.City, force bool, stdout, stderr i
 			fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		// Close session beads so aliases are released for next start.
+		closeCitySessionBeads(cityPath, stderr)
 		// Controller handled the shutdown — still stop bead store below.
 		if err := shutdownBeadsProviderForStop(cityPath); err != nil {
 			fmt.Fprintf(stderr, "gc stop: bead store: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -339,6 +343,30 @@ func stopCityManagedBeadsProviderAfterSuccessfulStop(cityPath string, stderr io.
 		return false
 	}
 	return true
+}
+
+// closeCitySessionBeads closes all open session beads so their aliases are
+// released for the next gc start. Without this, stale session beads from
+// previous runs hold aliases (e.g. "mayor-1") that prevent new sessions
+// from claiming the same name.
+func closeCitySessionBeads(cityPath string, stderr io.Writer) {
+	store, err := openCityStoreAt(cityPath)
+	if err != nil || store == nil {
+		return
+	}
+	sessions, err := store.ListByLabel("gc:session", 0)
+	if err != nil {
+		return
+	}
+	for _, session := range sessions {
+		if session.Status == "closed" {
+			continue
+		}
+		_ = store.SetMetadata(session.ID, "close_reason", "city stopped")
+		if err := store.Close(session.ID); err != nil {
+			fmt.Fprintf(stderr, "gc stop: closing session bead %s: %v\n", session.ID, err) //nolint:errcheck // best-effort warning
+		}
+	}
 }
 
 func stopCityManagedBeadsProvider(cityPath string) (bool, error) {
