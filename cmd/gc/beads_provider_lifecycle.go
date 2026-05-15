@@ -148,6 +148,12 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	} else {
 		clearCityDoltConfig(cityPath)
 	}
+	// Skip local Dolt startup only when canonical or compatibility topology
+	// says the city endpoint is external. Managed-local cities may not have a
+	// published runtime port yet on first startup, so this guard must not depend
+	// on runtime-state resolution.
+	// Also skip when the city uses a shared Dolt server (dolt.shared-server: true
+	// with dolt.auto-start: false) — the shared server is managed externally.
 	skipLocalDolt := false
 	if cityUsesBdStoreContract(cityPath) {
 		owned, err := managedDoltLifecycleOwned(cityPath)
@@ -155,6 +161,19 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 			return err
 		}
 		skipLocalDolt = !owned
+	}
+	if !skipLocalDolt && cityUsesSharedDoltServer(cityPath) {
+		skipLocalDolt = true
+	}
+	// When using a shared dolt server, inject the port into the process
+	// environment so ALL downstream code (Go store opens, bd subprocess
+	// calls, shell scripts) resolves the correct port without needing
+	// managed runtime state files.
+	if skipLocalDolt && cityUsesSharedDoltServer(cityPath) {
+		if port := resolveSharedDoltServerPort(); port != "" {
+			os.Setenv("BEADS_DOLT_SERVER_PORT", port)
+			os.Setenv("GC_DOLT_PORT", port)
+		}
 	}
 	if !skipLocalDolt {
 		if err := ensureBeadsProvider(cityPath); err != nil {
@@ -650,8 +669,12 @@ func resolveRigPaths(cityPath string, rigs []config.Rig) {
 // For exec providers, fires "start". For file providers, always available.
 // Acquires a per-city semaphore to prevent concurrent start operations
 // from causing spawn storms.
+// No-op when the city uses a shared Dolt server (gc does not own the lifecycle).
 func ensureBeadsProvider(cityPath string) error {
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
+		return nil
+	}
+	if cityUsesSharedDoltServer(cityPath) {
 		return nil
 	}
 	provider := beadsProvider(cityPath)
@@ -697,9 +720,16 @@ func ensureBeadsProvider(cityPath string) error {
 // shutdownBeadsProvider stops the bead store's backing service.
 // Called by gc stop after agents have been terminated.
 // For exec providers, fires "stop". For file providers, always available.
+// Skips stop when the city uses a shared Dolt server (dolt.shared-server: true).
 func shutdownBeadsProvider(cityPath string) error {
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return clearManagedDoltRuntimeStateUnlessPostgres(cityPath)
+	}
+	// When the city uses a shared Dolt server, gc does not own the server
+	// lifecycle. Skip the stop operation but clear any stale gc-managed
+	// runtime state that may have been left by a prior non-shared run.
+	if cityUsesSharedDoltServer(cityPath) {
+		return clearManagedDoltRuntimeStateIfOwned(cityPath)
 	}
 	provider := beadsProvider(cityPath)
 	if strings.HasPrefix(provider, "exec:") {
@@ -773,6 +803,14 @@ func initBeadsForDir(cityPath, dir, prefix, doltDatabase string) error {
 				overrides["GC_PACK_STATE_DIR"] = citylayout.PackStateDir(cityPath, "dolt")
 				if err := applyCanonicalScopeInitDoltEnv(overrides, cityPath, dir); err != nil {
 					return err
+				}
+			}
+			// Propagate shared server port to bd subprocess so it connects
+			// to the shared dolt server instead of trying auto-start.
+			if cityUsesSharedDoltServer(cityPath) {
+				if port := resolveSharedDoltServerPort(); port != "" {
+					overrides["BEADS_DOLT_SERVER_PORT"] = port
+					overrides["GC_DOLT_PORT"] = port
 				}
 			}
 			env := overlayEnvEntries(baseEnv, overrides)
@@ -1045,6 +1083,24 @@ func isExternalDolt(cityPath string) bool {
 	return err == nil && ok && target.External
 }
 
+// cityUsesSharedDoltServer returns true when the city's .beads/config.yaml
+// declares dolt.shared-server: true (and dolt.auto-start: false). This means
+// the city relies on an externally-managed shared Dolt server (typically at
+// ~/.beads/shared-server/) rather than a gc-managed per-city instance. When
+// true, gc must not start or stop a local Dolt server for this city.
+func cityUsesSharedDoltServer(cityPath string) bool {
+	cfgPath := filepath.Join(cityPath, ".beads", "config.yaml")
+	shared, err := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath)
+	if err != nil || !shared {
+		return false
+	}
+	autoStartDisabled, err := contract.ReadAutoStartDisabled(fsys.OSFS{}, cfgPath)
+	if err != nil {
+		return false
+	}
+	return autoStartDisabled
+}
+
 // doltHostForCity returns the effective Dolt host for a city.
 // Canonical or compat-configured targets win over ambient env so child
 // processes stay aligned with the resolved city endpoint. Env-only host
@@ -1124,6 +1180,14 @@ func currentDoltPort(cityPath string) string {
 	if port := currentResolvableManagedDoltPort(cityPath); port != "" {
 		writeDoltPortFile(cityPath, port, "", io.Discard)
 		return port
+	}
+	// When the city uses a shared Dolt server, resolve the shared server
+	// port and write it to the compatibility port file so bd can find it.
+	if cityUsesSharedDoltServer(cityPath) {
+		if port := resolveSharedDoltServerPort(); port != "" {
+			writeDoltPortFile(cityPath, port, "", io.Discard)
+			return port
+		}
 	}
 	removeDoltPortFile(cityPath)
 	return ""

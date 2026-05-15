@@ -754,6 +754,17 @@ func resolvedRuntimeCityDoltTarget(cityPath string, allowRecovery bool) (contrac
 	}
 	if target, ok, err := canonicalScopeDoltTarget(cityPath, cityPath); err != nil {
 		if !allowRecovery || !contract.IsManagedRuntimeUnavailable(err) {
+			// When the city uses a shared Dolt server and the canonical
+			// managed runtime resolution fails (for any reason — missing state
+			// file, stale PID, etc.), resolve the shared server port directly
+			// instead of returning an error. The managed runtime state is
+			// irrelevant for shared-server cities because gc does not own the
+			// Dolt lifecycle.
+			if cityUsesSharedDoltServer(cityPath) {
+				if port := resolveSharedDoltServerPort(); port != "" {
+					return contract.DoltConnectionTarget{Host: defaultManagedDoltHost, Port: port}, true, nil
+				}
+			}
 			return contract.DoltConnectionTarget{}, false, err
 		}
 		if port := recoveredManagedDoltPort(); port != "" {
@@ -776,6 +787,14 @@ func resolvedRuntimeCityDoltTarget(cityPath string, allowRecovery bool) (contrac
 	if port := recoveredManagedDoltPort(); port != "" {
 		return contract.DoltConnectionTarget{Host: defaultManagedDoltHost, Port: port}, true, nil
 	}
+	// When the city uses a shared Dolt server, resolve the shared server
+	// port as a fallback before attempting recovery (gc doesn't own the
+	// shared server, so recovery would be inappropriate).
+	if cityUsesSharedDoltServer(cityPath) {
+		if port := resolveSharedDoltServerPort(); port != "" {
+			return contract.DoltConnectionTarget{Host: defaultManagedDoltHost, Port: port}, true, nil
+		}
+	}
 	if allowRecovery {
 		if err := healthBeadsProvider(cityPath); err == nil {
 			resetRecoveryCache()
@@ -791,6 +810,28 @@ func resolvedRuntimeCityDoltTarget(cityPath string, allowRecovery bool) (contrac
 		return contract.DoltConnectionTarget{}, false, managedRuntimeErr
 	}
 	return contract.DoltConnectionTarget{}, false, nil
+}
+
+// resolveSharedDoltServerPort returns the port of the shared Dolt server.
+// It checks (in order):
+//  1. BEADS_DOLT_SERVER_PORT env var (set by the shared server launcher)
+//  2. ~/.beads/shared-server/dolt-server.port file (written by bd shared-server)
+//
+// Returns empty string if neither source provides a port.
+func resolveSharedDoltServerPort() string {
+	if port := strings.TrimSpace(os.Getenv("BEADS_DOLT_SERVER_PORT")); port != "" {
+		return port
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	portFile := filepath.Join(home, ".beads", "shared-server", "dolt-server.port")
+	data, err := os.ReadFile(portFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func managedLocalDoltEnv(env map[string]string) bool {
@@ -994,7 +1035,17 @@ func rigAllowsResolvedCityTargetFallback(cityPath, rigPath string) bool {
 }
 
 func applyResolvedRigDoltEnv(env map[string]string, cityPath, rigPath string, explicitRig *config.Rig, allowRecovery bool) error {
-	if usedCanonical, err := applyCanonicalScopeBackendEnv(env, cityPath, rigPath); err != nil {
+	// Short-circuit for shared-server cities: rigs inherit the shared port directly.
+	if cityUsesSharedDoltServer(cityPath) {
+		if port := resolveSharedDoltServerPort(); port != "" {
+			env["GC_DOLT_PORT"] = port
+			env["BEADS_DOLT_SERVER_PORT"] = port
+			env["GC_DOLT_HOST"] = "127.0.0.1"
+			mirrorBeadsDoltEnv(env)
+			return nil
+		}
+	}
+	if usedCanonical, err := applyCanonicalScopeDoltEnv(env, cityPath, rigPath); err != nil {
 		var invalid *contract.InvalidCanonicalConfigError
 		if errors.As(err, &invalid) {
 			fallback, fallbackErr := contract.AllowsInvalidInheritedCityFallback(fsys.OSFS{}, cityPath, rigPath)
