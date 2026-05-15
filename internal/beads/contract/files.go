@@ -208,6 +208,26 @@ func ReadExportAuto(fs fsys.FS, path string) (value bool, ok bool, err error) {
 	return false, false, nil
 }
 
+// ReadSharedServerEnabled reports whether dolt.shared-server is true in config.
+// When true, the city relies on an externally-managed shared Dolt server
+// rather than a gc-managed per-city instance.
+func ReadSharedServerEnabled(fs fsys.FS, path string) (bool, error) {
+	doc, err := readConfigDoc(fs, path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if value, ok := scanConfigLineValue(fs, path, "dolt.shared-server:"); ok {
+			return value == "true", nil
+		}
+		return false, err
+	}
+	if value, ok := configStringValue(mappingRoot(doc), "dolt.shared-server"); ok {
+		return value == "true", nil
+	}
+	return false, nil
+}
+
 // ReadEndpointStatus reads gc.endpoint_status when present.
 func ReadEndpointStatus(fs fsys.FS, path string) (EndpointStatus, bool, error) {
 	doc, err := readConfigDoc(fs, path)

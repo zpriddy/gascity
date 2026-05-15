@@ -951,6 +951,22 @@ func validateBDStoreTarget(cityPath, scopeRoot string) (contract.DoltConnectionT
 	if !scopeUsesBDDoltStore(cityPath, scopeRoot) {
 		return contract.DoltConnectionTarget{}, "", false, nil
 	}
+	// Shared-server cities don't have managed runtime state.
+	// Resolve directly to the shared server port.
+	cfgPath := filepath.Join(cityPath, ".beads", "config.yaml")
+	if shared, _ := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath); shared {
+		port := os.Getenv("BEADS_DOLT_SERVER_PORT")
+		if port == "" {
+			port = readSharedServerPortFile()
+		}
+		if port != "" {
+			target := contract.DoltConnectionTarget{
+				Host: "127.0.0.1",
+				Port: port,
+			}
+			return target, "", true, nil
+		}
+	}
 	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, scopeRoot, "")
 	if err != nil {
 		return contract.DoltConnectionTarget{}, "reconcile the canonical Dolt endpoint", true, err
@@ -963,6 +979,18 @@ func validateBDStoreTarget(cityPath, scopeRoot string) (contract.DoltConnectionT
 		return contract.DoltConnectionTarget{}, fixHintForBDScopeResolution(cityPath, resolved), true, err
 	}
 	return target, "", true, nil
+}
+
+func readSharedServerPortFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".beads", "shared-server", "dolt-server.port"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func fixHintForBDScopeResolution(cityPath string, resolved contract.ScopeConfigResolution) string {
@@ -1094,6 +1122,29 @@ func (c *DoltServerCheck) Run(_ *CheckContext) *CheckResult {
 		r.Status = StatusOK
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
+	}
+
+	// Shared-server cities: resolve directly to the shared server port.
+	cfgPath := filepath.Join(c.cityPath, ".beads", "config.yaml")
+	if shared, _ := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath); shared {
+		port := os.Getenv("BEADS_DOLT_SERVER_PORT")
+		if port == "" {
+			port = readSharedServerPortFile()
+		}
+		if port != "" {
+			addr := net.JoinHostPort("127.0.0.1", port)
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				r.Status = StatusError
+				r.Message = fmt.Sprintf("shared dolt server not reachable at %s", addr)
+				r.FixHint = "start the shared dolt server: bd dolt start (or check ~/.beads/shared-server/)"
+				return r
+			}
+			conn.Close() //nolint:errcheck
+			r.Status = StatusOK
+			r.Message = fmt.Sprintf("shared server reachable on %s", addr)
+			return r
+		}
 	}
 
 	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, c.cityPath, c.cityPath)
@@ -2031,6 +2082,11 @@ func ManagedLocalDoltChecksApplicable(cityPath string) bool {
 func managedLocalDoltChecksApplicable(cityPath string) bool {
 	if strings.TrimSpace(cityPath) == "" {
 		return true
+	}
+	// Shared-server cities don't have managed local dolt — skip these checks.
+	cfgPath := filepath.Join(cityPath, ".beads", "config.yaml")
+	if shared, _ := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath); shared {
+		return false
 	}
 
 	cityConfigPath := filepath.Join(cityPath, "city.toml")

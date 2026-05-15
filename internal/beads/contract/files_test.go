@@ -876,6 +876,57 @@ func TestReadExportAutoOnMissingFileReturnsAbsent(t *testing.T) {
 	}
 }
 
+func TestReadSharedServerEnabled(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := fs.WriteFile(path, []byte("dolt.shared-server: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled, err := ReadSharedServerEnabled(fs, path)
+	if err != nil {
+		t.Fatalf("ReadSharedServerEnabled() error = %v", err)
+	}
+	if !enabled {
+		t.Fatal("ReadSharedServerEnabled() = false, want true")
+	}
+}
+
+func TestReadSharedServerEnabledFalseWhenNotSet(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := fs.WriteFile(path, []byte("dolt.auto-start: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled, err := ReadSharedServerEnabled(fs, path)
+	if err != nil {
+		t.Fatalf("ReadSharedServerEnabled() error = %v", err)
+	}
+	if enabled {
+		t.Fatal("ReadSharedServerEnabled() = true, want false")
+	}
+}
+
+func TestReadSharedServerEnabledFallsBackToLineScanOnMalformedYAML(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := fs.WriteFile(path, []byte("dolt.shared-server: true\n: not yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled, err := ReadSharedServerEnabled(fs, path)
+	if err != nil {
+		t.Fatalf("ReadSharedServerEnabled() error = %v", err)
+	}
+	if !enabled {
+		t.Fatal("ReadSharedServerEnabled() = false, want true")
+	}
+}
+
 func TestEnsureCanonicalMetadataPreservesUnknownKeysAndScrubsDeprecatedOnes(t *testing.T) {
 	fs := fsys.OSFS{}
 	dir := t.TempDir()
