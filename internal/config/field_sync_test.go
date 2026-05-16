@@ -55,6 +55,8 @@ func TestAgentFieldSync(t *testing.T) {
 		"PackName":                     "runtime-only, set during V2 import expansion, not user-configurable",
 		"source":                       "runtime-only unexported provenance enum (ga-tpfc); stamped at discovery, not patched or overridden",
 		"layout":                       "runtime-only unexported pack-layout enum (ga-9ogb); stamped at discovery, not patched or overridden",
+		"IncludeWorkspaceDirectories":  "agent-specific directory opt-in, set per-agent not per-rig",
+		"WorkspaceDirectoryNames":      "agent-specific directory selection, set per-agent not per-rig",
 	}
 
 	// Fields on AgentOverride/AgentPatch that don't map 1:1 to Agent fields.
