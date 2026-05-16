@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"text/tabwriter"
 
 	"github.com/gastownhall/gascity/internal/config"
@@ -125,8 +126,12 @@ func newDirStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 				if path == "" {
 					path = d.Path
 				}
+				checkPath := path
+				if !filepath.IsAbs(checkPath) {
+					checkPath = filepath.Join(cityPath, checkPath)
+				}
 				exists := "yes"
-				if _, err := os.Stat(path); os.IsNotExist(err) {
+				if _, err := os.Stat(checkPath); os.IsNotExist(err) {
 					exists = "NO"
 				}
 				gitStr := "-"
