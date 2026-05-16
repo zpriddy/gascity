@@ -292,6 +292,13 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		agentEnv["GC_BEADS_SCOPE_ROOT"] = rigRoot
 	}
 
+	// Step 8b: Inject workspace directory env vars for opted-in agents.
+	if dirs := agentWorkspaceDirectories(cfgAgent, p.city); len(dirs) > 0 {
+		for k, v := range config.WorkspaceDirectoryEnvVars(dirs) {
+			agentEnv[k] = v
+		}
+	}
+
 	// Step 9: Render prompt with beacon.
 	var prompt string
 	// Merge fragment sources: V1 global_fragments + inject_fragments,

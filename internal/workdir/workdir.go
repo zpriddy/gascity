@@ -22,6 +22,9 @@ type PathContext struct {
 	RigRoot   string
 	CityRoot  string
 	CityName  string
+	// Dirs holds resolved workspace directory paths keyed by name.
+	// Available in templates as {{.Dirs.name}} or {{index .Dirs "name"}}.
+	Dirs map[string]string
 }
 
 // CityName returns the effective workspace name for workdir/template expansion.
@@ -110,6 +113,13 @@ func PathContextForQualifiedName(cityPath, cityName, qualifiedName string, a con
 		CityRoot:  cityPath,
 		CityName:  cityName,
 	}
+}
+
+// PathContextWithDirs builds template context including workspace directory paths.
+func PathContextWithDirs(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig, dirs []config.WorkspaceDirectory) PathContext {
+	ctx := PathContextForQualifiedName(cityPath, cityName, qualifiedName, a, rigs)
+	ctx.Dirs = config.WorkspaceDirectoryMap(dirs)
+	return ctx
 }
 
 // ExpandCommandTemplate renders command using the same PathContext surface as
