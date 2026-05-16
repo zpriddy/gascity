@@ -305,7 +305,7 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 		}
 		var ctx PromptContext
 		if a.PromptTemplate != "" || hookMode || sessionTemplateContext {
-			ctx = buildPrimeContext(cityPath, cityName, &a, cfg.Rigs, stderr)
+			ctx = buildPrimeContext(cityPath, cityName, &a, cfg.Rigs, cfg, stderr)
 			ctx.ProviderKey, ctx.ProviderDisplayName = providerInfoForAgent(&a, &cfg.Workspace, cfg.Providers)
 			ctx.InstructionsFile = instructionsFileForAgent(&a, &cfg.Workspace, cfg.Providers)
 		}
@@ -633,7 +633,7 @@ func findAgentByName(cfg *config.City, name string) (config.Agent, bool) {
 // buildPrimeContext constructs a PromptContext for gc prime. Uses GC_*
 // environment variables when running inside a managed session, falls back
 // to currentRigContext when run manually.
-func buildPrimeContext(cityPath, cityName string, a *config.Agent, rigs []config.Rig, stderr io.Writer) PromptContext {
+func buildPrimeContext(cityPath, cityName string, a *config.Agent, rigs []config.Rig, city *config.City, stderr io.Writer) PromptContext {
 	ctx := PromptContext{
 		CityRoot:      cityPath,
 		TemplateName:  a.Name,
@@ -674,5 +674,10 @@ func buildPrimeContext(cityPath, cityName string, a *config.Agent, rigs []config
 	ctx.DefaultBranch = defaultBranchForRig(ctx.RigName, rigs, ctx.WorkDir)
 	ctx.WorkQuery = expandAgentCommandTemplate(cityPath, cityName, a, rigs, "work_query", a.EffectiveWorkQuery(), stderr)
 	ctx.SlingQuery = expandAgentCommandTemplate(cityPath, cityName, a, rigs, "sling_query", a.EffectiveSlingQuery(), stderr)
+
+	if dirs := agentWorkspaceDirectories(a, city); len(dirs) > 0 {
+		ctx.Dirs = config.WorkspaceDirectoryMap(dirs)
+	}
+
 	return ctx
 }
