@@ -2,6 +2,8 @@ package config
 
 import (
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
 
 func TestValidateWorkspaceDirectories(t *testing.T) {
@@ -211,4 +213,101 @@ func containsStr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestParseAdditionalDirectoriesFromTOML(t *testing.T) {
+	input := `
+[workspace]
+provider = "claude"
+
+[[rigs]]
+name = "my_rig"
+prefix = "mr"
+path = "/repos/my_rig"
+
+[[additional_directories]]
+name = "ansible_roles"
+path = "/path/to/roles"
+
+[[additional_directories]]
+name = "dev_deploy"
+path = "{rig:my_rig}/dev"
+git_enabled = true
+default_branch = "main"
+
+[daemon]
+patrol_interval = "60s"
+`
+	var cfg City
+	_, err := toml.Decode(input, &cfg)
+	if err != nil {
+		t.Fatalf("TOML decode error: %v", err)
+	}
+
+	if len(cfg.WorkspaceDirectories) != 2 {
+		t.Fatalf("got %d directories, want 2", len(cfg.WorkspaceDirectories))
+	}
+
+	d1 := cfg.WorkspaceDirectories[0]
+	if d1.Name != "ansible_roles" {
+		t.Errorf("dir[0].Name = %q, want %q", d1.Name, "ansible_roles")
+	}
+	if d1.Path != "/path/to/roles" {
+		t.Errorf("dir[0].Path = %q, want %q", d1.Path, "/path/to/roles")
+	}
+	if d1.GitEnabled {
+		t.Error("dir[0].GitEnabled should be false")
+	}
+
+	d2 := cfg.WorkspaceDirectories[1]
+	if d2.Name != "dev_deploy" {
+		t.Errorf("dir[1].Name = %q, want %q", d2.Name, "dev_deploy")
+	}
+	if d2.Path != "{rig:my_rig}/dev" {
+		t.Errorf("dir[1].Path = %q, want %q", d2.Path, "{rig:my_rig}/dev")
+	}
+	if !d2.GitEnabled {
+		t.Error("dir[1].GitEnabled should be true")
+	}
+	if d2.DefaultBranch != "main" {
+		t.Errorf("dir[1].DefaultBranch = %q, want %q", d2.DefaultBranch, "main")
+	}
+
+	// Verify rig interpolation works.
+	err = ResolveWorkspaceDirectoryPaths(cfg.WorkspaceDirectories, cfg.Rigs)
+	if err != nil {
+		t.Fatalf("ResolveWorkspaceDirectoryPaths error: %v", err)
+	}
+	if cfg.WorkspaceDirectories[1].ResolvedPath != "/repos/my_rig/dev" {
+		t.Errorf("dir[1].ResolvedPath = %q, want %q", cfg.WorkspaceDirectories[1].ResolvedPath, "/repos/my_rig/dev")
+	}
+	if cfg.WorkspaceDirectories[1].ParentRig != "my_rig" {
+		t.Errorf("dir[1].ParentRig = %q, want %q", cfg.WorkspaceDirectories[1].ParentRig, "my_rig")
+	}
+}
+
+func TestBackwardsCompatibility_NoDirectories(t *testing.T) {
+	input := `
+[workspace]
+provider = "claude"
+
+[[rigs]]
+name = "test"
+prefix = "t"
+path = "/repos/test"
+
+[daemon]
+patrol_interval = "60s"
+`
+	var cfg City
+	_, err := toml.Decode(input, &cfg)
+	if err != nil {
+		t.Fatalf("TOML decode error: %v", err)
+	}
+	if len(cfg.WorkspaceDirectories) != 0 {
+		t.Fatalf("expected 0 directories, got %d", len(cfg.WorkspaceDirectories))
+	}
+	if len(cfg.Rigs) != 1 {
+		t.Fatalf("expected 1 rig, got %d", len(cfg.Rigs))
+	}
 }
