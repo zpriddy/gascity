@@ -1045,7 +1045,7 @@ func applyResolvedRigDoltEnv(env map[string]string, cityPath, rigPath string, ex
 			return nil
 		}
 	}
-	if usedCanonical, err := applyCanonicalScopeDoltEnv(env, cityPath, rigPath); err != nil {
+	if usedCanonical, err := applyCanonicalScopeBackendEnv(env, cityPath, rigPath); err != nil {
 		var invalid *contract.InvalidCanonicalConfigError
 		if errors.As(err, &invalid) {
 			fallback, fallbackErr := contract.AllowsInvalidInheritedCityFallback(fsys.OSFS{}, cityPath, rigPath)
