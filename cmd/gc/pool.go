@@ -334,6 +334,14 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 		v := *src.InjectAssignedSkills
 		dst.InjectAssignedSkills = &v
 	}
+	if src.IncludeWorkspaceDirectories != nil {
+		v := *src.IncludeWorkspaceDirectories
+		dst.IncludeWorkspaceDirectories = &v
+	}
+	if len(src.WorkspaceDirectoryNames) > 0 {
+		dst.WorkspaceDirectoryNames = make([]string, len(src.WorkspaceDirectoryNames))
+		copy(dst.WorkspaceDirectoryNames, src.WorkspaceDirectoryNames)
+	}
 	if src.DefaultSlingFormula != nil {
 		v := *src.DefaultSlingFormula
 		dst.DefaultSlingFormula = &v

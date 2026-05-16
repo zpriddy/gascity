@@ -297,6 +297,14 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		for k, v := range config.WorkspaceDirectoryEnvVars(dirs) {
 			agentEnv[k] = v
 		}
+		agentEnv["GC_DIR_INJECTION_COUNT"] = fmt.Sprintf("%d", len(dirs))
+	} else {
+		// Debug: report why injection didn't fire
+		cityDirCount := 0
+		if p.city != nil {
+			cityDirCount = len(p.city.WorkspaceDirectories)
+		}
+		agentEnv["GC_DIR_INJECTION_DEBUG"] = fmt.Sprintf("city_dirs=%d,agent=%s,include=%v,names=%v", cityDirCount, cfgAgent.Name, cfgAgent.IncludeWorkspaceDirectories, cfgAgent.WorkspaceDirectoryNames)
 	}
 
 	// Step 9: Render prompt with beacon.
