@@ -292,6 +292,15 @@ func newInternalCityWindowFocusCmd(_, stderr io.Writer) *cobra.Command {
 			}
 
 			paneIDs := strings.Split(strings.TrimSpace(out), "\n")
+			// If the user is actively typing in any pane, do NOT steal focus.
+			// We compare client_activity (last keystroke from any client) to
+			// now(); if the gap is under the idle threshold, the human is
+			// busy and a focus-shift would land mid-typed-command in the
+			// wrong pane (pgr-37uq). 3s lines up with the periodic-tick-3
+			// hook cadence that drives this command.
+			if userActivelyTyping(socketName, 3*time.Second) {
+				return nil
+			}
 			// Skip the first pane (left side / mayor) and check remaining.
 			for _, paneID := range paneIDs[1:] {
 				paneID = strings.TrimSpace(paneID)
@@ -322,6 +331,38 @@ func tmuxExec(socket string, args ...string) (string, error) {
 	cmd := exec.Command("tmux", fullArgs...)
 	out, err := cmd.Output()
 	return strings.TrimSpace(string(out)), err
+}
+
+// userActivelyTyping reports whether any client attached to this tmux
+// socket has had keyboard activity within `threshold`. Returns false
+// when no client is attached (no human present), when tmux is unreachable,
+// or when the activity timestamp can't be parsed — in all those cases
+// suppressing the caller's focus shift would surprise an absent user
+// more than performing it.
+//
+// Implementation: tmux's `#{client_activity}` is a Unix epoch second of
+// the most recent keypress on that client. We pick the maximum across
+// all attached clients and compare to now().
+func userActivelyTyping(socket string, threshold time.Duration) bool {
+	out, err := tmuxExec(socket, "list-clients", "-F", "#{client_activity}")
+	if err != nil || out == "" {
+		return false
+	}
+	now := time.Now().Unix()
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var act int64
+		if _, perr := fmt.Sscanf(line, "%d", &act); perr != nil {
+			continue
+		}
+		if now-act < int64(threshold.Seconds()) {
+			return true
+		}
+	}
+	return false
 }
 
 // tmuxRun runs a tmux command with the given socket, discarding output.
