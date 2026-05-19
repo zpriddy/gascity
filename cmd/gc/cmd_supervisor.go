@@ -1312,6 +1312,33 @@ func reconcileCities(
 		}
 	})
 
+	// Drop registered-stopped entries for paths no longer in the registry.
+	// Without this, suspended-then-unregistered cities would leave a stale
+	// entry that surfaces in the API as "registered, suspended" forever.
+	cr.BatchUpdate(func(
+		_ map[string]*managedCity,
+		_ map[string]cityInitProgress,
+		_ map[string]*initFailRecord,
+		_ map[string]*panicRecord,
+	) {})
+	if cr != nil {
+		// Use a separate citiesMu acquisition since registeredStopped
+		// has its own lifecycle helpers that take the lock internally.
+		// (Calling helpers directly from inside BatchUpdate would deadlock.)
+		stalePaths := func() []string {
+			var stale []string
+			for _, p := range toStopPaths {
+				if _, ok := cr.IsRegisteredStopped(p); ok {
+					stale = append(stale, p)
+				}
+			}
+			return stale
+		}()
+		for _, p := range stalePaths {
+			cr.ClearRegisteredStopped(p)
+		}
+	}
+
 	for i, mc := range toStop {
 		path := toStopPaths[i]
 		cityName := mc.name
@@ -1577,6 +1604,24 @@ func reconcileCities(
 				cityName, liveName)
 		}
 		applyRuntimeCityIdentity(cfg, cityName)
+
+		// If the city declares [workspace] suspended = true, record it as
+		// registered-but-stopped and skip startup. This prevents shared-Dolt
+		// cities (proving-grounds, gas-state, etc.) from auto-starting their
+		// runtime/controller just because the supervisor saw them in the
+		// registry. Recommended by the Dolt team for shared-server topologies
+		// where the operator wants explicit control over which cities are
+		// active even when registered together. The pre-existing
+		// build_desired_state.go suspended check only stops AGENT spawn —
+		// without this guard, the controller runtime still launches.
+		if cfg.Workspace.Suspended {
+			cr.MarkRegisteredStopped(path, cityName, "suspended")
+			fmt.Fprintf(stderr, "gc supervisor: city '%s' is suspended (workspace.suspended=true); skipping startup\n", cityName) //nolint:errcheck
+			continue
+		}
+		// City no longer suspended — clear any prior registered-stopped record
+		// so the supervisor will resume normal startup on this iteration.
+		cr.ClearRegisteredStopped(path)
 
 		// Track initialization progress for the API.
 		cr.BatchUpdate(func(

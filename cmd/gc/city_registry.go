@@ -50,6 +50,16 @@ type citySnapshot struct {
 	builtAt time.Time            // for staleness instrumentation
 }
 
+// registeredStoppedCity records a city that is registered with the
+// supervisor but explicitly not started — for example, a city whose
+// city.toml has [workspace] suspended = true. The supervisor records
+// this so the API can surface "registered, suspended" without leaving
+// the city in a perpetual init-failure backoff loop.
+type registeredStoppedCity struct {
+	name   string
+	status string // e.g. "suspended"
+}
+
 // cityRegistry owns the mutable cities map and the atomic snapshot.
 // All mutation methods acquire citiesMu, mutate, rebuild, and release.
 // The snapshot rebuild is always called while citiesMu is held —
@@ -65,6 +75,7 @@ type cityRegistry struct {
 	panicHistory         map[string]*panicRecord
 	pendingRequestIDs    map[string]string    // city path → request_id for async correlation
 	recentlyUnregistered map[string]time.Time // city path → unregister time (grace period for event delivery)
+	registeredStopped    map[string]registeredStoppedCity // city path → record for cities registered but explicitly not started (e.g. workspace.suspended=true)
 	supervisorRecorder   events.Recorder      // supervisor-level event recorder for city lifecycle events
 
 	gen uint64 // monotonic generation counter
@@ -79,6 +90,7 @@ func newCityRegistry() *cityRegistry {
 		panicHistory:         make(map[string]*panicRecord),
 		pendingRequestIDs:    make(map[string]string),
 		recentlyUnregistered: make(map[string]time.Time),
+		registeredStopped:    make(map[string]registeredStoppedCity),
 	}
 	// Initialize with empty snapshot to prevent nil-dereference panic
 	// if an API request arrives before the first reconciliation tick.
@@ -245,6 +257,52 @@ func (r *cityRegistry) BatchUpdate(fn func(
 	defer r.citiesMu.Unlock()
 	fn(r.cities, r.initStatus, r.initFailures, r.panicHistory)
 	r.rebuildSnapshotLocked()
+}
+
+// MarkRegisteredStopped records a city as registered-but-not-started
+// (for example, when [workspace] suspended = true in city.toml). Idempotent.
+// Also clears any in-progress init status / init-failure backoff for the path
+// so the supervisor doesn't retry startup.
+func (r *cityRegistry) MarkRegisteredStopped(path, name, status string) {
+	r.citiesMu.Lock()
+	defer r.citiesMu.Unlock()
+	if r.registeredStopped == nil {
+		r.registeredStopped = make(map[string]registeredStoppedCity)
+	}
+	r.registeredStopped[path] = registeredStoppedCity{name: name, status: status}
+	delete(r.initStatus, path)
+	delete(r.initFailures, path)
+	r.rebuildSnapshotLocked()
+}
+
+// ClearRegisteredStopped removes a path from the registered-stopped set —
+// called when the supervisor sees the city no longer declares suspended,
+// or when it's unregistered. Safe to call when the path isn't tracked.
+func (r *cityRegistry) ClearRegisteredStopped(path string) {
+	r.citiesMu.Lock()
+	defer r.citiesMu.Unlock()
+	if r.registeredStopped == nil {
+		return
+	}
+	if _, ok := r.registeredStopped[path]; ok {
+		delete(r.registeredStopped, path)
+		r.rebuildSnapshotLocked()
+	}
+}
+
+// IsRegisteredStopped returns the recorded status string and true if
+// the city is in the registered-stopped set, otherwise ("", false).
+func (r *cityRegistry) IsRegisteredStopped(path string) (string, bool) {
+	r.citiesMu.Lock()
+	defer r.citiesMu.Unlock()
+	if r.registeredStopped == nil {
+		return "", false
+	}
+	rec, ok := r.registeredStopped[path]
+	if !ok {
+		return "", false
+	}
+	return rec.status, true
 }
 
 // Snapshot returns the current read-only snapshot. Lock-free.
