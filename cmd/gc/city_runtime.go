@@ -2779,6 +2779,16 @@ func buildStandaloneRigStores(cfg *config.City, cityPath string, stderr io.Write
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
 		}
+		// MySQL-orphaned rig: rig declared backend=dolt with
+		// endpoint_origin=inherited_city, but city has migrated to
+		// backend=mysql. The rig's Dolt server is no longer running and
+		// cannot be reached. Substitute a placeholder so scaleCheck and
+		// collectAssignedWorkBeads don't flood the supervisor log with
+		// "Dolt server unreachable at 127.0.0.1:0" on every tick.
+		if rigOrphanedFromMySQLCity(cityPath, rig.Path) {
+			stores[rig.Name] = newMysqlOrphanedRigStore(rig.Name, rig.Path)
+			continue
+		}
 		store, err := openStoreAtForCity(rig.Path, cityPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc supervisor: rig bead store %q: %v\n", rig.Name, err) //nolint:errcheck // best-effort stderr
