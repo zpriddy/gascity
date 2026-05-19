@@ -650,9 +650,40 @@ func NewBeadsStoreCheck(cityPath string, newStore func(string) (beads.Store, err
 // Name returns the check identifier.
 func (c *BeadsStoreCheck) Name() string { return "beads-store" }
 
+// scopeUsesMySQLBackend returns true when the metadata.json at scopePath
+// declares backend: mysql. MySQL-backed scopes have no managed Dolt
+// runtime — checks that resolve dolt connection state must skip them.
+func scopeUsesMySQLBackend(scopePath string) bool {
+	metaPath := filepath.Join(scopePath, ".beads", "metadata.json")
+	state, ok, err := contract.LoadMetadataState(fsys.OSFS{}, metaPath)
+	if err != nil || !ok {
+		return false
+	}
+	return state.Backend == "mysql"
+}
+
 // Run opens the store and pings it to verify accessibility.
 func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
+	// MySQL-backed cities have no managed Dolt — bd connects directly to
+	// the configured MySQL server using .beads/config.yaml. Skip the
+	// dolt-target validation and go straight to the store ping.
+	if scopeUsesMySQLBackend(c.cityPath) {
+		store, err := c.newStore(c.cityPath)
+		if err != nil {
+			r.Status = StatusError
+			r.Message = fmt.Sprintf("store open failed: %v", err)
+			return r
+		}
+		if err := store.Ping(); err != nil {
+			r.Status = StatusError
+			r.Message = fmt.Sprintf("store ping failed: %v", err)
+			return r
+		}
+		r.Status = StatusOK
+		r.Message = "store accessible (mysql backend)"
+		return r
+	}
 	target, fixHint, active, err := validateBDStoreTarget(c.cityPath, c.cityPath)
 	if err != nil {
 		r.Status = StatusError
@@ -1123,6 +1154,12 @@ func (c *DoltServerCheck) Run(_ *CheckContext) *CheckResult {
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
 	}
+	// MySQL-backed cities have no Dolt server — skip.
+	if scopeUsesMySQLBackend(c.cityPath) {
+		r.Status = StatusOK
+		r.Message = "skipped (mysql backend)"
+		return r
+	}
 
 	// Shared-server cities: resolve directly to the shared server port.
 	cfgPath := filepath.Join(c.cityPath, ".beads", "config.yaml")
@@ -1432,6 +1469,26 @@ func (c *RigBeadsCheck) Run(_ *CheckContext) *CheckResult {
 	rigPath := c.rig.Path
 	if !filepath.IsAbs(rigPath) {
 		rigPath = filepath.Join(c.cityPath, rigPath)
+	}
+	// MySQL-backed cities (and their rigs, which inherit the backend)
+	// have no managed Dolt — bd connects directly to MySQL via
+	// .beads/config.yaml. Skip dolt-target resolution and ping the
+	// store directly.
+	if scopeUsesMySQLBackend(rigPath) || scopeUsesMySQLBackend(c.cityPath) {
+		store, err := c.newStore(rigPath)
+		if err != nil {
+			r.Status = StatusError
+			r.Message = fmt.Sprintf("store open failed: %v", err)
+			return r
+		}
+		if err := store.Ping(); err != nil {
+			r.Status = StatusError
+			r.Message = fmt.Sprintf("store ping failed: %v", err)
+			return r
+		}
+		r.Status = StatusOK
+		r.Message = "store accessible (mysql backend)"
+		return r
 	}
 	target, fixHint, active, err := validateBDStoreTarget(c.cityPath, rigPath)
 	if err != nil {

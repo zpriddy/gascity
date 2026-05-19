@@ -34,6 +34,14 @@ func (c *doltDriftCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		r.Message = "not using bd-backed Dolt topology"
 		return r
 	}
+	// MySQL-backed cities don't use managed Dolt — there's nothing to
+	// drift against. Resolving city endpoint state would error on the
+	// missing managed-runtime publication.
+	if cityUsesMySQLBackend(c.cityPath) {
+		r.Status = doctor.StatusOK
+		r.Message = "mysql backend — no managed Dolt to drift"
+		return r
+	}
 
 	cityState, _, err := resolveDesiredCityEndpointState(c.cityPath, c.cfg.Dolt, config.EffectiveHQPrefix(c.cfg))
 	if err != nil {
