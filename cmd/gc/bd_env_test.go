@@ -4797,3 +4797,104 @@ func TestReapStaleBdExportJSONLLeavesFileOnUnmanagedScope(t *testing.T) {
 		t.Fatalf("jsonl removed on unmanaged scope; stat err = %v, want nil", err)
 	}
 }
+
+func TestParseListenerPortFromYAML(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "standard config",
+			yaml: "log_level: warning\n\nlistener:\n  port: 3307\n  host: 0.0.0.0\n\ndata_dir: /foo\n",
+			want: "3307",
+		},
+		{
+			name: "tabs as indent",
+			yaml: "listener:\n\tport: 3307\n",
+			want: "3307",
+		},
+		{
+			name: "inline comment",
+			yaml: "listener:\n  port: 3307  # default\n",
+			want: "3307",
+		},
+		{
+			name: "no listener block",
+			yaml: "log_level: warning\ndata_dir: /foo\n",
+			want: "",
+		},
+		{
+			name: "listener block but no port",
+			yaml: "listener:\n  host: 0.0.0.0\n  max_connections: 1000\n",
+			want: "",
+		},
+		{
+			name: "non-integer port",
+			yaml: "listener:\n  port: abc\n",
+			want: "",
+		},
+		{
+			name: "port outside listener block",
+			yaml: "port: 9999\nlistener:\n  host: 0.0.0.0\n",
+			want: "",
+		},
+		{
+			name: "commented-out port inside listener",
+			yaml: "listener:\n  # port: 3307\n  host: 0.0.0.0\n",
+			want: "",
+		},
+		{
+			name: "empty input",
+			yaml: "",
+			want: "",
+		},
+		{
+			name: "block ends at next top-level key",
+			yaml: "listener:\n  host: 0.0.0.0\ndata_dir: /foo\n  port: 3307\n",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseListenerPortFromYAML(tt.yaml)
+			if got != tt.want {
+				t.Errorf("parseListenerPortFromYAML() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveSharedDoltServerPort_FallbackToConfigYAML(t *testing.T) {
+	// Sandbox HOME so we don't touch the real ~/.beads
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	sharedDir := filepath.Join(tmpHome, ".beads", "shared-server")
+	if err := os.MkdirAll(sharedDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	cfgYAML := "log_level: warning\nlistener:\n  port: 3308\n  host: 0.0.0.0\ndata_dir: /tmp/foo\n"
+	if err := os.WriteFile(filepath.Join(sharedDir, "dolt-config.yaml"), []byte(cfgYAML), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// No port file → must fall back to config.yaml.
+	if got := resolveSharedDoltServerPort(); got != "3308" {
+		t.Errorf("resolveSharedDoltServerPort() with config.yaml only = %q, want %q", got, "3308")
+	}
+
+	// Port file should win over config.yaml.
+	if err := os.WriteFile(filepath.Join(sharedDir, "dolt-server.port"), []byte("9999\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile port: %v", err)
+	}
+	if got := resolveSharedDoltServerPort(); got != "9999" {
+		t.Errorf("resolveSharedDoltServerPort() with port file = %q, want %q", got, "9999")
+	}
+
+	// Env var should win over both.
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "5555")
+	if got := resolveSharedDoltServerPort(); got != "5555" {
+		t.Errorf("resolveSharedDoltServerPort() with env = %q, want %q", got, "5555")	}
+}

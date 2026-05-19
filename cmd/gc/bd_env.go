@@ -816,8 +816,14 @@ func resolvedRuntimeCityDoltTarget(cityPath string, allowRecovery bool) (contrac
 // It checks (in order):
 //  1. BEADS_DOLT_SERVER_PORT env var (set by the shared server launcher)
 //  2. ~/.beads/shared-server/dolt-server.port file (written by bd shared-server)
+//  3. ~/.beads/shared-server/dolt-config.yaml listener.port (config file fallback)
 //
-// Returns empty string if neither source provides a port.
+// The third fallback exists because bd does not always write dolt-server.port
+// (only test fixtures do today; see beads explicit_db_nodb_test.go). When the
+// shared server is started manually with --config, the config file is the only
+// authoritative source for the port.
+//
+// Returns empty string if no source provides a port.
 func resolveSharedDoltServerPort() string {
 	if port := strings.TrimSpace(os.Getenv("BEADS_DOLT_SERVER_PORT")); port != "" {
 		return port
@@ -827,11 +833,62 @@ func resolveSharedDoltServerPort() string {
 		return ""
 	}
 	portFile := filepath.Join(home, ".beads", "shared-server", "dolt-server.port")
-	data, err := os.ReadFile(portFile)
+	if data, err := os.ReadFile(portFile); err == nil {
+		if p := strings.TrimSpace(string(data)); p != "" {
+			return p
+		}
+	}
+	// Fallback: parse listener.port from dolt-config.yaml. This is a minimal
+	// regex-based parse — it does NOT pull in a full YAML dependency, since
+	// gc's bd_env.go is on a tight cold-start path. We only need the integer
+	// after "port:" inside a "listener:" block.
+	cfgFile := filepath.Join(home, ".beads", "shared-server", "dolt-config.yaml")
+	cfgData, err := os.ReadFile(cfgFile)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	return parseListenerPortFromYAML(string(cfgData))
+}
+
+// parseListenerPortFromYAML extracts the listener.port integer from a Dolt
+// sql-server config YAML. Returns empty string if the field is absent or
+// malformed. This is a defensive minimal parser — it does not validate the
+// full config; it only handles the listener block's port: line.
+func parseListenerPortFromYAML(yaml string) string {
+	inListener := false
+	for _, raw := range strings.Split(yaml, "\n") {
+		line := strings.TrimRight(raw, " \t\r")
+		trimmed := strings.TrimLeft(line, " \t")
+		// Detect listener: block start (no leading whitespace).
+		if !inListener {
+			if strings.HasPrefix(line, "listener:") {
+				inListener = true
+			}
+			continue
+		}
+		// Lines with no leading whitespace end the listener block.
+		if line != "" && line[0] != ' ' && line[0] != '\t' {
+			return ""
+		}
+		// Skip comments and blank lines.
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// Look for `port: <int>` (allow inline comments).
+		if strings.HasPrefix(trimmed, "port:") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "port:"))
+			// Strip trailing comment.
+			if i := strings.Index(rest, "#"); i >= 0 {
+				rest = strings.TrimSpace(rest[:i])
+			}
+			// Validate it's an integer.
+			if _, err := strconv.Atoi(rest); err == nil {
+				return rest
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func managedLocalDoltEnv(env map[string]string) bool {
