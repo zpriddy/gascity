@@ -486,7 +486,11 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 	// contract.LoadMetadataState, which rejects unknown backends including
 	// "mysql" with an error. The mysql check is a cheap direct read that
 	// tolerates any backend value.
-	if scopeUsesMySQLBackendForInit(dir) {
+	//
+	// Rigs without their own metadata.json inherit the city's MySQL backend
+	// — gc has no managed dolt runtime to spawn for them, so we just install
+	// hooks and exit.
+	if scopeUsesMySQLBackendForInit(dir) || cityUsesMySQLBackend(cityPath) {
 		if err := installBeadHooks(dir, cityPath); err != nil {
 			return fmt.Errorf("install hooks at %s: %w", dir, err)
 		}

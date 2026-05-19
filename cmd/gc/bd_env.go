@@ -337,6 +337,9 @@ func applyCanonicalScopeBackendEnv(env map[string]string, cityPath, scopeRoot st
 			return true, err
 		}
 		return true, nil
+	case "mysql":
+		clearProjectedPostgresEnv(env)
+		return true, nil
 	default:
 		return true, fmt.Errorf("unsupported backend %q for scope %s", meta.Backend, scopeRoot)
 	}
@@ -361,6 +364,8 @@ func applyCityPostgresBackendEnv(env map[string]string, cityPath string) (bool, 
 		}
 		return true, nil
 	case "", "dolt":
+		return false, nil
+	case "mysql":
 		return false, nil
 	default:
 		return true, fmt.Errorf("unsupported backend %q for scope %s", meta.Backend, cityPath)
@@ -1039,6 +1044,13 @@ func bdCommandRunnerWithManagedRetryErr(cityPath string, envFn func(dir string) 
 }
 
 func applyResolvedCityDoltEnv(env map[string]string, cityPath string, allowRecovery bool) error {
+	// Short-circuit for MySQL-backed cities: bd reads MySQL connection info
+	// from .beads/config.yaml directly.
+	if cityUsesMySQLBackend(cityPath) {
+		clearProjectedDoltEnv(env)
+		clearProjectedPostgresEnv(env)
+		return nil
+	}
 	target, ok, err := resolvedRuntimeCityDoltTarget(cityPath, allowRecovery)
 	if err != nil {
 		return err
@@ -1092,6 +1104,13 @@ func rigAllowsResolvedCityTargetFallback(cityPath, rigPath string) bool {
 }
 
 func applyResolvedRigDoltEnv(env map[string]string, cityPath, rigPath string, explicitRig *config.Rig, allowRecovery bool) error {
+	// Short-circuit for MySQL-backed cities: bd reads MySQL connection info
+	// from .beads/config.yaml directly; no env projection needed.
+	if cityUsesMySQLBackend(cityPath) {
+		clearProjectedDoltEnv(env)
+		clearProjectedPostgresEnv(env)
+		return nil
+	}
 	// Short-circuit for shared-server cities: rigs inherit the shared port directly.
 	if cityUsesSharedDoltServer(cityPath) {
 		if port := resolveSharedDoltServerPort(); port != "" {
@@ -1215,6 +1234,11 @@ func bdRuntimeEnvWithError(cityPath string) (map[string]string, error) {
 	if !cityUsesBdStoreContract(cityPath) {
 		return env, nil
 	}
+	if cityUsesMySQLBackend(cityPath) {
+		clearProjectedDoltEnv(env)
+		clearProjectedPostgresEnv(env)
+		return env, nil
+	}
 	if usedPostgres, err := applyCityPostgresBackendEnv(env, cityPath); err != nil {
 		clearProjectedDoltEnv(env)
 		clearProjectedPostgresEnv(env)
@@ -1259,7 +1283,10 @@ func cityRuntimeProcessEnvWithError(cityPath string) ([]string, error) {
 	var projectionErr error
 	if cityUsesBdStoreContract(cityPath) {
 		source := map[string]string{"BEADS_DOLT_AUTO_START": "0"}
-		if usedPostgres, err := applyCityPostgresBackendEnv(source, cityPath); err != nil {
+		if cityUsesMySQLBackend(cityPath) {
+			// MySQL backend needs no env projection; bd reads connection
+			// details from .beads/config.yaml directly.
+		} else if usedPostgres, err := applyCityPostgresBackendEnv(source, cityPath); err != nil {
 			clearProjectedDoltEnv(source)
 			clearProjectedPostgresEnv(source)
 			mirrorBeadsDoltEnv(source)
