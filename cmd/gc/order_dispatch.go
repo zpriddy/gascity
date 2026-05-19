@@ -375,9 +375,20 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 
 	stores := make(map[string]beads.Store)
 
+	cityIsMySQL := cityUsesMySQLBackend(cityPath)
 	for _, a := range m.aa {
 		// Skip orders targeting suspended rigs.
 		if m.orderRigSuspended(a) {
+			continue
+		}
+		// Skip dolt-runtime-dependent orders for MySQL-backed cities.
+		// These orders shell out to scripts that resolve a managed Dolt
+		// port (port_resolve.sh exit 78) or invoke `bd list` with stale
+		// dolt env, both of which fail loudly with no recovery path on
+		// MySQL cities. The orders ship with the dolt/maintenance system
+		// packs and have no mysql equivalents — quietly skipping them is
+		// the correct behavior, not a workaround.
+		if cityIsMySQL && orderRequiresManagedDolt(a) {
 			continue
 		}
 
@@ -1051,6 +1062,28 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 
 	// Label tracking bead with outcome.
 	store.Update(trackingID, beads.UpdateOpts{Labels: []string{"wisp"}}) //nolint:errcheck // best-effort
+}
+
+// orderRequiresManagedDolt reports whether an order's exec path depends
+// on a managed Dolt runtime (port_resolve.sh / runtime.sh / dolt-target.sh).
+// MySQL-backed cities have no managed Dolt — these orders fail with
+// "cannot resolve runtime port" or "load metadata: unsupported backend"
+// and must be quietly skipped, not run.
+//
+// Detection is by Source path: orders shipped from packs/dolt/ are all
+// dolt-only; the maintenance pack ships two dolt-dependent exec scripts
+// (mol-dog-jsonl, mol-dog-reaper) that source dolt-target.sh and resolve
+// GC_DOLT_PORT before doing anything else.
+func orderRequiresManagedDolt(a orders.Order) bool {
+	src := strings.ReplaceAll(a.Source, string(os.PathSeparator), "/")
+	if strings.Contains(src, "/packs/dolt/") {
+		return true
+	}
+	switch a.Name {
+	case "mol-dog-jsonl", "mol-dog-reaper":
+		return true
+	}
+	return false
 }
 
 // orderRigSuspended reports whether the order targets a suspended rig.
