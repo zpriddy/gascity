@@ -21,7 +21,7 @@ LDFLAGS := -X main.version=$(VERSION) \
            -X main.commit=$(COMMIT) \
            -X main.date=$(BUILD_TIME)
 
-.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-routed-test-rows check-version-tag lint lint-full lint-new lint-changed fmt-check fmt vet test test-fast-parallel test-fsys-darwin-compile test-pack-registry-live test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-smoke
+.PHONY: build build-zp check check-all check-bd check-docker check-docs check-dolt check-routed-test-rows check-version-tag lint lint-full lint-new lint-changed fmt-check fmt vet test test-fast-parallel test-fsys-darwin-compile test-pack-registry-live test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-smoke
 
 ## build: compile gc binary with version metadata
 build:
@@ -29,6 +29,41 @@ build:
 ifeq ($(shell uname),Darwin)
 	@scripts/sign-darwin-local.sh $(BUILD_DIR)/$(BINARY)
 endif
+
+# Fork-build counter file — bumped manually each time we apply or change
+# our fork-only patches on top of the current upstream SHA. Restarts at 1
+# whenever the upstream short SHA in $(COMMIT) changes (i.e. when we
+# rebase onto a new upstream).
+ZP_FORK_VERSION_FILE := .zp-fork-version
+ZP_FORK_COUNTER := $(shell cat $(ZP_FORK_VERSION_FILE) 2>/dev/null | tr -d '[:space:]')
+ZP_BUILD := $(COMMIT)-zp.$(ZP_FORK_COUNTER)
+ZP_LDFLAGS := -X main.version=$(ZP_BUILD) \
+              -X main.commit=$(COMMIT) \
+              -X main.date=$(BUILD_TIME)
+# Apple developer cert for signing fork builds. Override on the make line:
+#   make build-zp ZP_CODESIGN_IDENTITY="-"
+# to ad-hoc-sign instead.
+ZP_CODESIGN_IDENTITY ?= Apple Development: Zak Priddy (9ULEP73AAX)
+
+## build-zp: build gc with fork version <sha>-zp.<n> (reads .zp-fork-version).
+## Convention: lets us tell forked builds apart from upstream at a glance
+## via `gc version`.
+build-zp:
+	@if [ -z "$(ZP_FORK_COUNTER)" ]; then \
+		echo "ERROR: $(ZP_FORK_VERSION_FILE) missing or empty. Create it with an integer (e.g. echo 1 > $(ZP_FORK_VERSION_FILE))." >&2; \
+		exit 1; \
+	fi
+	@echo "Building $(BINARY) (fork build: $(ZP_BUILD))..."
+	go build -ldflags "$(ZP_LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gc
+ifeq ($(shell uname),Darwin)
+	@if codesign -s "$(ZP_CODESIGN_IDENTITY)" -f $(BUILD_DIR)/$(BINARY) 2>/dev/null; then \
+		echo "Signed $(BINARY) with: $(ZP_CODESIGN_IDENTITY)"; \
+	else \
+		echo "WARNING: codesign with '$(ZP_CODESIGN_IDENTITY)' failed; falling back to ad-hoc signature" >&2; \
+		codesign -s - -f $(BUILD_DIR)/$(BINARY) 2>/dev/null || true; \
+	fi
+endif
+	@echo "Built: $(BUILD_DIR)/$(BINARY) ($(ZP_BUILD))"
 
 ## install: build and install gc to GOPATH/bin (same location as go install)
 install: build
