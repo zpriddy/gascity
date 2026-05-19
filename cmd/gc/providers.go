@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -531,6 +532,33 @@ func providerUsesBdStoreContract(provider string) bool {
 
 func cityUsesBdStoreContract(cityPath string) bool {
 	return providerUsesBdStoreContract(rawBeadsProvider(cityPath))
+}
+
+// cityUsesMySQLBackend returns true when the city's bd metadata declares
+// backend: mysql. Such cities have NO managed dolt runtime — bd talks to
+// an external MySQL server via DSN-style connection params stored in
+// .beads/metadata.json. gc must skip ALL dolt-runtime machinery for these
+// cities (publication, state files, port resolution, restart loops).
+//
+// Mirrors the postgres detection in postgresMetadataForScope but uses a
+// minimal direct read so callers in dolt-only paths don't pull in the full
+// scope-resolution machinery.
+func cityUsesMySQLBackend(cityPath string) bool {
+	if strings.TrimSpace(cityPath) == "" {
+		return false
+	}
+	metaPath := filepath.Join(cityPath, ".beads", "metadata.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return false
+	}
+	var meta struct {
+		Backend string `json:"backend"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(meta.Backend), "mysql")
 }
 
 func rawBeadsProviderForScope(scopeRoot, cityPath string) string {

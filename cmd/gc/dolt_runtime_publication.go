@@ -72,6 +72,11 @@ func managedDoltLifecycleOwned(cityPath string) (bool, error) {
 	if cityUsesSharedDoltServer(cityPath) {
 		return false, nil
 	}
+	// When the city's bd metadata declares backend: mysql, bd talks directly
+	// to an external MySQL server. There is no managed-dolt runtime to own.
+	if cityUsesMySQLBackend(cityPath) {
+		return false, nil
+	}
 	if cityUsesBdStoreContract(cityPath) {
 		_, usesPostgres, err := postgresMetadataForScope(cityPath, cityPath)
 		if err != nil {

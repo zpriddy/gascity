@@ -490,6 +490,15 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		}
 		return nil
 	}
+	// MySQL-backed scopes: bd talks directly to MySQL using metadata.json
+	// connection params. Only install hooks; skip dolt-database verification
+	// and managed-port sync entirely.
+	if scopeUsesMySQLBackendForInit(dir) {
+		if err := installBeadHooks(dir); err != nil {
+			return fmt.Errorf("install hooks at %s: %w", dir, err)
+		}
+		return nil
+	}
 	doltDatabase := canonicalScopeDoltDatabase(cityPath, dir, prefix)
 	if err := normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase); err != nil {
 		return err
@@ -550,6 +559,13 @@ func scopeUsesPostgresBackendForInit(cityPath, dir string) (bool, error) {
 	}
 	_, usesPostgres, err := postgresMetadataForScope(cityPath, dir)
 	return usesPostgres, err
+}
+
+// scopeUsesMySQLBackendForInit returns true when the scope's metadata.json
+// declares backend: mysql. Direct read (mirrors cityUsesMySQLBackend) so the
+// init path can branch without pulling in postgres-style scope inheritance.
+func scopeUsesMySQLBackendForInit(dir string) bool {
+	return cityUsesMySQLBackend(dir)
 }
 
 func allowLegacyDoltMetadataRepair(fs fsys.FS, path string, err error) bool {
@@ -685,6 +701,11 @@ func ensureBeadsProvider(cityPath string) error {
 	if cityUsesSharedDoltServer(cityPath) {
 		return nil
 	}
+	// MySQL-backed bd cities have no managed-dolt service to start. bd talks
+	// directly to the external MySQL server using params from metadata.json.
+	if cityUsesMySQLBackend(cityPath) {
+		return nil
+	}
 	provider := beadsProvider(cityPath)
 	if strings.HasPrefix(provider, "exec:") {
 		release, err := acquireProviderSemaphoreForOp(cityPath, "start")
@@ -739,6 +760,13 @@ func shutdownBeadsProvider(cityPath string) error {
 	if cityUsesSharedDoltServer(cityPath) {
 		return clearManagedDoltRuntimeStateIfOwned(cityPath)
 	}
+	// MySQL-backed bd cities have no managed-dolt service to stop. There is
+	// also no gc-owned runtime state to clear (managedDoltLifecycleOwned
+	// returns false for mysql, so clearManagedDoltRuntimeStateIfOwned is a
+	// no-op anyway — call it for symmetry with shared-dolt path).
+	if cityUsesMySQLBackend(cityPath) {
+		return clearManagedDoltRuntimeStateIfOwned(cityPath)
+	}
 	provider := beadsProvider(cityPath)
 	if strings.HasPrefix(provider, "exec:") {
 		if providerUsesBdStoreContract(provider) {
@@ -780,6 +808,13 @@ func initBeadsForDir(cityPath, dir, prefix, doltDatabase string) error {
 		if err := seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase); err != nil {
 			return err
 		}
+		return nil
+	}
+	// MySQL-backed bd cities are initialized by the user via
+	// `bd init --backend=mysql`. gc must NOT re-run bd init here — doing so
+	// with default (dolt) backend would bulldoze the existing mysql
+	// metadata.json and break the city. Treat as already-initialized.
+	if cityUsesMySQLBackend(cityPath) {
 		return nil
 	}
 	provider := beadsProvider(cityPath)
@@ -974,6 +1009,12 @@ func initFileStoreForDir(cityPath, dir string) error {
 // operations from causing a thundering herd when dolt bounces.
 func healthBeadsProvider(cityPath string) error {
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
+		return nil
+	}
+	// MySQL-backed bd cities have no gc-managed health probe — bd talks
+	// directly to the external MySQL server. Treat as healthy here; bd will
+	// surface MySQL connectivity errors at first use.
+	if cityUsesMySQLBackend(cityPath) {
 		return nil
 	}
 	provider := beadsProvider(cityPath)
@@ -1185,6 +1226,12 @@ type doltRuntimeState struct {
 // .beads/dolt-server.port is a compatibility mirror for raw bd, not a GC
 // control-plane input.
 func currentDoltPort(cityPath string) string {
+	// MySQL-backed bd cities have no managed-dolt port at all. Skip the
+	// resolution dance and remove any stale compatibility port file.
+	if cityUsesMySQLBackend(cityPath) {
+		removeDoltPortFile(cityPath)
+		return ""
+	}
 	if port := currentResolvableManagedDoltPort(cityPath); port != "" {
 		writeDoltPortFile(cityPath, port, "", io.Discard)
 		return port
