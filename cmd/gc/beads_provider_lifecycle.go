@@ -170,9 +170,17 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	// calls, shell scripts) resolves the correct port without needing
 	// managed runtime state files.
 	if skipLocalDolt && cityUsesSharedDoltServer(cityPath) {
-		if port := resolveSharedDoltServerPort(); port != "" {
+		port := resolveSharedDoltServerPort()
+		if port != "" {
 			os.Setenv("BEADS_DOLT_SERVER_PORT", port)
 			os.Setenv("GC_DOLT_PORT", port)
+		} else {
+			// Shared-server cities require an external Dolt server; gc must
+			// not silently fall back to spawning a local dolt. Fail loudly so
+			// the operator fixes the config or starts the shared server,
+			// rather than ending up with a per-city dolt the city was
+			// explicitly configured to avoid.
+			return fmt.Errorf("shared Dolt server is required (dolt.shared-server: true) but the port cannot be resolved: set BEADS_DOLT_SERVER_PORT, write ~/.beads/shared-server/dolt-server.port, or ensure ~/.beads/shared-server/dolt-config.yaml has listener.port set; then start the shared server (e.g. `dolt sql-server --config ~/.beads/shared-server/dolt-config.yaml`)")
 		}
 	}
 	if !skipLocalDolt {
