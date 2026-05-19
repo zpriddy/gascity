@@ -1211,6 +1211,14 @@ type SessionConfig struct {
 	// NudgeLockTimeout is how long to wait to acquire the per-session nudge lock.
 	// Duration string. Defaults to "30s".
 	NudgeLockTimeout string `toml:"nudge_lock_timeout,omitempty" jsonschema:"default=30s"`
+	// NudgeIdleSecs is how long the user (any attached tmux client) must
+	// have been keyboard-idle before a nudge is delivered. Avoids
+	// interrupting an operator who is mid-typing. Detected via tmux's
+	// `#{client_activity}` (epoch seconds of last keypress). 0 disables
+	// the check (deliver immediately). Total deferral is capped at 5
+	// minutes so a permanently-active operator can't block forever.
+	// Defaults to 20.
+	NudgeIdleSecs *int `toml:"nudge_idle_secs,omitempty" jsonschema:"default=20"`
 	// DebounceMs is the default debounce interval in milliseconds for send-keys.
 	// Defaults to 500.
 	DebounceMs *int `toml:"debounce_ms,omitempty" jsonschema:"default=500"`
@@ -1314,6 +1322,16 @@ func (s *SessionConfig) DisplayMsOrDefault() int {
 		return 5000
 	}
 	return *s.DisplayMs
+}
+
+// NudgeIdleSecsOrDefault returns how long the user must be idle before
+// nudges deliver. Defaults to 20s if nil. 0 means disabled (immediate
+// delivery).
+func (s *SessionConfig) NudgeIdleSecsOrDefault() int {
+	if s.NudgeIdleSecs == nil {
+		return 20
+	}
+	return *s.NudgeIdleSecs
 }
 
 // ACPSessionConfig holds settings for the ACP session provider.

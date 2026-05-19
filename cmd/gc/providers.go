@@ -93,6 +93,7 @@ func tmuxConfigFromSession(sc config.SessionConfig, cityName, _ string) sessiont
 		NudgeReadyTimeout:  sc.NudgeReadyTimeoutDuration(),
 		NudgeRetryInterval: sc.NudgeRetryIntervalDuration(),
 		NudgeLockTimeout:   sc.NudgeLockTimeoutDuration(),
+		NudgeUserIdleSecs:  sc.NudgeIdleSecsOrDefault(),
 		DebounceMs:         sc.DebounceMsOrDefault(),
 		DisplayMs:          sc.DisplayMsOrDefault(),
 		SocketName:         socketName,

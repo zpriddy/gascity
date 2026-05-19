@@ -4394,6 +4394,29 @@ func TestSessionDebounceMsCustom(t *testing.T) {
 	}
 }
 
+func TestSessionNudgeIdleSecsDefault(t *testing.T) {
+	s := SessionConfig{}
+	if got := s.NudgeIdleSecsOrDefault(); got != 20 {
+		t.Errorf("NudgeIdleSecsOrDefault() = %d, want 20", got)
+	}
+}
+
+func TestSessionNudgeIdleSecsCustom(t *testing.T) {
+	v := 5
+	s := SessionConfig{NudgeIdleSecs: &v}
+	if got := s.NudgeIdleSecsOrDefault(); got != 5 {
+		t.Errorf("NudgeIdleSecsOrDefault() = %d, want 5", got)
+	}
+}
+
+func TestSessionNudgeIdleSecsZeroDisables(t *testing.T) {
+	v := 0
+	s := SessionConfig{NudgeIdleSecs: &v}
+	if got := s.NudgeIdleSecsOrDefault(); got != 0 {
+		t.Errorf("NudgeIdleSecsOrDefault() = %d, want 0 (disabled)", got)
+	}
+}
+
 func TestSessionDisplayMsDefault(t *testing.T) {
 	s := SessionConfig{}
 	got := s.DisplayMsOrDefault()

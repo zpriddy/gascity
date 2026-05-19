@@ -52,8 +52,17 @@ type Config struct {
 	// sent anyway (immediate fallback). Set to 0 to disable wait-idle and
 	// always send immediately.
 	NudgeIdleTimeout time.Duration
-	DebounceMs       int
-	DisplayMs        int
+	// NudgeUserIdleSecs is how long the user (any attached tmux client)
+	// must have been keyboard-idle before a nudge is delivered to a
+	// session that has a client attached. Avoids interrupting an
+	// operator who is mid-typing. Detected via tmux's
+	// `#{client_activity}` (epoch seconds of last keypress).
+	// 0 disables the check (deliver immediately). Capped at 5 minutes
+	// of total deferral so a permanently-active operator doesn't block
+	// nudges forever. Default: 20s.
+	NudgeUserIdleSecs int
+	DebounceMs        int
+	DisplayMs         int
 	// SocketName specifies the tmux socket name for per-city isolation.
 	// When set, all tmux commands use "tmux -L <socket>" to connect to
 	// a dedicated server. Empty means use the default tmux server.
@@ -68,6 +77,7 @@ func DefaultConfig() Config {
 		NudgeRetryInterval: 500 * time.Millisecond,
 		NudgeLockTimeout:   30 * time.Second,
 		NudgeIdleTimeout:   30 * time.Second,
+		NudgeUserIdleSecs:  20,
 		DebounceMs:         500,
 		DisplayMs:          5000,
 	}
@@ -3434,4 +3444,63 @@ func (t *Tmux) SetAutoRespawnHook(session string) error {
 	}
 
 	return nil
+}
+
+// waitForUserIdle blocks until either:
+//   - no attached client has had a keystroke within `userIdleSecs`, or
+//   - `cap` of total wall-clock has elapsed (hard ceiling so a
+//     permanently-active operator can't block a nudge forever), or
+//   - no client is attached / tmux is unreachable (no human present).
+//
+// Lighter design per pgr-we41: re-poll `#{client_activity}` in a small
+// loop with a sleep equal to the remaining idle gap, rather than
+// spinning a goroutine or queueing the nudge for redelivery. The
+// `name` parameter is informational only — `client_activity` is a
+// per-client value (last keystroke from THAT client into ANY pane on
+// the server), not per-session, so we examine all attached clients.
+//
+// Best-effort: errors from tmux are treated as "no client attached"
+// and return immediately so the nudge proceeds.
+func (t *Tmux) waitForUserIdle(name string, userIdleSecs int, cap time.Duration) {
+	_ = name // currently informational only; client_activity is per-client
+	if userIdleSecs <= 0 {
+		return
+	}
+	deadline := time.Now().Add(cap)
+	for {
+		out, err := t.run("list-clients", "-F", "#{client_activity}")
+		if err != nil || strings.TrimSpace(out) == "" {
+			return // no client attached, no human to disturb
+		}
+		now := time.Now().Unix()
+		var maxAct int64
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			act, perr := strconv.ParseInt(line, 10, 64)
+			if perr != nil {
+				continue
+			}
+			if act > maxAct {
+				maxAct = act
+			}
+		}
+		if maxAct == 0 {
+			return // unparseable — give up the deferral, deliver
+		}
+		gap := now - maxAct
+		if int(gap) >= userIdleSecs {
+			return // user idle long enough, deliver
+		}
+		// Sleep for just the remaining gap, then re-check (the user may
+		// have typed again in the meantime).
+		remaining := time.Duration(int64(userIdleSecs)-gap) * time.Second
+		if time.Now().Add(remaining).After(deadline) {
+			// Hard cap reached — deliver anyway.
+			return
+		}
+		time.Sleep(remaining)
+	}
 }

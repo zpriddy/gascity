@@ -441,6 +441,13 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 		// but Claude's cooperative queue will handle it at the next turn.
 		_ = p.tm.WaitForIdle(context.Background(), name, idleTimeout)
 	}
+	// Defer briefly if a human operator is mid-typing on the attached
+	// tmux client. Lightweight: re-read client_activity in a bounded
+	// loop (no goroutines, no requeue), capped at 5 min total to avoid
+	// blocking forever on a permanently-active user. See pgr-we41.
+	if userIdle := p.tm.cfg.NudgeUserIdleSecs; userIdle > 0 {
+		p.tm.waitForUserIdle(name, userIdle, 5*time.Minute)
+	}
 	return p.NudgeNow(name, content)
 }
 
