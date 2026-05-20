@@ -292,6 +292,17 @@
           "type": "boolean",
           "description": "InjectAssignedSkills controls whether gc appends an\n\"assigned skills\" appendix to the agent's rendered prompt. The\nappendix lists every skill visible to this agent, partitioned\ninto (assigned-to-you, shared-with-every-agent), so agents\nsharing a scope-root sink can tell which skills are their\nspecialization vs which are the city-wide set.\n\nPointer tri-state:\n  nil   -\u003e inherit: inject when the agent has a vendor sink\n  *true -\u003e explicitly inject (equivalent to the default)\n  *false -\u003e disable; the template is responsible for rendering\n            any skill guidance itself"
         },
+        "include_workspace_directories": {
+          "type": "boolean",
+          "description": "IncludeWorkspaceDirectories controls whether all workspace directories\nare injected into this agent's environment and prompt context.\nWhen true, all directories declared in [[workspace_directories]] are\navailable as GC_DIR_\u003cNAME\u003e env vars and {{.Dirs.\u003cname\u003e}} template vars."
+        },
+        "workspace_directory_names": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "WorkspaceDirectoryNames selectively includes specific workspace directories\nby name. When non-empty, only the listed directories are injected.\nTakes precedence over IncludeWorkspaceDirectories when both are set."
+        },
         "attach": {
           "type": "boolean",
           "description": "Attach controls whether the agent's session supports interactive\nattachment (e.g., tmux attach). When false, the agent can use a\nlighter runtime (subprocess instead of tmux). Defaults to true."
@@ -992,6 +1003,13 @@
           "type": "array",
           "description": "Rigs lists external projects registered in the city."
         },
+        "additional_directories": {
+          "items": {
+            "$ref": "#/$defs/WorkspaceDirectory"
+          },
+          "type": "array",
+          "description": "WorkspaceDirectories declares named directories available to agents.\nLighter than rigs: no beads DB, no pack imports, no agent scoping.\nTOML key: additional_directories (under [workspace] context)."
+        },
         "patches": {
           "$ref": "#/$defs/Patches",
           "description": "Patches holds targeted modifications applied after fragment merge."
@@ -1247,6 +1265,16 @@
           "type": "integer",
           "description": "ArchiveLevel controls Dolt's auto_gc archive aggressiveness.\n0 disables archive compaction (lower CPU on startup).\n1 enables archive compaction (higher CPU on startup).\nnil (omitted) defaults to 0.",
           "default": 0
+        },
+        "auto_gc": {
+          "type": "string",
+          "description": "AutoGc controls whether Dolt's auto_gc behavior is enabled in the\nmanaged dolt-config.yaml. Accepted values:\n  \"true\" / \"on\" / \"enabled\"   → auto_gc_behavior.enable=true,\n                                 dolt_auto_gc_enabled=\"ON\"\n  \"false\" / \"off\" / \"disabled\" → auto_gc_behavior.enable=false,\n                                  dolt_auto_gc_enabled=\"OFF\"\nEmpty (default) → \"true\". Override globally with env GC_DOLT_AUTO_GC.\nNote: dolt#10944's load-avg gate means upstream auto_gc may not fire\nin practice on busy machines; pair with `gc dolt compact` for\nguaranteed cleanup.",
+          "default": "true"
+        },
+        "autocommit": {
+          "type": "string",
+          "description": "Autocommit controls Dolt's session-level autocommit behavior in the\nmanaged dolt-config.yaml. Accepted values:\n  \"batch\" / \"off\"   → behavior.autocommit=false (group writes, fewer\n                      commits — recommended for managed gas-city use)\n  \"on\" / \"true\"     → behavior.autocommit=true  (commit per statement)\nEmpty (default) → \"batch\". Override globally with env GC_DOLT_AUTOCOMMIT.",
+          "default": "batch"
         }
       },
       "additionalProperties": false,
@@ -2257,6 +2285,11 @@
           "description": "NudgeLockTimeout is how long to wait to acquire the per-session nudge lock.\nDuration string. Defaults to \"30s\".",
           "default": "30s"
         },
+        "nudge_idle_secs": {
+          "type": "integer",
+          "description": "NudgeIdleSecs is how long the user (any attached tmux client) must\nhave been keyboard-idle before a nudge is delivered. Avoids\ninterrupting an operator who is mid-typing. Detected via tmux's\n`#{client_activity}` (epoch seconds of last keypress). 0 disables\nthe check (deliver immediately). Total deferral is capped at 5\nminutes so a permanently-active operator can't block forever.\nDefaults to 20.",
+          "default": 20
+        },
         "debounce_ms": {
           "type": "integer",
           "description": "DebounceMs is the default debounce interval in milliseconds for send-keys.\nDefaults to 500.",
@@ -2398,6 +2431,33 @@
       "additionalProperties": false,
       "type": "object",
       "description": "Workspace holds city-level metadata and optional defaults that apply to all agents unless overridden per-agent."
+    },
+    "WorkspaceDirectory": {
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name is the unique identifier for this directory."
+        },
+        "path": {
+          "type": "string",
+          "description": "Path is the filesystem path. May use {rig:\u003cname\u003e} interpolation\nfor paths nested inside a registered rig."
+        },
+        "git_enabled": {
+          "type": "boolean",
+          "description": "GitEnabled allows agents to make git commits in this directory.\nWhen false (default), agents should treat the directory as read-only."
+        },
+        "default_branch": {
+          "type": "string",
+          "description": "DefaultBranch is the directory's mainline branch when GitEnabled=true.\nUsed by agents to ensure they're on the correct branch before committing."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "path"
+      ],
+      "description": "WorkspaceDirectory declares a named directory available to agents."
     }
   },
   "title": "Gas City Configuration",

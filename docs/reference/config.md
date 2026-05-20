@@ -21,6 +21,7 @@ City is the top-level configuration for a Gas City instance.
 | `agent` | []Agent |  |  | Agents lists all configured agents in this city. Optional: PackV2 cities compose agents through [imports.*] and ship without any [[agent]] block. |
 | `named_session` | []NamedSession |  |  | NamedSessions lists canonical alias-backed sessions built from reusable agent templates. |
 | `rigs` | []Rig |  |  | Rigs lists external projects registered in the city. |
+| `additional_directories` | []WorkspaceDirectory |  |  | WorkspaceDirectories declares named directories available to agents. Lighter than rigs: no beads DB, no pack imports, no agent scoping. TOML key: additional_directories (under [workspace] context). |
 | `patches` | Patches |  |  | Patches holds targeted modifications applied after fragment merge. |
 | `beads` | BeadsConfig |  |  | Beads configures the bead store backend. |
 | `session` | SessionConfig |  |  | Session configures the session provider backend. |
@@ -113,6 +114,8 @@ Agent defines a configured agent in the city.
 | `inject_fragments` | []string |  |  | InjectFragments lists named template fragments to append to this agent's rendered prompt. Fragments come from shared template directories across all loaded packs. Each name must match a &#123;&#123; define "name" &#125;&#125; block. |
 | `append_fragments` | []string |  |  | AppendFragments is the V2 per-agent alias for prompt fragment injection. It layers after InjectFragments and before inherited/default fragments. |
 | `inject_assigned_skills` | boolean |  |  | InjectAssignedSkills controls whether gc appends an "assigned skills" appendix to the agent's rendered prompt. The appendix lists every skill visible to this agent, partitioned into (assigned-to-you, shared-with-every-agent), so agents sharing a scope-root sink can tell which skills are their specialization vs which are the city-wide set.  Pointer tri-state:   nil   -&gt; inherit: inject when the agent has a vendor sink   *true -&gt; explicitly inject (equivalent to the default)   *false -&gt; disable; the template is responsible for rendering             any skill guidance itself |
+| `include_workspace_directories` | boolean |  |  | IncludeWorkspaceDirectories controls whether all workspace directories are injected into this agent's environment and prompt context. When true, all directories declared in [[workspace_directories]] are available as GC_DIR_&lt;NAME&gt; env vars and &#123;&#123;.Dirs.&lt;name&gt;&#125;&#125; template vars. |
+| `workspace_directory_names` | []string |  |  | WorkspaceDirectoryNames selectively includes specific workspace directories by name. When non-empty, only the listed directories are injected. Takes precedence over IncludeWorkspaceDirectories when both are set. |
 | `attach` | boolean |  |  | Attach controls whether the agent's session supports interactive attachment (e.g., tmux attach). When false, the agent can use a lighter runtime (subprocess instead of tmux). Defaults to true. |
 | `fallback` | boolean |  |  | Fallback marks this agent as a fallback definition. During pack composition, a non-fallback agent with the same name wins silently. When two fallbacks collide, the first loaded (depth-first) wins. See docs/guides/migrating-to-pack-vnext.md for migration guidance. |
 | `depends_on` | []string |  |  | DependsOn lists agent names that must be awake before this agent wakes. Used for dependency-ordered startup and shutdown. Validated for cycles at config load time. |
@@ -315,6 +318,8 @@ DoltConfig holds optional dolt server overrides.
 | `port` | integer |  | `0` | Port is the dolt server port. 0 means use ephemeral port allocation (hashed from city path). Set explicitly to override. |
 | `host` | string |  | `localhost` | Host is the dolt server hostname. Defaults to localhost. |
 | `archive_level` | integer |  | `0` | ArchiveLevel controls Dolt's auto_gc archive aggressiveness. 0 disables archive compaction (lower CPU on startup). 1 enables archive compaction (higher CPU on startup). nil (omitted) defaults to 0. |
+| `auto_gc` | string |  | `true` | AutoGc controls whether Dolt's auto_gc behavior is enabled in the managed dolt-config.yaml. Accepted values:   "true" / "on" / "enabled"   → auto_gc_behavior.enable=true,                                  dolt_auto_gc_enabled="ON"   "false" / "off" / "disabled" → auto_gc_behavior.enable=false,                                   dolt_auto_gc_enabled="OFF" Empty (default) → "true". Override globally with env GC_DOLT_AUTO_GC. Note: dolt#10944's load-avg gate means upstream auto_gc may not fire in practice on busy machines; pair with `gc dolt compact` for guaranteed cleanup. |
+| `autocommit` | string |  | `batch` | Autocommit controls Dolt's session-level autocommit behavior in the managed dolt-config.yaml. Accepted values:   "batch" / "off"   → behavior.autocommit=false (group writes, fewer                       commits — recommended for managed gas-city use)   "on" / "true"     → behavior.autocommit=true  (commit per statement) Empty (default) → "batch". Override globally with env GC_DOLT_AUTOCOMMIT. |
 
 ## EventsConfig
 
@@ -662,6 +667,7 @@ SessionConfig holds session provider settings.
 | `nudge_ready_timeout` | string |  | `10s` | NudgeReadyTimeout is how long to wait for the agent to be ready before sending nudge text. Duration string. Defaults to "10s". |
 | `nudge_retry_interval` | string |  | `500ms` | NudgeRetryInterval is the retry interval between nudge readiness polls. Duration string. Defaults to "500ms". |
 | `nudge_lock_timeout` | string |  | `30s` | NudgeLockTimeout is how long to wait to acquire the per-session nudge lock. Duration string. Defaults to "30s". |
+| `nudge_idle_secs` | integer |  | `20` | NudgeIdleSecs is how long the user (any attached tmux client) must have been keyboard-idle before a nudge is delivered. Avoids interrupting an operator who is mid-typing. Detected via tmux's `#&#123;client_activity&#125;` (epoch seconds of last keypress). 0 disables the check (deliver immediately). Total deferral is capped at 5 minutes so a permanently-active operator can't block forever. Defaults to 20. |
 | `debounce_ms` | integer |  | `500` | DebounceMs is the default debounce interval in milliseconds for send-keys. Defaults to 500. |
 | `display_ms` | integer |  | `5000` | DisplayMs is the default display duration in milliseconds for status messages. Defaults to 5000. |
 | `startup_timeout` | string |  | `60s` | StartupTimeout is how long to wait for each agent's Start() call before treating it as failed. Duration string (e.g., "60s", "2m"). Defaults to "60s". |
@@ -707,4 +713,15 @@ Workspace holds city-level metadata and optional defaults that apply to all agen
 | `includes` | []string |  |  | Includes is the legacy city.toml pack-composition list.  Deprecated: use root pack.toml [imports.*] instead. Run gc doctor to inspect; gc doctor --fix handles the safe mechanical rewrites available in this release wave. Each entry is a local path, a git source//sub#ref URL, or a GitHub tree URL. |
 | `default_rig_includes` | []string |  |  | DefaultRigIncludes is the legacy city.toml default-rig pack list.  Deprecated: use city.toml [defaults.rig.imports.&lt;binding&gt;] instead. Run gc doctor to inspect; gc doctor --fix handles the safe mechanical rewrites available in this release wave. |
 | `env` | map[string]string |  |  | Env defines workspace-wide environment variables applied to every managed session. Lowest config-precedence — overridden by provider, agent, and patch env. Use for cross-cutting variables like GC_TARGET_BRANCH that every agent should inherit. |
+
+## WorkspaceDirectory
+
+WorkspaceDirectory declares a named directory available to agents.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | **yes** |  | Name is the unique identifier for this directory. |
+| `path` | string | **yes** |  | Path is the filesystem path. May use &#123;rig:&lt;name&gt;&#125; interpolation for paths nested inside a registered rig. |
+| `git_enabled` | boolean |  |  | GitEnabled allows agents to make git commits in this directory. When false (default), agents should treat the directory as read-only. |
+| `default_branch` | string |  |  | DefaultBranch is the directory's mainline branch when GitEnabled=true. Used by agents to ensure they're on the correct branch before committing. |
 

@@ -31,12 +31,14 @@ ifeq ($(shell uname),Darwin)
 endif
 
 # Fork-build counter file — bumped manually each time we apply or change
-# our fork-only patches on top of the current upstream SHA. Restarts at 1
-# whenever the upstream short SHA in $(COMMIT) changes (i.e. when we
-# rebase onto a new upstream).
+# our fork-only patches on top of the current upstream SHA.
+#
+# Format: a semver-style fork tag like "1.0.0-zv1". The build name is
+# "<fork-version>+<sha>" so `gc version` shows e.g. "1.0.0-zv1+18b41fa1"
+# — fork tag for humans, sha for traceability.
 ZP_FORK_VERSION_FILE := .zp-fork-version
-ZP_FORK_COUNTER := $(shell cat $(ZP_FORK_VERSION_FILE) 2>/dev/null | tr -d '[:space:]')
-ZP_BUILD := $(COMMIT)-zp.$(ZP_FORK_COUNTER)
+ZP_FORK_VERSION := $(shell cat $(ZP_FORK_VERSION_FILE) 2>/dev/null | tr -d '[:space:]')
+ZP_BUILD := $(ZP_FORK_VERSION)+$(COMMIT)
 ZP_LDFLAGS := -X main.version=$(ZP_BUILD) \
               -X main.commit=$(COMMIT) \
               -X main.date=$(BUILD_TIME)
@@ -45,12 +47,12 @@ ZP_LDFLAGS := -X main.version=$(ZP_BUILD) \
 # to ad-hoc-sign instead.
 ZP_CODESIGN_IDENTITY ?= Apple Development: Zak Priddy (9ULEP73AAX)
 
-## build-zp: build gc with fork version <sha>-zp.<n> (reads .zp-fork-version).
+## build-zp: build gc with fork version <fork-version>+<sha> (reads .zp-fork-version).
 ## Convention: lets us tell forked builds apart from upstream at a glance
 ## via `gc version`.
 build-zp:
-	@if [ -z "$(ZP_FORK_COUNTER)" ]; then \
-		echo "ERROR: $(ZP_FORK_VERSION_FILE) missing or empty. Create it with an integer (e.g. echo 1 > $(ZP_FORK_VERSION_FILE))." >&2; \
+	@if [ -z "$(ZP_FORK_VERSION)" ]; then \
+		echo "ERROR: $(ZP_FORK_VERSION_FILE) missing or empty. Create it with a semver fork tag (e.g. echo 1.0.0-zv1 > $(ZP_FORK_VERSION_FILE))." >&2; \
 		exit 1; \
 	fi
 	@echo "Building $(BINARY) (fork build: $(ZP_BUILD))..."

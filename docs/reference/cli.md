@@ -27,11 +27,13 @@ gc [flags]
 | [gc beads](#gc-beads) | Manage the beads provider |
 | [gc build-image](#gc-build-image) | Build a prebaked agent container image |
 | [gc cities](#gc-cities) | List registered cities |
+| [gc city-window](#gc-city-window) | Open a multi-pane tmux window showing city agents |
 | [gc completion](#gc-completion) | Generate the autocompletion script for the specified shell |
 | [gc config](#gc-config) | Inspect and validate city configuration |
 | [gc converge](#gc-converge) | Manage convergence loops (bounded iterative refinement) |
 | [gc convoy](#gc-convoy) | Manage convoys — graphs of related work |
 | [gc dashboard](#gc-dashboard) | Web dashboard for monitoring the supervisor and managed cities |
+| [gc dir](#gc-dir) | Manage workspace directories |
 | [gc doctor](#gc-doctor) | Check workspace health |
 | [gc dolt-cleanup](#gc-dolt-cleanup) | Find and remove orphaned Dolt databases (Go-side core) |
 | [gc event](#gc-event) | Event operations |
@@ -470,6 +472,27 @@ gc cities list [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | Output one JSONL result record |
+
+## gc city-window
+
+Create a tmux window with a multi-pane layout showing city agents.
+
+Default layout: mayor on the left half, 3 panes on the right
+(concierge, terraform-deploy-agent, terraform-code-agent).
+Each pane auto-reconnects when sessions restart.
+
+Press prefix+a to pop a picker menu to switch any pane to a
+different agent.
+
+```
+gc city-window [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--agents` | stringSlice | `[mayor,concierge,terraform-deploy-agent,terraform-code-agent]` | comma-separated agent aliases |
+| `--name` | string | `city` | tmux window name |
+| `--no-monitor` | bool |  | disable attention auto-focus |
 
 ## gc completion
 
@@ -1102,6 +1125,44 @@ gc dashboard serve [flags]
 |------|------|---------|-------------|
 | `--api` | string |  | GC API server URL override (auto-discovered by default) |
 | `--port` | int | `8080` | HTTP port |
+
+## gc dir
+
+Manage workspace directories declared in the city config.
+
+Workspace directories are named path references available to agents.
+They are lighter than rigs: no beads database, no pack imports, no
+agent scoping. Agents opt in to receive directory paths as environment
+variables and template context.
+
+```
+gc dir
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc dir list](#gc-dir-list) | List workspace directories |
+| [gc dir status](#gc-dir-status) | Show workspace directory status |
+
+## gc dir list
+
+List all workspace directories declared in the city config with resolved paths.
+
+```
+gc dir list [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | output as JSON |
+
+## gc dir status
+
+Show status of workspace directories: existence on disk, git status if enabled.
+
+```
+gc dir status
+```
 
 ## gc doctor
 
