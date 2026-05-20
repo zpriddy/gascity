@@ -22,6 +22,17 @@ func claudeHookCommand(t *testing.T, data []byte, event string) string {
 	return entries[0].Hooks[0].Command
 }
 
+// jsonEscaped returns the JSON-encoded form of s without the surrounding
+// quotes. Useful for searching/replacing inside an embedded JSON document
+// where the literal `"` characters in the constant are escaped to `\"`.
+func jsonEscaped(s string) string {
+	enc, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(enc[1 : len(enc)-1])
+}
+
 type claudeHookEntry struct {
 	Matcher string `json:"matcher"`
 	Hooks   []struct {
@@ -221,7 +232,7 @@ func TestInstallClaudeUpgradesGeneratedFileMissingManagedSessionMarkers(t *testi
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
-	stale := strings.Replace(string(current), `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex`, `gc prime --hook`, 1)
+	stale := strings.Replace(string(current), jsonEscaped(sessionStartCurrentFormBody), `gc prime --hook`, 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check SessionStart marker pattern")
 	}
@@ -252,7 +263,7 @@ func TestInstallClaudeUpgradesPreviousCanonicalSessionStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
-	stale := strings.Replace(string(current), sessionStartCurrentFormBody, sessionStartPreviousManagedFormBody, 1)
+	stale := strings.Replace(string(current), jsonEscaped(sessionStartCurrentFormBody), jsonEscaped(sessionStartPreviousManagedFormBody), 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check previous SessionStart pattern")
 	}
@@ -533,7 +544,7 @@ func TestUpgradeCodexHooksSkipsWhenDesiredPreCompactUnavailable(t *testing.T) {
     "SessionStart": [{
       "hooks": [{
         "type": "command",
-        "command": "GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex"
+        "command": "` + jsonEscaped(sessionStartCurrentFormBody) + `"
       }]
     }]
   }
@@ -627,7 +638,7 @@ func TestInstallClaudeUpgradesGeneratedFileWithCombinedKnownDrift(t *testing.T) 
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
-	stale := strings.Replace(string(current), `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex`, `gc prime --hook`, 1)
+	stale := strings.Replace(string(current), jsonEscaped(sessionStartCurrentFormBody), `gc prime --hook`, 1)
 	stale = strings.Replace(stale, `"matcher": "startup"`, `"matcher": ""`, 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check combined SessionStart drift pattern")
@@ -668,7 +679,7 @@ func TestInstallClaudeUpgradesGeneratedFileWithAllKnownDrift(t *testing.T) {
 		t.Fatalf("readEmbedded: %v", err)
 	}
 	stale := strings.Replace(string(current), `gc handoff --auto \"context cycle\"`, `gc prime --hook`, 1)
-	stale = strings.Replace(stale, `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex`, `gc prime --hook --hook-format codex`, 1)
+	stale = strings.Replace(stale, jsonEscaped(sessionStartCurrentFormBody), jsonEscaped(sessionStartPreviousCodexFormBody), 1)
 	stale = strings.Replace(stale, `"matcher": "startup"`, `"matcher": ""`, 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check all known Claude drift patterns")
