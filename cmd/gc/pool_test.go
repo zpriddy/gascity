@@ -838,6 +838,8 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		MCPDir:                       "/mcp",
 		HooksInstalled:               &trueVal,
 		InjectAssignedSkills:         &trueVal,
+		IncludeWorkspaceDirectories:  &trueVal,
+		WorkspaceDirectoryNames:      []string{"repo"},
 		SessionSetup:                 []string{"setup-cmd"},
 		SessionSetupScript:           "scripts/setup.sh",
 		SessionLive:                  []string{"live-cmd"},

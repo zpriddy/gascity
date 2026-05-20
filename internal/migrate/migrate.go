@@ -91,6 +91,8 @@ type agentFile struct {
 	InstallAgentHooks      []string          `toml:"install_agent_hooks,omitempty"`
 	HooksInstalled         *bool             `toml:"hooks_installed,omitempty"`
 	InjectAssignedSkills   *bool             `toml:"inject_assigned_skills,omitempty"`
+	IncludeWorkspaceDirectories *bool        `toml:"include_workspace_directories,omitempty"`
+	WorkspaceDirectoryNames     []string     `toml:"workspace_directory_names,omitempty"`
 	SessionSetup           []string          `toml:"session_setup,omitempty"`
 	SessionSetupScript     string            `toml:"session_setup_script,omitempty"`
 	SessionLive            []string          `toml:"session_live,omitempty"`
@@ -893,6 +895,8 @@ func agentConfigFromAgent(agent config.Agent) agentFile {
 		InstallAgentHooks:      agent.InstallAgentHooks,
 		HooksInstalled:         agent.HooksInstalled,
 		InjectAssignedSkills:   agent.InjectAssignedSkills,
+		IncludeWorkspaceDirectories: agent.IncludeWorkspaceDirectories,
+		WorkspaceDirectoryNames:     agent.WorkspaceDirectoryNames,
 		SessionSetup:           agent.SessionSetup,
 		SessionSetupScript:     agent.SessionSetupScript,
 		SessionLive:            agent.SessionLive,
