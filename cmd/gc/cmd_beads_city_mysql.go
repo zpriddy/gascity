@@ -176,6 +176,12 @@ func doBeadsCityUseMysql(fs fsys.FS, cityPath string, opts cityMysqlOptions, std
 		// the warning but don't roll back.
 		fmt.Fprintf(stderr, "%s: warning: stopping managed dolt: %v\n", name, err) //nolint:errcheck
 	}
+	// Clean up dolt-runtime side-files (dolt/, dolt-server.port) left behind
+	// by gc init's brief dolt path. Best-effort: errors are surfaced as
+	// warnings but don't fail the command, mirroring stopManagedDolt above.
+	if err := clearDoltSideFiles(cityPath, rigPlans); err != nil {
+		fmt.Fprintf(stderr, "%s: warning: cleaning dolt side files: %v\n", name, err) //nolint:errcheck
+	}
 
 	printMysqlResult(stdout, cityPath, opts, rigPlans)
 	return 0
@@ -430,6 +436,33 @@ func setBdCustomTypes(scopeRoot, bdPath string) error {
 		return fmt.Errorf("bd config set types.custom: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// clearDoltSideFiles removes per-scope dolt runtime artifacts that linger
+// after a brief dolt-init pass (e.g. when gc init scaffolds a city with bd
+// init's dolt default before flipping to mysql). These are inert when no
+// dolt server is running but look like configuration drift to gc doctor.
+//
+// Removed: .beads/dolt/ directory, .beads/dolt-server.port file. Both
+// per-scope (city + each rig that the cascade touched).
+func clearDoltSideFiles(cityPath string, rigPlans []cityRigEndpointPlan) error {
+	scopes := []string{cityPath}
+	for _, plan := range rigPlans {
+		if plan.Update {
+			scopes = append(scopes, plan.Rig.Path)
+		}
+	}
+	var firstErr error
+	for _, scope := range scopes {
+		beadsDir := filepath.Join(scope, ".beads")
+		if err := os.RemoveAll(filepath.Join(beadsDir, "dolt")); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("remove %s/dolt: %w", beadsDir, err)
+		}
+		if err := os.Remove(filepath.Join(beadsDir, "dolt-server.port")); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = fmt.Errorf("remove %s/dolt-server.port: %w", beadsDir, err)
+		}
+	}
+	return firstErr
 }
 
 // stopManagedDoltIfRunning best-effort stops any managed-dolt runtime owned by
