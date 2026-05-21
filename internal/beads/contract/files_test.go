@@ -1292,27 +1292,27 @@ func TestLoadMetadataStateRejectFixtures(t *testing.T) {
 		{
 			name:            "E3 mixed backends fires before required-fields",
 			fixture:         "reject_mixed_backends.json",
-			wantErrContains: "cannot mix dolt and postgres fields in a single scope (backend=dolt but postgres_database is also set)",
+			wantErrContains: "cannot mix backend fields in a single scope (backend=dolt but postgres_database is also set)",
 		},
 		{
 			name:            "E3 rejects explicit dolt with postgres fields",
 			fixture:         "reject_dolt_with_postgres_field.json",
-			wantErrContains: "cannot mix dolt and postgres fields in a single scope (backend=dolt but postgres_host is also set)",
+			wantErrContains: "cannot mix backend fields in a single scope (backend=dolt but postgres_host is also set)",
 		},
 		{
 			name:            "E3 surfaces dolt field when backend=postgres",
 			fixture:         "reject_mixed_pg_backend_with_dolt.json",
-			wantErrContains: "cannot mix dolt and postgres fields in a single scope (backend=postgres but dolt_database is also set)",
+			wantErrContains: "cannot mix backend fields in a single scope (backend=postgres but dolt_database is also set)",
 		},
 		{
 			name:            "E3 rejects explicit postgres with dolt fields",
 			fixture:         "reject_postgres_with_dolt_field.json",
-			wantErrContains: "cannot mix dolt and postgres fields in a single scope (backend=postgres but dolt_database is also set)",
+			wantErrContains: "cannot mix backend fields in a single scope (backend=postgres but dolt_database is also set)",
 		},
 		{
 			name:            "E3 surfaces dolt field first when backend is empty",
 			fixture:         "reject_mixed_empty_backend.json",
-			wantErrContains: "cannot mix dolt and postgres fields in a single scope (backend= but dolt_database is also set)",
+			wantErrContains: "cannot mix backend fields in a single scope (backend= but dolt_database is also set)",
 		},
 		{
 			name:            "E4 postgres missing host",
@@ -1629,5 +1629,222 @@ func TestEnsureCanonicalMetadataPreservesAllKeysOnEmptyBackend(t *testing.T) {
 		if _, ok := meta[key]; !ok {
 			t.Fatalf("metadata should preserve %q when backend is empty: %s", key, data)
 		}
+	}
+}
+
+func TestEnsureCanonicalConfigWritesMysqlFields(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	changed, err := EnsureCanonicalConfig(fs, path, ConfigState{
+		IssuePrefix:    "cs",
+		Backend:        "mysql",
+		EndpointOrigin: EndpointOriginManagedCity,
+		EndpointStatus: EndpointStatusVerified,
+		MysqlHost:      "127.0.0.1",
+		MysqlPort:      "3306",
+		MysqlUser:      "root",
+		MysqlDatabase:  "csi_beads",
+	})
+	if err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("EnsureCanonicalConfig() should report changes for new file")
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, needle := range []string{
+		"issue_prefix: cs",
+		"mysql.server-host: 127.0.0.1",
+		"mysql.server-port: 3306",
+		"mysql.server-user: root",
+		"mysql.database: csi_beads",
+		"dolt.auto-start: false",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("config missing %q:\n%s", needle, text)
+		}
+	}
+	for _, forbidden := range []string{"dolt.host:", "dolt.port:", "dolt.user:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("mysql-backend config should not contain %q:\n%s", forbidden, text)
+		}
+	}
+}
+
+func TestEnsureCanonicalConfigMysqlScrubsDoltConnectionFields(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	input := strings.Join([]string{
+		"issue_prefix: cs",
+		"dolt.host: 127.0.0.1",
+		"dolt.port: 3307",
+		"dolt.user: root",
+		"",
+	}, "\n")
+	if err := fs.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{
+		IssuePrefix:   "cs",
+		Backend:       "mysql",
+		MysqlHost:     "127.0.0.1",
+		MysqlPort:     "3306",
+		MysqlUser:     "root",
+		MysqlDatabase: "csi_beads",
+	}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, forbidden := range []string{"dolt.host:", "dolt.port:", "dolt.user:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("mysql canonicalisation should scrub %q:\n%s", forbidden, text)
+		}
+	}
+}
+
+func TestLoadMetadataStateAcceptsMysqlBackend(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metadata.json")
+	body := `{"backend":"mysql","database":"csi_beads","mysql_host":"127.0.0.1","mysql_port":"3306","mysql_user":"root","mysql_database":"csi_beads"}`
+	if err := fs.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, ok, err := LoadMetadataState(fs, path)
+	if err != nil {
+		t.Fatalf("LoadMetadataState() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("LoadMetadataState() should report file present")
+	}
+	if state.Backend != "mysql" || state.MysqlDatabase != "csi_beads" || state.MysqlPort != "3306" {
+		t.Fatalf("unexpected state: %+v", state)
+	}
+}
+
+func TestLoadMetadataStateRejectsMysqlMissingFields(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metadata.json")
+	body := `{"backend":"mysql","database":"csi_beads","mysql_host":"127.0.0.1"}`
+	if err := fs.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadMetadataState(fs, path)
+	if err == nil {
+		t.Fatal("expected mysql-required error, got nil")
+	}
+	var perr *MetadataParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("expected MetadataParseError, got %T: %v", err, err)
+	}
+	if !strings.Contains(perr.Reason, "backend=mysql requires") {
+		t.Fatalf("unexpected reason: %s", perr.Reason)
+	}
+}
+
+func TestLoadMetadataStateRejectsMixedDoltAndMysql(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metadata.json")
+	body := `{"backend":"mysql","database":"csi_beads","dolt_database":"hq","mysql_host":"127.0.0.1","mysql_port":"3306","mysql_user":"root","mysql_database":"csi_beads"}`
+	if err := fs.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadMetadataState(fs, path)
+	if err == nil {
+		t.Fatal("expected mixed-backend error, got nil")
+	}
+	var perr *MetadataParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("expected MetadataParseError, got %T: %v", err, err)
+	}
+	if !strings.Contains(perr.Reason, "cannot mix") || !strings.Contains(perr.Reason, "dolt_database") {
+		t.Fatalf("unexpected reason: %s", perr.Reason)
+	}
+}
+
+func TestEnsureCanonicalMetadataMysqlScrubsDoltAndPostgresKeys(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metadata.json")
+	body := `{"backend":"dolt","database":"hq","dolt_database":"hq","dolt_mode":"server","postgres_host":"oldpg"}`
+	if err := fs.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := EnsureCanonicalMetadata(fs, path, MetadataState{
+		Database:      "csi_beads",
+		Backend:       "mysql",
+		MysqlHost:     "127.0.0.1",
+		MysqlPort:     "3306",
+		MysqlUser:     "root",
+		MysqlDatabase: "csi_beads",
+	})
+	if err != nil {
+		t.Fatalf("EnsureCanonicalMetadata() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("expected changes")
+	}
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if meta["backend"] != "mysql" {
+		t.Fatalf("backend should be mysql: %v", meta)
+	}
+	for _, key := range []string{"dolt_database", "dolt_mode", "postgres_host"} {
+		if _, ok := meta[key]; ok {
+			t.Fatalf("%q should be scrubbed when backend=mysql: %v", key, meta)
+		}
+	}
+	for _, key := range []string{"mysql_host", "mysql_port", "mysql_user", "mysql_database"} {
+		if _, ok := meta[key]; !ok {
+			t.Fatalf("%q should be present when backend=mysql: %v", key, meta)
+		}
+	}
+}
+
+func TestReadConfigStateInfersMysqlBackend(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	input := strings.Join([]string{
+		"issue_prefix: cs",
+		"mysql.server-host: 127.0.0.1",
+		"mysql.server-port: 3306",
+		"mysql.server-user: root",
+		"mysql.database: csi_beads",
+		"",
+	}, "\n")
+	if err := fs.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, ok, err := ReadConfigState(fs, path)
+	if err != nil || !ok {
+		t.Fatalf("ReadConfigState() ok=%v err=%v", ok, err)
+	}
+	if state.Backend != "mysql" {
+		t.Fatalf("expected Backend=mysql, got %q", state.Backend)
+	}
+	if state.MysqlDatabase != "csi_beads" || state.MysqlHost != "127.0.0.1" {
+		t.Fatalf("mysql fields not populated: %+v", state)
 	}
 }
