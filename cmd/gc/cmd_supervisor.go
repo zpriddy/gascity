@@ -1075,6 +1075,11 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc supervisor: workspace-service startup cleanup: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	// MySQL autostart: best-effort attempt to ensure mysqld is running for
+	// any registered city that uses backend=mysql with a loopback host.
+	// Failures are non-fatal; mysql cities that can't reach mysqld will fail
+	// their own probes downstream with clear errors.
+	supervisorEnsureMysqldRunning(reg, stdout, stderr)
 
 	// Start API server with city-namespaced routing (Phase 2).
 	startedAt := time.Now()
