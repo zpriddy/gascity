@@ -200,6 +200,12 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			register(newDoltTopologyCheck(cityPath, cfg))
 			register(newDoltDriftCheck(cityPath, cfg))
 		}
+		// Always register the mysql-backend check — it self-skips for non-
+		// mysql scopes and is cheap enough to run unconditionally.
+		register(newMysqlBackendCheck(cityPath))
+		for _, rig := range cfg.Rigs {
+			register(newMysqlBackendCheck(rig.Path))
+		}
 		register(doctor.NewConfigValidCheck(cfg))
 		register(doctor.NewConfigRefsCheck(cfg, cityPath))
 		register(doctor.NewStaleLocalPackDirCheck(cfg.Packs, cfg.Imports, cfg.DefaultRigImports, cityPath, cfg.Rigs...))
