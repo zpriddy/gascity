@@ -1065,22 +1065,28 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 }
 
 // orderRequiresManagedDolt reports whether an order's exec path depends
-// on a managed Dolt runtime (port_resolve.sh / runtime.sh / dolt-target.sh).
-// MySQL-backed cities have no managed Dolt — these orders fail with
-// "cannot resolve runtime port" or "load metadata: unsupported backend"
-// and must be quietly skipped, not run.
+// on a managed Dolt runtime (port_resolve.sh / runtime.sh / dolt-target.sh)
+// or invokes `gc bd list` / `gc rig list` which themselves trigger the
+// gc-beads-bd.sh op_recover path. MySQL-backed cities have no managed
+// Dolt — these orders fail with "cannot resolve runtime port" or
+// "load metadata: unsupported backend", or worse, silently spawn rogue
+// dolt servers via the bd wrapper's recover-managed loop. They must be
+// quietly skipped, not run.
 //
 // Detection is by Source path: orders shipped from packs/dolt/ are all
-// dolt-only; the maintenance pack ships two dolt-dependent exec scripts
-// (mol-dog-jsonl, mol-dog-reaper) that source dolt-target.sh and resolve
-// GC_DOLT_PORT before doing anything else.
+// dolt-only; the maintenance pack ships three dolt-dependent exec scripts
+// (mol-dog-jsonl, mol-dog-reaper, orphan-sweep). The first two source
+// dolt-target.sh and resolve GC_DOLT_PORT before doing anything else;
+// orphan-sweep calls `gc bd list` / `gc rig list` which route through
+// gc-beads-bd.sh and unconditionally invoke op_recover regardless of
+// backend type.
 func orderRequiresManagedDolt(a orders.Order) bool {
 	src := strings.ReplaceAll(a.Source, string(os.PathSeparator), "/")
 	if strings.Contains(src, "/packs/dolt/") {
 		return true
 	}
 	switch a.Name {
-	case "mol-dog-jsonl", "mol-dog-reaper":
+	case "mol-dog-jsonl", "mol-dog-reaper", "orphan-sweep":
 		return true
 	}
 	return false

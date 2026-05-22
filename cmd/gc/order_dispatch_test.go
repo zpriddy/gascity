@@ -6568,3 +6568,50 @@ func TestOrderDispatchSingleFlightLockFailsClosedOnPartialTierError(t *testing.T
 		t.Fatal("hasOpenWorkStrict returned true with partial tier error; caller must fail closed instead")
 	}
 }
+
+func TestOrderRequiresManagedDolt(t *testing.T) {
+	cases := []struct {
+		name   string
+		order  orders.Order
+		expect bool
+	}{
+		{
+			name:   "dolt-pack-source",
+			order:  orders.Order{Name: "dolt-status", Source: filepath.Join(".gc", "system", "packs", "dolt", "orders", "status.toml")},
+			expect: true,
+		},
+		{
+			name:   "mol-dog-jsonl-by-name",
+			order:  orders.Order{Name: "mol-dog-jsonl", Source: "anywhere/orders/mol-dog-jsonl.toml"},
+			expect: true,
+		},
+		{
+			name:   "mol-dog-reaper-by-name",
+			order:  orders.Order{Name: "mol-dog-reaper", Source: "anywhere/orders/mol-dog-reaper.toml"},
+			expect: true,
+		},
+		{
+			name:   "orphan-sweep-by-name",
+			order:  orders.Order{Name: "orphan-sweep", Source: filepath.Join(".gc", "system", "packs", "maintenance", "orders", "orphan-sweep.toml")},
+			expect: true,
+		},
+		{
+			name:   "unrelated-maintenance-order-not-skipped",
+			order:  orders.Order{Name: "mol-dog-doctor", Source: filepath.Join(".gc", "system", "packs", "maintenance", "orders", "mol-dog-doctor.toml")},
+			expect: false,
+		},
+		{
+			name:   "unknown-order-not-skipped",
+			order:  orders.Order{Name: "user-defined-cron", Source: "city/orders/whatever.toml"},
+			expect: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := orderRequiresManagedDolt(tc.order)
+			if got != tc.expect {
+				t.Fatalf("orderRequiresManagedDolt(%+v) = %v, want %v", tc.order, got, tc.expect)
+			}
+		})
+	}
+}
