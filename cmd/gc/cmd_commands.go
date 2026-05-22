@@ -147,6 +147,11 @@ func discoveredHelpRequested(args []string) bool {
 }
 
 func runDiscoveredCommand(entry config.DiscoveredCommand, cityPath, cityName string, args []string, stdinR io.Reader, stdout, stderr io.Writer) int {
+	if entry.BindingName == "dolt" && cityUsesMySQLBackend(cityPath) && !argsRequestHelp(args) {
+		fmt.Fprintf(stderr, "gc dolt: this city uses backend=mysql; gc dolt commands do not apply\n") //nolint:errcheck
+		fmt.Fprintf(stderr, "  hint: use `gc bd ...` for issue tracking, or `gc beads city use-mysql` to re-canonicalise this scope\n") //nolint:errcheck
+		return 1
+	}
 	packDir := entry.PackDir
 	if packDir == "" {
 		packDir = packRootFromEntryDir(entry.SourceDir, "commands")
@@ -314,4 +319,20 @@ func packRootFromEntryDir(sourceDir, topLevel string) string {
 		return sourceDir[:idx]
 	}
 	return filepath.Dir(sourceDir)
+}
+
+// argsRequestHelp reports whether the discovered-command argv represents a
+// help request that should bypass cross-cutting guards (like the mysql-
+// backend dolt refusal). Empty argv (the parent help listing) and any
+// trailing --help / -h count.
+func argsRequestHelp(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	for _, a := range args {
+		if a == "--help" || a == "-h" {
+			return true
+		}
+	}
+	return false
 }
