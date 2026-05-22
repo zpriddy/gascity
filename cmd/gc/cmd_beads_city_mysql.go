@@ -465,6 +465,113 @@ func clearDoltSideFiles(cityPath string, rigPlans []cityRigEndpointPlan) error {
 	return firstErr
 }
 
+// initDirIfReadyManagedMysql is the mysql-backend counterpart to
+// initDirIfReadyManagedDolt. Called by initDirIfReady when the city's
+// metadata.json declares backend=mysql; runs bd init --backend=mysql against
+// the new rig dir using the city's mysql connection settings, then writes
+// canonical metadata.json + config.yaml so the rig matches the rest of the
+// cascade.
+//
+// dir is the rig path; cityPath is the owning city. The new rig shares the
+// city's database — this matches the proving-grounds pattern where every
+// rig prefix lives in one bd database.
+func initDirIfReadyManagedMysql(cityPath, dir, prefix string) error {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return fmt.Errorf("rig prefix is required for mysql cascade")
+	}
+	city, ok, err := loadCityMysqlState(cityPath)
+	if err != nil {
+		return fmt.Errorf("read city mysql state: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("city at %s has backend=mysql but metadata.json is incomplete", cityPath)
+	}
+
+	if err := defaultBdMysqlInit(dir, prefix, city.Database, city.Host, city.Port, city.User); err != nil {
+		return fmt.Errorf("bd init mysql for rig: %w", err)
+	}
+	rigState := contract.ConfigState{
+		IssuePrefix:    prefix,
+		Backend:        "mysql",
+		EndpointOrigin: contract.EndpointOriginInheritedCity,
+		EndpointStatus: contract.EndpointStatusVerified,
+		MysqlHost:      city.Host,
+		MysqlPort:      city.Port,
+		MysqlUser:      city.User,
+		MysqlDatabase:  city.Database,
+	}
+	opts := cityMysqlOptions{
+		Host:     city.Host,
+		Port:     city.Port,
+		User:     city.User,
+		Database: city.Database,
+	}
+	if err := writeMysqlScope(fsys.OSFS{}, dir, rigState, prefix, opts); err != nil {
+		return fmt.Errorf("write canonical rig scope: %w", err)
+	}
+	return installBeadHooks(dir)
+}
+
+// cityMysqlState is the resolved mysql connection target for a city.
+type cityMysqlState struct {
+	Host     string
+	Port     string
+	User     string
+	Database string
+}
+
+// loadCityMysqlState reads the city's metadata.json and returns the mysql
+// connection target. Falls back to config.yaml mysql.* keys when metadata
+// is incomplete (e.g. legacy scopes that haven't been re-canonicalised yet
+// — including the scs-core-services-pre-fix shape where metadata.json says
+// backend=mysql but lacks the mysql_* fields, which the contract rejects
+// with a parse error). Returns (zero, false, nil) when neither source has
+// all four fields.
+func loadCityMysqlState(cityPath string) (cityMysqlState, bool, error) {
+	fs := fsys.OSFS{}
+	state := cityMysqlState{}
+	meta, ok, err := contract.LoadMetadataState(fs, filepath.Join(cityPath, ".beads", "metadata.json"))
+	if err != nil {
+		// Tolerate parse-error metadata (e.g. mysql with missing fields) —
+		// the config.yaml fallback below may have what we need.
+		var perr *contract.MetadataParseError
+		if !errors.As(err, &perr) {
+			return state, false, err
+		}
+	}
+	if ok && meta.Backend == "mysql" {
+		state.Host = meta.MysqlHost
+		state.Port = meta.MysqlPort
+		state.User = meta.MysqlUser
+		state.Database = meta.MysqlDatabase
+	}
+	if state.Host == "" || state.Port == "" || state.User == "" || state.Database == "" {
+		cfg, cfgOK, err := contract.ReadConfigState(fs, filepath.Join(cityPath, ".beads", "config.yaml"))
+		if err != nil {
+			return state, false, err
+		}
+		if cfgOK {
+			if state.Host == "" {
+				state.Host = cfg.MysqlHost
+			}
+			if state.Port == "" {
+				state.Port = cfg.MysqlPort
+			}
+			if state.User == "" {
+				state.User = cfg.MysqlUser
+			}
+			if state.Database == "" {
+				state.Database = cfg.MysqlDatabase
+			}
+		}
+	}
+	if state.Host == "" || state.Port == "" || state.User == "" || state.Database == "" {
+		return state, false, nil
+	}
+	return state, true, nil
+}
+
 // stopManagedDoltIfRunning best-effort stops any managed-dolt runtime owned by
 // this city. Used by use-mysql to leave no zombie dolt sql-server behind.
 // Failures are non-fatal: the caller logs but does not roll back, because the

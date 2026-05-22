@@ -365,3 +365,135 @@ func TestPlanMysqlRigUpdatesPropagatesConnection(t *testing.T) {
 		t.Fatalf("rig endpoint origin = %q", plan.Target.EndpointOrigin)
 	}
 }
+
+func TestLoadCityMysqlStateFromMetadata(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{
+		"backend":        "mysql",
+		"database":       "demo_beads",
+		"mysql_host":     "127.0.0.1",
+		"mysql_port":     "3306",
+		"mysql_user":     "root",
+		"mysql_database": "demo_beads",
+	})
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, ok, err := loadCityMysqlState(dir)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if state.Database != "demo_beads" || state.Host != "127.0.0.1" {
+		t.Fatalf("unexpected state: %+v", state)
+	}
+}
+
+func TestLoadCityMysqlStateFallsBackToConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Metadata declares mysql but lacks the connection fields — this is the
+	// scs-core-services-pre-fix shape.
+	body := `{"backend":"mysql","database":"demo_beads"}`
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := strings.Join([]string{
+		"issue_prefix: cs",
+		"mysql.server-host: 127.0.0.1",
+		"mysql.server-port: 3306",
+		"mysql.server-user: root",
+		"mysql.database: demo_beads",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "config.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Note: LoadMetadataState rejects mysql metadata without the required
+	// fields, so we expect the metadata read to return ok=false; the fallback
+	// reads config.yaml and populates state from there.
+	state, ok, _ := loadCityMysqlState(dir)
+	if !ok {
+		t.Fatalf("expected fallback to config.yaml to populate state, got %+v", state)
+	}
+	if state.Database != "demo_beads" {
+		t.Fatalf("unexpected database: %q", state.Database)
+	}
+}
+
+func TestLoadCityMysqlStateNoData(t *testing.T) {
+	dir := t.TempDir()
+	_, ok, _ := loadCityMysqlState(dir)
+	if ok {
+		t.Fatal("expected ok=false when no metadata or config exists")
+	}
+}
+
+func TestInitDirIfReadyManagedMysqlInvokesBdInit(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	// Set up city with mysql metadata.
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{
+		"backend":        "mysql",
+		"database":       "demo_beads",
+		"mysql_host":     "127.0.0.1",
+		"mysql_port":     "3306",
+		"mysql_user":     "root",
+		"mysql_database": "demo_beads",
+	})
+	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "metadata.json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	bdi := &fakeBdInit{}
+	prevBd := defaultBdMysqlInit
+	defer func() { defaultBdMysqlInit = prevBd }()
+	defaultBdMysqlInit = bdi.run
+
+	if err := initDirIfReadyManagedMysql(cityDir, rigDir, "tr"); err != nil {
+		t.Fatalf("initDirIfReadyManagedMysql: %v", err)
+	}
+	if len(bdi.calls) != 1 {
+		t.Fatalf("expected 1 bd init call, got %d", len(bdi.calls))
+	}
+	if bdi.calls[0].database != "demo_beads" || bdi.calls[0].prefix != "tr" {
+		t.Fatalf("wrong call: %+v", bdi.calls[0])
+	}
+	// Rig metadata should be canonical.
+	metaBytes, err := os.ReadFile(filepath.Join(rigDir, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metaBytes), `"backend": "mysql"`) {
+		t.Fatalf("rig metadata missing backend=mysql: %s", metaBytes)
+	}
+}
+
+func TestInitDirIfReadyManagedMysqlRefusesIncompleteCity(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Empty metadata + empty config — no mysql info anywhere.
+	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "metadata.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := initDirIfReadyManagedMysql(cityDir, rigDir, "tr")
+	if err == nil {
+		t.Fatal("expected error for incomplete city state")
+	}
+	if !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
