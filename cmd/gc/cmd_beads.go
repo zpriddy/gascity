@@ -362,7 +362,17 @@ func doBeadsHealth(quiet, jsonOut bool, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if !quiet {
-		fmt.Fprintln(stdout, "Beads provider: healthy") //nolint:errcheck // best-effort stdout
+		fmt.Fprintf(stdout, "Beads provider: healthy (%s)\n", describeBeadsBackendLabel(cityPath)) //nolint:errcheck // best-effort stdout
 	}
 	return 0
+}
+
+// describeBeadsBackendLabel returns a short human-readable backend label for
+// the city's beads provider. Falls back to "managed dolt" when no metadata
+// is present (matches the historical default).
+func describeBeadsBackendLabel(cityPath string) string {
+	if cityUsesMySQLBackend(cityPath) {
+		return "mysql"
+	}
+	return "managed dolt"
 }
