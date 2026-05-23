@@ -64,8 +64,9 @@ on the same bead.`,
 	return cmd
 }
 
-// claimResult is the structured result of a successful claim, returned as
-// JSON when --json is set and rendered as text otherwise.
+// claimResult is the structured result of a successful claim. The CLI
+// renders it as text; future work may surface a json variant once a
+// proper JSON schema is registered for this command.
 type claimResult struct {
 	BeadID       string `json:"bead_id"`
 	BeadStatus   string `json:"bead_status"`
@@ -78,10 +79,9 @@ type claimResult struct {
 
 func newWorktreeClaimCmd(stdout, stderr io.Writer) *cobra.Command {
 	var (
-		purpose    string
-		branch     string
-		base       string
-		jsonOutput bool
+		purpose string
+		branch  string
+		base    string
 	)
 	cmd := &cobra.Command{
 		Use:   "claim <bead-id>",
@@ -117,21 +117,13 @@ claimed AND the worktree exists. Any failure leaves no half-state.`,
 				fmt.Fprintf(stderr, "gc worktree claim: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
-			if jsonOutput {
-				if err := writeCLIJSONLine(stdout, res); err != nil {
-					fmt.Fprintf(stderr, "gc worktree claim: writing json: %v\n", err) //nolint:errcheck
-					return errExit
-				}
-				return nil
-			}
-			fmt.Fprintf(stdout, "Claimed %s, worktree=%s, branch=%s\n", res.BeadID, res.WorktreePath, res.Branch) //nolint:errcheck
+			fmt.Fprintf(stdout, "Claimed %s\n  worktree: %s\n  branch:   %s\n  status:   %s\n  assignee: %s\n", res.BeadID, res.WorktreePath, res.Branch, res.BeadStatus, res.Assignee) //nolint:errcheck
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&purpose, "purpose", "", "short kebab-case purpose suffix (e.g. \"mysql-rebase\")")
 	cmd.Flags().StringVar(&branch, "branch", "", "explicit branch name (default: $GC_ALIAS/<bead-id>-<purpose>)")
 	cmd.Flags().StringVar(&base, "from", "", "base branch or ref to create the worktree from (default: HEAD)")
-	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit a single JSON line on success")
 	return cmd
 }
 
@@ -196,7 +188,6 @@ type listEntry struct {
 }
 
 func newWorktreeListCmd(stdout, stderr io.Writer) *cobra.Command {
-	var jsonOutput bool
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List worktrees claimed via gc worktree claim",
@@ -210,16 +201,6 @@ matching claim) is surfaced via OnDisk + StorePath.`,
 			if err != nil {
 				fmt.Fprintf(stderr, "gc worktree list: %v\n", err) //nolint:errcheck
 				return errExit
-			}
-			if jsonOutput {
-				if err := writeCLIJSONLine(stdout, struct {
-					SchemaVersion string      `json:"schema_version"`
-					Entries       []listEntry `json:"entries"`
-				}{SchemaVersion: "1", Entries: entries}); err != nil {
-					fmt.Fprintf(stderr, "gc worktree list: writing json: %v\n", err) //nolint:errcheck
-					return errExit
-				}
-				return nil
 			}
 			if len(entries) == 0 {
 				fmt.Fprintln(stdout, "No claimed worktrees in this city.") //nolint:errcheck
@@ -235,7 +216,6 @@ matching claim) is surfaced via OnDisk + StorePath.`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit a single JSON line")
 	return cmd
 }
 
