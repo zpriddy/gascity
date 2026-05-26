@@ -953,12 +953,12 @@ func openSourceWorkflowStoreRef(cfg *config.City, cityPath, storeRef string) (co
 			if rig.Name != rigName {
 				continue
 			}
-			rigPath := resolveStoreScopeRoot(cityPath, rig.Path)
-			store, err := openStoreAtForCity(rigPath, cityPath)
+			rigScopeRoot := config.RigBeadsScopeRoot(cfg.EffectiveCityName(), rig)
+			store, err := openStoreAtForCity(rigScopeRoot, cityPath)
 			if err != nil {
 				return convoyStoreView{}, "", fmt.Errorf("opening rig store %s: %w", rigName, err)
 			}
-			return convoyStoreView{path: rigPath, store: store}, "rig:" + rigName, nil
+			return convoyStoreView{path: rigScopeRoot, store: store}, "rig:" + rigName, nil
 		}
 		return convoyStoreView{}, "", fmt.Errorf("rig %q not found", rigName)
 	default:

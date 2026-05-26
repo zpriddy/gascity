@@ -181,16 +181,17 @@ func doRigSetEndpoint(fs fsys.FS, cityPath, rigName string, opts rigEndpointOpti
 		fmt.Fprintf(stderr, "gc rig set-endpoint: WARN: rig %q now runs its own Dolt on 127.0.0.1:%s, independent of the city's managed Dolt; `gc start` will not supervise it.\n", rig.Name, targetState.DoltPort) //nolint:errcheck // best-effort stderr
 	}
 
-	snapshots, err := snapshotRigEndpointFiles(fs, cityPath, rig.Path)
+	scopeRoot := rigBeadsScopeRoot(loadedCityName(&persistCfg, cityPath), rig)
+	snapshots, err := snapshotRigEndpointFiles(fs, cityPath, scopeRoot)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc rig set-endpoint: snapshot canonical files: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if err := ensureCanonicalScopeMetadataIfPresent(fs, rig.Path); err != nil {
+	if err := ensureCanonicalScopeMetadataIfPresent(fs, scopeRoot); err != nil {
 		writeRigEndpointRollbackError(fs, stderr, snapshots, "canonicalizing metadata", err)
 		return 1
 	}
-	if err := ensureCanonicalScopeConfig(fs, rig.Path, targetState); err != nil {
+	if err := ensureCanonicalScopeConfig(fs, scopeRoot, targetState); err != nil {
 		writeRigEndpointRollbackError(fs, stderr, snapshots, "writing canonical config", err)
 		return 1
 	}
@@ -198,7 +199,7 @@ func doRigSetEndpoint(fs fsys.FS, cityPath, rigName string, opts rigEndpointOpti
 		writeRigEndpointRollbackError(fs, stderr, snapshots, "syncing compat city config", err)
 		return 1
 	}
-	if err := syncRigManagedPortArtifact(cityPath, rig.Path, cityState, targetState); err != nil {
+	if err := syncRigManagedPortArtifact(cityPath, scopeRoot, cityState, targetState); err != nil {
 		writeRigEndpointRollbackError(fs, stderr, snapshots, "syncing managed port artifact", err)
 		return 1
 	}
@@ -334,16 +335,15 @@ func requestedRigEndpointState(rig config.Rig, currentState, cityState contract.
 }
 
 func ensureCanonicalScopeConfig(fs fsys.FS, scopeRoot string, state contract.ConfigState) error {
-	beadsDir := filepath.Join(scopeRoot, ".beads")
-	if err := ensureBeadsDir(fs, beadsDir); err != nil {
+	if err := ensureBeadsDir(fs, scopeRoot); err != nil {
 		return err
 	}
-	_, err := contract.EnsureCanonicalConfig(fs, filepath.Join(beadsDir, "config.yaml"), state)
+	_, err := contract.EnsureCanonicalConfig(fs, beadsConfigPathForRoot(scopeRoot), state)
 	return err
 }
 
 func requireCanonicalScopeMetadata(fs fsys.FS, scopeRoot string) error {
-	path := filepath.Join(scopeRoot, ".beads", "metadata.json")
+	path := beadsMetadataPathForRoot(scopeRoot)
 	if _, err := fs.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("missing canonical metadata %s", path)
@@ -361,7 +361,7 @@ func requireCanonicalScopeMetadata(fs fsys.FS, scopeRoot string) error {
 }
 
 func ensureCanonicalScopeMetadataIfPresent(fs fsys.FS, scopeRoot string) error {
-	path := filepath.Join(scopeRoot, ".beads", "metadata.json")
+	path := beadsMetadataPathForRoot(scopeRoot)
 	doltDatabase, err := func() (string, error) {
 		if err := requireCanonicalScopeMetadata(fs, scopeRoot); err != nil {
 			return "", err
@@ -384,15 +384,15 @@ func ensureCanonicalScopeMetadataIfPresent(fs fsys.FS, scopeRoot string) error {
 	return err
 }
 
-func syncRigManagedPortArtifact(cityPath, rigPath string, cityState, rigState contract.ConfigState) error {
+func syncRigManagedPortArtifact(cityPath, scopeRoot string, cityState, rigState contract.ConfigState) error {
 	if cityState.EndpointOrigin == contract.EndpointOriginManagedCity && rigState.EndpointOrigin == contract.EndpointOriginInheritedCity {
 		port, err := readManagedRuntimePublishedPort(cityPath)
 		if err != nil {
 			return err
 		}
-		return writeDoltPortFileStrict(fsys.OSFS{}, rigPath, port)
+		return writeDoltPortFileStrict(fsys.OSFS{}, scopeRoot, port)
 	}
-	return removeDoltPortFileStrict(rigPath)
+	return removeDoltPortFileStrict(scopeRoot)
 }
 
 func readManagedRuntimePublishedPort(cityPath string) (string, error) {
@@ -427,25 +427,25 @@ func readManagedRuntimePublishedPort(cityPath string) (string, error) {
 	return strconv.Itoa(state.Port), nil
 }
 
-func writeDoltPortFileStrict(fs fsys.FS, dir, port string) error {
-	if strings.TrimSpace(dir) == "" || strings.TrimSpace(port) == "" {
-		return fmt.Errorf("missing rig path or port")
+func writeDoltPortFileStrict(fs fsys.FS, scopeRoot, port string) error {
+	if strings.TrimSpace(scopeRoot) == "" || strings.TrimSpace(port) == "" {
+		return fmt.Errorf("missing rig scope root or port")
 	}
-	portFile := filepath.Join(dir, ".beads", "dolt-server.port")
+	portFile := beadsPortFilePathForRoot(scopeRoot)
 	if data, err := os.ReadFile(portFile); err == nil && strings.TrimSpace(string(data)) == strings.TrimSpace(port) {
 		return nil
 	}
-	if err := ensureBeadsDir(fs, filepath.Dir(portFile)); err != nil {
+	if err := ensureBeadsDir(fs, scopeRoot); err != nil {
 		return err
 	}
 	return fsys.WriteFileAtomic(fs, portFile, []byte(strings.TrimSpace(port)+"\n"), 0o644)
 }
 
-func removeDoltPortFileStrict(dir string) error {
-	if strings.TrimSpace(dir) == "" {
+func removeDoltPortFileStrict(scopeRoot string) error {
+	if strings.TrimSpace(scopeRoot) == "" {
 		return nil
 	}
-	if err := os.Remove(filepath.Join(dir, ".beads", "dolt-server.port")); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(beadsPortFilePathForRoot(scopeRoot)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -456,7 +456,7 @@ func printRigEndpointDryRun(stdout io.Writer, rig config.Rig, current, target co
 	fmt.Fprintf(stdout, "  rig: %s\n", rig.Name)                                          //nolint:errcheck // best-effort stdout
 	fmt.Fprintf(stdout, "  from: %s\n", describeRigEndpointState(current))                //nolint:errcheck // best-effort stdout
 	fmt.Fprintf(stdout, "  to:   %s\n", describeRigEndpointState(target))                 //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  file: %s\n", filepath.Join(rig.Path, ".beads", "config.yaml")) //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  file: %s\n", beadsConfigPathForRoot(rigBeadsScopeRoot("<city>", rig))) //nolint:errcheck // best-effort stdout
 }
 
 func printRigEndpointResult(stdout io.Writer, rig config.Rig, state contract.ConfigState) {
@@ -657,8 +657,8 @@ type fileSnapshot struct {
 
 func snapshotRigCanonicalFiles(fs fsys.FS, scopeRoot string) ([]fileSnapshot, error) {
 	paths := []string{
-		filepath.Join(scopeRoot, ".beads", "metadata.json"),
-		filepath.Join(scopeRoot, ".beads", "config.yaml"),
+		beadsMetadataPathForRoot(scopeRoot),
+		beadsConfigPathForRoot(scopeRoot),
 	}
 	snapshots := make([]fileSnapshot, 0, len(paths))
 	for _, path := range paths {
@@ -687,8 +687,8 @@ func snapshotRigEndpointFiles(fs fsys.FS, cityPath, scopeRoot string) ([]fileSna
 	paths := []string{
 		filepath.Join(cityPath, "city.toml"),
 		config.SiteBindingPath(cityPath),
-		filepath.Join(scopeRoot, ".beads", "metadata.json"),
-		filepath.Join(scopeRoot, ".beads", "config.yaml"),
+		beadsMetadataPathForRoot(scopeRoot),
+		beadsConfigPathForRoot(scopeRoot),
 	}
 	snapshots := make([]fileSnapshot, 0, len(paths))
 	for _, path := range paths {

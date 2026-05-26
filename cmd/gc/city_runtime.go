@@ -2693,11 +2693,11 @@ func buildStandaloneRigStores(cfg *config.City, cityPath string, stderr io.Write
 		// cannot be reached. Substitute a placeholder so scaleCheck and
 		// collectAssignedWorkBeads don't flood the supervisor log with
 		// "Dolt server unreachable at 127.0.0.1:0" on every tick.
-		if rigOrphanedFromMySQLCity(cityPath, rig.Path) {
+		if rigOrphanedFromMySQLCity(cityPath, rig) {
 			stores[rig.Name] = newMysqlOrphanedRigStore(rig.Name, rig.Path)
 			continue
 		}
-		store, err := openStoreAtForCity(rig.Path, cityPath)
+		store, err := openStoreAtForCity(rigBeadsScopeRoot(cfg.EffectiveCityName(), rig), cityPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc supervisor: rig bead store %q: %v\n", rig.Name, err) //nolint:errcheck // best-effort stderr
 			continue

@@ -40,9 +40,20 @@ type PortResolverInput struct {
 // intentionally not the same type as RigListItem so the resolver does not
 // reach into HTTP/CLI types.
 type resolverRig struct {
-	Name string
-	Path string
-	HQ   bool
+	Name      string
+	Path      string
+	ScopeRoot string
+	HQ        bool
+}
+
+// cleanupRigScopeRoot returns the rig's beads-scope root if it was set
+// (i.e. caller used the new shared-rig-aware helper), or falls back to
+// the legacy <rig>/.beads layout when ScopeRoot is empty.
+func cleanupRigScopeRoot(rig resolverRig) string {
+	if strings.TrimSpace(rig.ScopeRoot) != "" {
+		return rig.ScopeRoot
+	}
+	return filepath.Join(rig.Path, ".beads")
 }
 
 // PortResolution describes the outcome of the dolt port discovery chain.
@@ -93,7 +104,7 @@ func ResolveDoltPort(in PortResolverInput) PortResolution {
 	res.Tried = append(res.Tried, attempt)
 
 	for _, rig := range orderRigsHQFirst(in.Rigs) {
-		path := filepath.Join(rig.Path, ".beads", "dolt-server.port")
+		path := beadsPortFilePathForRoot(cleanupRigScopeRoot(rig))
 		attempt, port, ok := tryRigPortFile(in.FS, path)
 		res.Tried = append(res.Tried, attempt)
 		if ok {

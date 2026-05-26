@@ -71,6 +71,23 @@ func ValidateSemantics(cfg *City, source string) []string {
 		}
 	}
 
+	for _, rig := range cfg.Rigs {
+		scope := strings.TrimSpace(rig.BeadsScope)
+		switch scope {
+		case "", "legacy", "city":
+			// valid
+		default:
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: rig %q: beads_scope must be \"legacy\", \"city\", or empty, got %q",
+				source, rig.Name, rig.BeadsScope))
+		}
+		if rig.SharedAcrossCities && scope != "" && scope != "city" {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: rig %q: shared_across_cities requires beads_scope = \"city\"",
+				source, rig.Name))
+		}
+	}
+
 	// Custom provider names must not contain the reserved ":" character
 	// (used by the base = "builtin:..." / "provider:..." namespace prefixes).
 	for name := range cfg.Providers {

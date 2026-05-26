@@ -1002,7 +1002,7 @@ func resolveRigDoltDatabase(r resolverRig, fs fsys.FS) rigDoltDatabaseResolution
 			err:  fmt.Errorf("missing filesystem for rig metadata; cannot verify live dolt database name"),
 		}
 	}
-	metadataPath := filepath.Join(r.Path, ".beads", "metadata.json")
+	metadataPath := beadsMetadataPathForRoot(cleanupRigScopeRoot(r))
 	data, err := fs.ReadFile(metadataPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1048,15 +1048,17 @@ func loadResolverRigs(cityPath string, cfg *config.City) []resolverRig {
 
 	out := make([]resolverRig, 0, len(rigs)+1)
 	out = append(out, resolverRig{
-		Name: cfg.EffectiveCityName(),
-		Path: cityPath,
-		HQ:   true,
+		Name:      cfg.EffectiveCityName(),
+		Path:      cityPath,
+		ScopeRoot: cityBeadsScopeRoot(cityPath),
+		HQ:        true,
 	})
 	for _, r := range rigs {
 		out = append(out, resolverRig{
-			Name: r.Name,
-			Path: r.Path,
-			HQ:   false,
+			Name:      r.Name,
+			Path:      r.Path,
+			ScopeRoot: rigBeadsScopeRoot(cfg.EffectiveCityName(), r),
+			HQ:        false,
 		})
 	}
 	return out

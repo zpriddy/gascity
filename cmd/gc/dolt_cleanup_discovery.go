@@ -24,7 +24,7 @@ import (
 func loadRigDoltPorts(rigs []resolverRig, fs fsys.FS) map[int]string {
 	out := map[int]string{}
 	for _, rig := range rigs {
-		path := filepath.Join(rig.Path, ".beads", "dolt-server.port")
+		path := beadsPortFilePathForRoot(cleanupRigScopeRoot(rig))
 		data, err := fs.ReadFile(path)
 		if err != nil {
 			continue

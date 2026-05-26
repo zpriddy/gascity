@@ -15,8 +15,9 @@ import (
 
 // rigRoute pairs a bead prefix with the absolute directory it lives in.
 type rigRoute struct {
-	Prefix string
-	AbsDir string
+	Prefix    string
+	AbsDir    string
+	ScopeRoot string
 }
 
 // routeEntry is a single line in routes.jsonl — maps a prefix to a relative path.
@@ -51,18 +52,19 @@ func writeAllRoutes(rigs []rigRoute) error {
 		if err != nil {
 			return fmt.Errorf("generating routes for %q: %w", rig.Prefix, err)
 		}
-		if err := writeRoutesFile(rig.AbsDir, routes); err != nil {
+		if err := writeRoutesFile(rig.ScopeRoot, routes); err != nil {
 			return fmt.Errorf("writing routes for %q: %w", rig.Prefix, err)
 		}
 	}
 	return nil
 }
 
-// writeRoutesFile atomically writes routes.jsonl to <dir>/.beads/routes.jsonl.
-// Uses temp file + rename for crash safety per CLAUDE.md conventions.
-func writeRoutesFile(dir string, routes []routeEntry) error {
-	beadsDir := filepath.Join(dir, ".beads")
-	if err := ensureBeadsDir(fsys.OSFS{}, beadsDir); err != nil {
+// writeRoutesFile atomically writes routes.jsonl to scopeRoot/routes.jsonl.
+// scopeRoot is a beads scope root (typically <city>/.beads or
+// <rig>/.beads or <rig>/.beads/cities/<city>/). Uses temp file + rename
+// for crash safety per CLAUDE.md conventions.
+func writeRoutesFile(scopeRoot string, routes []routeEntry) error {
+	if err := ensureBeadsDir(fsys.OSFS{}, scopeRoot); err != nil {
 		return fmt.Errorf("creating .beads dir: %w", err)
 	}
 
@@ -75,7 +77,7 @@ func writeRoutesFile(dir string, routes []routeEntry) error {
 		}
 	}
 
-	target := filepath.Join(beadsDir, "routes.jsonl")
+	target := filepath.Join(scopeRoot, "routes.jsonl")
 	// Use PID + timestamp for uniqueness so concurrent gc processes don't
 	// clobber each other's temp files.
 	suffix := strconv.Itoa(os.Getpid()) + "." + strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -95,14 +97,15 @@ func writeRoutesFile(dir string, routes []routeEntry) error {
 func collectRigRoutes(cityPath string, cfg *config.City) []rigRoute {
 	hqPrefix := config.EffectiveHQPrefix(cfg)
 
-	rigs := []rigRoute{{Prefix: hqPrefix, AbsDir: cityPath}}
+	rigs := []rigRoute{{Prefix: hqPrefix, AbsDir: cityPath, ScopeRoot: cityBeadsScopeRoot(cityPath)}}
 	for i := range cfg.Rigs {
 		if strings.TrimSpace(cfg.Rigs[i].Path) == "" {
 			continue
 		}
 		rigs = append(rigs, rigRoute{
-			Prefix: cfg.Rigs[i].EffectivePrefix(),
-			AbsDir: cfg.Rigs[i].Path,
+			Prefix:    cfg.Rigs[i].EffectivePrefix(),
+			AbsDir:    cfg.Rigs[i].Path,
+			ScopeRoot: rigBeadsScopeRoot(cfg.EffectiveCityName(), cfg.Rigs[i]),
 		})
 	}
 	return rigs

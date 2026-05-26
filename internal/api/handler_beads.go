@@ -215,7 +215,7 @@ func (s *Server) resolveStoreByPrefix(prefix string) beads.Store {
 
 	// Check city-level routes first.
 	if cityPath != "" {
-		if storePath, ok := resolveRoutePrefix(cityPath, prefix); ok {
+		if storePath, ok := resolveRoutePrefix(config.CityBeadsScopeRoot(cityPath), prefix); ok {
 			cleanPath := filepath.Clean(storePath)
 			// Route may point to a rig directory — resolve to the rig store.
 			if rigName, found := rigPathToName[cleanPath]; found {
@@ -241,7 +241,7 @@ func (s *Server) resolveStoreByPrefix(prefix string) beads.Store {
 		if !filepath.IsAbs(rigPath) && cityPath != "" {
 			rigPath = filepath.Join(cityPath, rigPath)
 		}
-		storePath, ok := resolveRoutePrefix(rigPath, prefix)
+		storePath, ok := resolveRoutePrefix(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), rig), prefix)
 		if !ok {
 			continue
 		}
@@ -401,10 +401,12 @@ func beadPrefix(id string) string {
 	return sling.BeadPrefix(id)
 }
 
-// resolveRoutePrefix reads routes.jsonl from a rig's .beads/ directory and
-// resolves the given prefix to an absolute store path.
-func resolveRoutePrefix(rigPath, prefix string) (string, bool) {
-	routesPath := filepath.Join(rigPath, ".beads", "routes.jsonl")
+// resolveRoutePrefix reads routes.jsonl from a beads scope root (the
+// `.beads/` dir under a city or rig) and resolves the given prefix to an
+// absolute store path. Callers pass cityBeadsScopeRoot(cityPath) for the
+// city scope or config.RigBeadsScopeRoot(cityName, rig) for a rig.
+func resolveRoutePrefix(scopeRoot, prefix string) (string, bool) {
+	routesPath := filepath.Join(scopeRoot, "routes.jsonl")
 	data, err := os.ReadFile(routesPath)
 	if err != nil {
 		return "", false
@@ -423,7 +425,9 @@ func resolveRoutePrefix(rigPath, prefix string) (string, bool) {
 		if entry.Prefix == prefix {
 			resolved := entry.Path
 			if !filepath.IsAbs(resolved) {
-				resolved = filepath.Join(rigPath, resolved)
+				// scopeRoot is the .beads/ dir; routes.jsonl paths are
+				// relative to the rig/city root, which is its parent.
+				resolved = filepath.Join(filepath.Dir(scopeRoot), resolved)
 			}
 			return resolved, true
 		}

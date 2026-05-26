@@ -148,7 +148,7 @@ const (
 )
 
 func rigPortFileValue(rig resolverRig, fs fsys.FS) (int, rigPortFileState) {
-	data, err := fs.ReadFile(filepath.Join(rig.Path, ".beads", "dolt-server.port"))
+	data, err := fs.ReadFile(beadsPortFilePathForRoot(cleanupRigScopeRoot(rig)))
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
 			return 0, rigPortFileMissing

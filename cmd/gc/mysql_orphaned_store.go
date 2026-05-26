@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // mysqlOrphanedRigStore is a placeholder Store for rigs that declared
@@ -81,7 +81,9 @@ var _ beads.Store = mysqlOrphanedRigStore{}
 // endpoint_origin=inherited_city, but the parent city has migrated to
 // backend=mysql. In this state bd subprocess calls at the rig dir fail
 // loudly because the inherited city Dolt server is no longer running.
-func rigOrphanedFromMySQLCity(cityPath, rigPath string) bool {
+func rigOrphanedFromMySQLCity(cityPath string, rig config.Rig) bool {
+	rigPath := rig.Path
+	rigScopeRoot := rigBeadsScopeRoot(config.CityNameFromPath(cityPath), rig)
 	if !cityUsesMySQLBackend(cityPath) {
 		return false
 	}
@@ -95,10 +97,10 @@ func rigOrphanedFromMySQLCity(cityPath, rigPath string) bool {
 	// when both conditions hold:
 	//   1. metadata.json says backend=dolt (or empty, which defaults to dolt)
 	//   2. config.yaml says endpoint_origin=inherited_city
-	if !rigDeclaresDoltBackend(rigPath) {
+	if !rigDeclaresDoltBackend(rigScopeRoot) {
 		return false
 	}
-	if !rigEndpointInheritedFromCity(rigPath) {
+	if !rigEndpointInheritedFromCity(rigScopeRoot) {
 		return false
 	}
 	return true
@@ -107,8 +109,8 @@ func rigOrphanedFromMySQLCity(cityPath, rigPath string) bool {
 // rigDeclaresDoltBackend reports whether the rig's .beads/metadata.json
 // declares backend=dolt (explicitly or by default — empty backend defaults
 // to dolt in the current bd contract).
-func rigDeclaresDoltBackend(rigPath string) bool {
-	metaPath := filepath.Join(rigPath, ".beads", "metadata.json")
+func rigDeclaresDoltBackend(rigScopeRoot string) bool {
+	metaPath := beadsMetadataPathForRoot(rigScopeRoot)
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		return false
@@ -127,8 +129,8 @@ func rigDeclaresDoltBackend(rigPath string) bool {
 // .beads/config.yaml has gc.endpoint_origin: inherited_city. Uses a
 // minimal direct line scan to avoid pulling the full contract reader
 // into the dolt-only short-circuit path.
-func rigEndpointInheritedFromCity(rigPath string) bool {
-	cfgPath := filepath.Join(rigPath, ".beads", "config.yaml")
+func rigEndpointInheritedFromCity(rigScopeRoot string) bool {
+	cfgPath := beadsConfigPathForRoot(rigScopeRoot)
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return false

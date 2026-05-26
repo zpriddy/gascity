@@ -192,15 +192,15 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
 		}
-		scopeRoot := resolveStoreScopeRoot(cs.cityPath, rig.Path)
+		scopeRoot := rigBeadsScopeRoot(cfg.EffectiveCityName(), rig)
 		// MySQL-orphaned rig: rig declared backend=dolt with
 		// endpoint_origin=inherited_city, but city has migrated to
 		// backend=mysql. The rig's Dolt server is no longer running and
 		// cannot be reached. Substitute a placeholder store that returns
 		// empty reads (no error) to suppress the per-tick supervisor log
 		// flood, and clear writes to a specific actionable error.
-		if rigOrphanedFromMySQLCity(cs.cityPath, scopeRoot) {
-			stores[rig.Name] = newMysqlOrphanedRigStore(rig.Name, scopeRoot)
+		if rigOrphanedFromMySQLCity(cs.cityPath, rig) {
+			stores[rig.Name] = newMysqlOrphanedRigStore(rig.Name, rig.Path)
 			continue
 		}
 		scopeProvider := rawBeadsProviderForScope(scopeRoot, cs.cityPath)

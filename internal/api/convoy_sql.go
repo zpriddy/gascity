@@ -386,7 +386,7 @@ func workflowSQLRouteCandidate(state State, prefix string) (workflowSQLStoreCand
 		if rigPath == "" {
 			continue
 		}
-		storePath, ok := resolveRoutePrefix(rigPath, prefix)
+		storePath, ok := resolveRoutePrefix(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), rig), prefix)
 		if !ok {
 			continue
 		}

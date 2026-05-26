@@ -58,7 +58,7 @@ func (rt *serviceRuntime) BeadStore(rig string) beads.Store {
 		if candidate.Name != rig {
 			continue
 		}
-		store, err := openStoreAtForCity(candidate.Path, rt.cr.cityPath)
+		store, err := openStoreAtForCity(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), candidate), rt.cr.cityPath)
 		if err != nil {
 			return nil
 		}

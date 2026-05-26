@@ -92,7 +92,7 @@ func resolveOrderStoreTarget(cityPath string, cfg *config.City, a orders.Order) 
 		return execStoreTarget{}, fmt.Errorf("rig %q is declared but has no path binding — run `gc rig add <dir> --name %s` to bind it before dispatching rig-scoped orders", rig.Name, rig.Name)
 	}
 	return execStoreTarget{
-		ScopeRoot: rig.Path,
+		ScopeRoot: rigBeadsScopeRoot(cfg.EffectiveCityName(), rig),
 		ScopeKind: "rig",
 		Prefix:    rig.EffectivePrefix(),
 		RigName:   rig.Name,
@@ -493,7 +493,7 @@ func orderTrackingSweepTargetsForConfig(cityPath string, cfg *config.City) []ord
 			}
 			targets = append(targets, orderTrackingSweepTarget{
 				target: execStoreTarget{
-					ScopeRoot: rig.Path,
+					ScopeRoot: rigBeadsScopeRoot(cfg.EffectiveCityName(), rig),
 					ScopeKind: "rig",
 					Prefix:    rig.EffectivePrefix(),
 					RigName:   rig.Name,

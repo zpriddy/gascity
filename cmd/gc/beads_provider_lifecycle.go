@@ -1102,7 +1102,7 @@ func waitForAllBeadsScopesReadyAfterRecovery(cityPath string, timeout time.Durat
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
 		}
-		if err := waitForBeadsScopeReadyAfterRecovery(resolveStoreScopeRoot(cityPath, rig.Path), cityPath, deadline); err != nil {
+		if err := waitForBeadsScopeReadyAfterRecovery(rigBeadsScopeRoot(cfg.EffectiveCityName(), rig), cityPath, deadline); err != nil {
 			return fmt.Errorf("rig %q store not ready: %w", rig.Name, err)
 		}
 	}

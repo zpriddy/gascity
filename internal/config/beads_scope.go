@@ -49,3 +49,11 @@ func BeadsHooksPathForRoot(scopeRoot string) string {
 func BeadsPortFilePathForRoot(scopeRoot string) string {
 	return filepath.Join(scopeRoot, "dolt-server.port")
 }
+
+// CityNameFromPath returns the city name derived from cityPath when no
+// loaded *City config is available (e.g. during early supervisor startup
+// before city.toml has been parsed). It is the free-function fallback
+// callers can use when (*City).EffectiveCityName isn't reachable.
+func CityNameFromPath(cityPath string) string {
+	return filepath.Base(filepath.Clean(cityPath))
+}

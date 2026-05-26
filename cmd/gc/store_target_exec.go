@@ -124,7 +124,7 @@ func resolveConfiguredExecStoreTarget(cityPath, storePath string) (execStoreTarg
 	for i := range cfg.Rigs {
 		if samePath(cfg.Rigs[i].Path, scopeRoot) {
 			return execStoreTarget{
-				ScopeRoot: scopeRoot,
+				ScopeRoot: rigBeadsScopeRoot(cfg.EffectiveCityName(), cfg.Rigs[i]),
 				ScopeKind: "rig",
 				Prefix:    cfg.Rigs[i].EffectivePrefix(),
 				RigName:   cfg.Rigs[i].Name,
