@@ -150,6 +150,11 @@ the provider. The machine-local workspace identity lives in `.gc/site.toml`
 instead, which is how `gc cities`, `gc status`, and other commands still know
 this city is named `my-city`.
 
+If you later bind the same rig checkout into multiple cities, keep the path
+binding in `.gc/site.toml` and use rig settings such as
+`shared_across_cities = true` or `beads_scope = "city"` to isolate each city's
+rig-local bead state.
+
 The built-in `mayor` comes from the scaffolded `agents/mayor/` content, and
 `[[named_session]]` keeps a `mayor` session running so you can talk to it at
 any time. When you add more agents later, Gas City creates `agents/<name>/`,

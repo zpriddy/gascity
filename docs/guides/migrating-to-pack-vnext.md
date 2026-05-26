@@ -65,6 +65,20 @@ This guide stays focused on the high-probability migration work:
 It does not try to be a rollout ledger. When a surface is still
 release-gated, this guide calls that out inline.
 
+## Canonical scope files
+
+Gas City manages canonical bead topology files under `.beads/` scopes.
+
+- City-level state lives under `city/.beads/`.
+- Legacy rig-level state lives under `rig/.beads/`.
+- Shared rigs can opt into city-scoped state under
+  `rig/.beads/cities/<city-name>/`.
+
+If you intentionally reuse the same rig checkout across multiple cities, set
+`shared_across_cities = true` or `beads_scope = "city"` on that rig so each
+city gets isolated `config.yaml`, `metadata.json`, `routes.jsonl`, `hooks/`,
+and managed `dolt-server.port` state.
+
 ## Before you start
 
 The important mental shift is:
@@ -642,6 +656,8 @@ schema, plus the qualified rows that matter most during migration.
 | `[[named_session]]` | Named reusable sessions | Move to `[[named_session]]` in the root city `pack.toml`. |
 | `[[rigs]]` | Rig deployment entries | Keep in `city.toml`. |
 | `rigs.path` | Machine-local project binding | Move to `.gc/site.toml`. Schema-2 root `city.toml` rejects this field; editor/init paths persist copied or edited bindings into `.gc/site.toml` and stop writing it back to authored `city.toml`. |
+| `rigs.beads_scope` | Rig bead-store layout | New shared-rig mode may opt into `"city"`, which stores rig-local bead metadata under `rig/.beads/cities/<city-name>/` instead of the legacy `rig/.beads/` root. |
+| `rigs.shared_across_cities` | Shared-rig intent flag | New deployment hint for rigs intentionally bound by multiple cities. Shared rigs should use `beads_scope = "city"`. |
 | `rigs.prefix` | Derived rig prefix | Keep in `city.toml` in the current release wave. It is deployment state, but not yet extracted into separate site-binding storage. |
 | `rigs.suspended` | Operational toggle | Keep in `city.toml` in the current release wave. It remains deployment/runtime state rather than portable pack definition. |
 | `rigs.includes` | Rig-scoped pack composition | Move to rig-scoped imports in `city.toml`. |

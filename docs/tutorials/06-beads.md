@@ -52,6 +52,32 @@ name = "my-project"
 path = "/Users/csells/my-project"
 ```
 
+For legacy rigs, the rig-local bead store lives directly under the rig:
+
+```text
+my-project/.beads/
+```
+
+When a single rig path is intentionally shared across multiple cities, Gas City
+can isolate bead state per city instead of sharing one `.beads` root. Set
+`shared_across_cities = true` (or `beads_scope = "city"`) on the rig and each
+city uses a scoped subtree:
+
+```text
+my-project/.beads/cities/<city-name>/
+```
+
+That keeps work, routing, and rig-local metadata separate even though the git
+checkout is shared.
+
+Inside the active scope, GC manages canonical rig files such as:
+
+- `config.yaml`
+- `metadata.json`
+- `routes.jsonl`
+- `dolt-server.port`
+- `hooks/`
+
 Beads are fundamental to the system. You're going to be working with crew to
 turn plans into beads that can be executed in parallel by polecats.
 

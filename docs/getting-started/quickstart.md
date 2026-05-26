@@ -39,6 +39,11 @@ gc rig add ~/hello-world
 A rig is an external project directory registered with the city. It gets its
 own beads database, hook installation, and routing context.
 
+By default, a rig keeps its canonical bead state in `rig/.beads/`. If the same
+checkout is intentionally shared across multiple cities, configure that rig
+with `shared_across_cities = true` or `beads_scope = "city"` so each city gets
+its own scoped state under `rig/.beads/cities/<city-name>/`.
+
 ## 3. Sling Work
 
 ```bash
