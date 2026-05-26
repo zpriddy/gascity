@@ -472,6 +472,13 @@ type Rig struct {
 	Path string `toml:"path,omitempty"`
 	// Prefix overrides the auto-derived bead ID prefix for this rig.
 	Prefix string `toml:"prefix,omitempty"`
+	// BeadsScope controls where this rig's bead-store metadata lives.
+	// "legacy" (default) keeps the historical <rig>/.beads layout.
+	// "city" stores per-city bead metadata under <rig>/.beads/cities/<city-name>/.
+	BeadsScope string `toml:"beads_scope,omitempty"`
+	// SharedAcrossCities declares the operator's intent that this rig path may
+	// be bound by multiple cities. Shared rigs must use BeadsScope = "city".
+	SharedAcrossCities bool `toml:"shared_across_cities,omitempty"`
 	// DefaultBranch is the rig repository's mainline branch (e.g. "main",
 	// "master", "develop"). When set, routing formulas use this as the
 	// default merge target instead of probing origin/HEAD at sling time.

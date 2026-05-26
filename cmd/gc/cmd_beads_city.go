@@ -394,9 +394,10 @@ func snapshotCityTopologyFiles(fs fsys.FS, cityPath string, plans []cityRigEndpo
 
 func snapshotCityManagedPortFiles(fs fsys.FS, cityPath string, plans []cityRigEndpointPlan) ([]fileSnapshot, error) {
 	seen := map[string]struct{}{}
-	paths := []string{filepath.Join(cityPath, ".beads", "dolt-server.port")}
+	cityName := filepath.Base(filepath.Clean(cityPath))
+	paths := []string{beadsPortFilePathForRoot(cityBeadsScopeRoot(cityPath))}
 	for _, plan := range plans {
-		paths = append(paths, filepath.Join(plan.Rig.Path, ".beads", "dolt-server.port"))
+		paths = append(paths, beadsPortFilePathForRoot(rigBeadsScopeRoot(cityName, plan.Rig)))
 	}
 	snapshots := make([]fileSnapshot, 0, len(paths))
 	for _, path := range paths {
