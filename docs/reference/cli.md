@@ -73,6 +73,7 @@ gc [flags]
 | [gc unregister](#gc-unregister) | Remove a city from the machine-wide supervisor |
 | [gc version](#gc-version) | Print gc version |
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
+| [gc worktree](#gc-worktree) | Atomic worktree+bead-claim subcommands |
 
 ## gc agent
 
@@ -294,8 +295,11 @@ gc beads
 
 Manage the canonical city endpoint topology for bd-backed beads stores.
 
-Use use-managed to make the city GC-managed again. Use use-external to pin the
-city to an external Dolt endpoint and rewrite inherited rig mirrors.
+Use use-managed to make the city GC-managed again (managed Dolt). Use
+use-external to pin the city to an external Dolt endpoint and rewrite
+inherited rig mirrors. Use use-mysql to switch the city to a MySQL backend
+(creates the database, writes canonical metadata, runs bd init, and cascades
+to inherited rigs).
 
 ```
 gc beads city
@@ -305,6 +309,7 @@ gc beads city
 |------------|-------------|
 | [gc beads city use-external](#gc-beads-city-use-external) | Set the city endpoint to an external Dolt server |
 | [gc beads city use-managed](#gc-beads-city-use-managed) | Set the city endpoint to GC-managed |
+| [gc beads city use-mysql](#gc-beads-city-use-mysql) | Set the city endpoint to a MySQL backend |
 
 ## gc beads city use-external
 
@@ -333,6 +338,31 @@ gc beads city use-managed [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dry-run` | bool |  | show the canonical changes without writing files |
+
+## gc beads city use-mysql
+
+Switch the city (and any inherited rigs) to a bd MySQL backend.
+
+Creates the target database if it does not exist, writes canonical metadata.json
+and config.yaml entries, and runs `bd init --backend=mysql` to seed the
+config table. Inherited rigs share the city's database — each rig keeps its own
+issue prefix.
+
+This command does NOT modify cities that use a Dolt backend; run it only on a
+fresh city or after explicit migration. Use --dry-run to preview the change set.
+
+```
+gc beads city use-mysql [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--database` | string |  | MySQL database name (required; also used by inherited rigs) |
+| `--dry-run` | bool |  | show the canonical changes without writing files or touching MySQL |
+| `--host` | string | `127.0.0.1` | MySQL server host |
+| `--password` | string |  | MySQL server password (read from $GC_MYSQL_PASSWORD if unset) |
+| `--port` | string | `3306` | MySQL server port |
+| `--user` | string | `root` | MySQL server user |
 
 ## gc beads health
 
@@ -1626,6 +1656,11 @@ Pass --preserve-existing to keep any pre-authored pack.toml, city.toml, or
 agent prompt files in the target directory (useful when bootstrapping a
 committed workspace — e.g. from a bootstrap.sh shipped in the repo).
 
+Pass --backend=mysql with --mysql-database=&lt;name&gt; to provision a MySQL-backed
+beads scope as part of init: gc creates the database, runs bd init, and writes
+canonical metadata. Default --mysql-host/port/user are 127.0.0.1/3306/root;
+the password is read from --mysql-password or $GC_MYSQL_PASSWORD.
+
 ```
 gc init [path] [flags]
 ```
@@ -1641,14 +1676,21 @@ gc init
   gc init --from ~/elan --name elan /city
   gc init --file examples/gastown.toml ~/bright-lights
   gc init --file city.toml --preserve-existing .
+  gc init --provider claude --backend mysql --mysql-database mycity_beads ~/my-city
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--backend` | string |  | beads backend for the new city (only "mysql" is supported here; default leaves init's regular dolt-managed backend in place) |
 | `--bootstrap-profile` | string |  | bootstrap profile to apply for hosted/container defaults |
 | `--file` | string |  | path to a TOML file to use as city.toml |
 | `--from` | string |  | path to an example city directory to copy |
 | `--json` | bool |  | emit JSON summary |
+| `--mysql-database` | string |  | MySQL database name (required with --backend=mysql) |
+| `--mysql-host` | string | `127.0.0.1` | MySQL server host (used with --backend=mysql) |
+| `--mysql-password` | string |  | MySQL server password (used with --backend=mysql; falls back to $GC_MYSQL_PASSWORD) |
+| `--mysql-port` | string | `3306` | MySQL server port (used with --backend=mysql) |
+| `--mysql-user` | string | `root` | MySQL server user (used with --backend=mysql) |
 | `--name` | string |  | workspace name (default: target directory basename) |
 | `--preserve-existing` | bool |  | keep any pre-authored pack.toml, city.toml, or agent prompt files instead of overwriting them |
 | `--provider` | string |  | built-in workspace provider to use for the default mayor config |
@@ -3637,3 +3679,114 @@ gc wait ready <wait-id> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | Output in JSONL format |
+
+## gc worktree
+
+Atomically create a git worktree paired with a bead claim.
+
+Subcommands:
+  claim    Create a worktree and claim the corresponding bead in one step
+  release  Remove the worktree and clear the bead claim
+  list     Show all worktrees claimed via 'gc worktree claim' in this city
+  inspect  Show what 'gc worktree claim' would do for a bead (dry-run)
+
+Convention (gs-5sj): worktrees are named .worktrees/&lt;bead-id&gt;-&lt;purpose&gt;.
+The bead-id-first prefix makes 'git worktree list' immediately correlate
+trees to beads, and prevents two agents from creating colliding worktrees
+on the same bead.
+
+```
+gc worktree
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc worktree claim](#gc-worktree-claim) | Create a worktree and claim the bead atomically |
+| [gc worktree inspect](#gc-worktree-inspect) | Show what gc worktree claim would do for a bead (dry-run) |
+| [gc worktree list](#gc-worktree-list) | List worktrees claimed via gc worktree claim |
+| [gc worktree release](#gc-worktree-release) | Clear a worktree claim from a bead |
+
+## gc worktree claim
+
+Atomically claim a bead and create a git worktree for the work.
+
+The bead transitions to status=in_progress with assignee=$GC_ALIAS, and
+metadata.gc.worktree_path / .gc.worktree_branch / .gc.worktree_created_at
+record the worktree state. The worktree is created at:
+
+    &lt;repo-root&gt;/.worktrees/&lt;bead-id&gt;-&lt;purpose&gt;
+
+on a new branch named:
+
+    $GC_ALIAS/&lt;bead-id&gt;-&lt;purpose&gt;
+
+Override the branch with --branch=&lt;name&gt; and the base ref with --from=&lt;base&gt;.
+
+The bead claim runs first; the worktree creation runs second. If the
+claim fails (already claimed, branch collision, etc.) no worktree is
+created. If the worktree creation fails, the claim is rolled back.
+
+The atomic guarantee is: after a successful exit, both the bead is
+claimed AND the worktree exists. Any failure leaves no half-state.
+
+```
+gc worktree claim <bead-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--branch` | string |  | explicit branch name (default: $GC_ALIAS/&lt;bead-id&gt;-&lt;purpose&gt;) |
+| `--from` | string |  | base branch or ref to create the worktree from (default: HEAD) |
+| `--purpose` | string |  | short kebab-case purpose suffix (e.g. "mysql-rebase") |
+
+## gc worktree inspect
+
+Resolve the worktree path, branch name, and base ref that 'gc worktree
+claim &lt;bead-id&gt;' would use, plus run all pre-flight checks (existing
+claim, path collision, branch collision). Reports the result without
+modifying any state.
+
+```
+gc worktree inspect <bead-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--branch` | string |  | explicit branch name |
+| `--from` | string |  | base branch or ref |
+| `--purpose` | string |  | short kebab-case purpose suffix |
+
+## gc worktree list
+
+List every bead in the city that carries gc.worktree_path metadata,
+plus whether the worktree directory still exists on disk. Drift (bead
+claims a worktree that no longer exists, or worktree exists without a
+matching claim) is surfaced via OnDisk + StorePath.
+
+```
+gc worktree list
+```
+
+## gc worktree release
+
+Reverse 'gc worktree claim'. Clears gc.worktree_* metadata on the bead
+and (when --remove is set) removes the worktree directory + branch.
+
+By default, --keep is used: the worktree stays on disk for the operator
+to inspect or finish manually. Pass --remove to delete the worktree and
+its branch (refused if the worktree has uncommitted changes or unpushed
+commits — pass --remove --force to override).
+
+Optionally close the bead with --reason="&lt;text&gt;". If --reason is omitted
+the bead stays in_progress with the assignee unchanged so a follow-up
+claim can resume the work.
+
+```
+gc worktree release <bead-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--keep` | bool |  | keep the worktree on disk after clearing the claim (default) |
+| `--reason` | string |  | if set, also close the bead with this reason |
+| `--remove` | bool |  | delete the worktree directory + branch after clearing the claim |

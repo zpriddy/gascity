@@ -2002,6 +2002,14 @@
           "type": "string",
           "description": "Prefix overrides the auto-derived bead ID prefix for this rig."
         },
+        "beads_scope": {
+          "type": "string",
+          "description": "BeadsScope controls where this rig's bead-store metadata lives.\n\"legacy\" (default) keeps the historical \u003crig\u003e/.beads layout.\n\"city\" stores per-city bead metadata under \u003crig\u003e/.beads/cities/\u003ccity-name\u003e/."
+        },
+        "shared_across_cities": {
+          "type": "boolean",
+          "description": "SharedAcrossCities declares the operator's intent that this rig path may\nbe bound by multiple cities. Shared rigs must use BeadsScope = \"city\"."
+        },
         "default_branch": {
           "type": "string",
           "description": "DefaultBranch is the rig repository's mainline branch (e.g. \"main\",\n\"master\", \"develop\"). When set, routing formulas use this as the\ndefault merge target instead of probing origin/HEAD at sling time.\nCaptured by `gc rig add` from the rig's git config; set manually for\nrigs whose mainline isn't reachable via origin/HEAD."

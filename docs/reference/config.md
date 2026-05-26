@@ -573,6 +573,8 @@ Rig defines an external project registered in the city.
 | `name` | string | **yes** |  | Name is the unique identifier for this rig. |
 | `path` | string |  |  | Path is the absolute filesystem path to the rig's repository. |
 | `prefix` | string |  |  | Prefix overrides the auto-derived bead ID prefix for this rig. |
+| `beads_scope` | string |  |  | BeadsScope controls where this rig's bead-store metadata lives. "legacy" (default) keeps the historical &lt;rig&gt;/.beads layout. "city" stores per-city bead metadata under &lt;rig&gt;/.beads/cities/&lt;city-name&gt;/. |
+| `shared_across_cities` | boolean |  |  | SharedAcrossCities declares the operator's intent that this rig path may be bound by multiple cities. Shared rigs must use BeadsScope = "city". |
 | `default_branch` | string |  |  | DefaultBranch is the rig repository's mainline branch (e.g. "main", "master", "develop"). When set, routing formulas use this as the default merge target instead of probing origin/HEAD at sling time. Captured by `gc rig add` from the rig's git config; set manually for rigs whose mainline isn't reachable via origin/HEAD. |
 | `suspended` | boolean |  |  | Suspended prevents the reconciler from spawning agents in this rig. Toggle with gc rig suspend/resume. |
 | `formulas_dir` | string |  |  | FormulasDir is a rig-local formula directory (Layer 4). Overrides pack formulas for this rig by filename. Relative paths resolve against the city directory. |

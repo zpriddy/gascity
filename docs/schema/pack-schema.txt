@@ -251,6 +251,17 @@
           "type": "boolean",
           "description": "InjectAssignedSkills controls whether gc appends an\n\"assigned skills\" appendix to the agent's rendered prompt. The\nappendix lists every skill visible to this agent, partitioned\ninto (assigned-to-you, shared-with-every-agent), so agents\nsharing a scope-root sink can tell which skills are their\nspecialization vs which are the city-wide set.\n\nPointer tri-state:\n  nil   -\u003e inherit: inject when the agent has a vendor sink\n  *true -\u003e explicitly inject (equivalent to the default)\n  *false -\u003e disable; the template is responsible for rendering\n            any skill guidance itself"
         },
+        "include_workspace_directories": {
+          "type": "boolean",
+          "description": "IncludeWorkspaceDirectories controls whether all workspace directories\nare injected into this agent's environment and prompt context.\nWhen true, all directories declared in [[workspace_directories]] are\navailable as GC_DIR_\u003cNAME\u003e env vars and {{.Dirs.\u003cname\u003e}} template vars."
+        },
+        "workspace_directory_names": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "WorkspaceDirectoryNames selectively includes specific workspace directories\nby name. When non-empty, only the listed directories are injected.\nTakes precedence over IncludeWorkspaceDirectories when both are set."
+        },
         "attach": {
           "type": "boolean",
           "description": "Attach controls whether the agent's session supports interactive\nattachment (e.g., tmux attach). When false, the agent can use a\nlighter runtime (subprocess instead of tmux). Defaults to true."
