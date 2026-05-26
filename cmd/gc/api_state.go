@@ -192,6 +192,13 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
 		}
+		// Ensure rig.Path is absolute before passing to rigBeadsScopeRoot,
+		// so the resulting scope-root path is absolute too. resolveRigPaths
+		// is the canonical helper but we may run before it; do a local
+		// resolve guard.
+		if !filepath.IsAbs(rig.Path) {
+			rig.Path = filepath.Join(cs.cityPath, rig.Path)
+		}
 		scopeRoot := rigBeadsScopeRoot(cfg.EffectiveCityName(), rig)
 		// MySQL-orphaned rig: rig declared backend=dolt with
 		// endpoint_origin=inherited_city, but city has migrated to

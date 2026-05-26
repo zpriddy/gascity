@@ -386,7 +386,12 @@ func workflowSQLRouteCandidate(state State, prefix string) (workflowSQLStoreCand
 		if rigPath == "" {
 			continue
 		}
-		storePath, ok := resolveRoutePrefix(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), rig), prefix)
+		// Use the resolved (absolute) rig path so RigBeadsScopeRoot
+		// returns an absolute scope root; routes.jsonl reads are
+		// from filesystem and need an absolute path.
+		resolvedRig := rig
+		resolvedRig.Path = rigPath
+		storePath, ok := resolveRoutePrefix(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), resolvedRig), prefix)
 		if !ok {
 			continue
 		}

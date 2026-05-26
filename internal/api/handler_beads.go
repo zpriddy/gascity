@@ -241,7 +241,11 @@ func (s *Server) resolveStoreByPrefix(prefix string) beads.Store {
 		if !filepath.IsAbs(rigPath) && cityPath != "" {
 			rigPath = filepath.Join(cityPath, rigPath)
 		}
-		storePath, ok := resolveRoutePrefix(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), rig), prefix)
+		// Use the resolved (absolute) rig path so RigBeadsScopeRoot
+		// returns an absolute scope root.
+		resolvedRig := rig
+		resolvedRig.Path = rigPath
+		storePath, ok := resolveRoutePrefix(config.RigBeadsScopeRoot(cfg.EffectiveCityName(), resolvedRig), prefix)
 		if !ok {
 			continue
 		}
