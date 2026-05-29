@@ -510,7 +510,7 @@ func initDirIfReadyManagedMysql(cityPath, dir, prefix string) error {
 	if err := writeMysqlScope(fsys.OSFS{}, dir, rigState, prefix, opts); err != nil {
 		return fmt.Errorf("write canonical rig scope: %w", err)
 	}
-	return installBeadHooks(dir)
+	return installBeadHooks(dir, cityPath)
 }
 
 // cityMysqlState is the resolved mysql connection target for a city.
