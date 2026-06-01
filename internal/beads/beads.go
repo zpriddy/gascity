@@ -40,6 +40,14 @@ type Bead struct {
 	// garbage collection. Reads must opt in via ListQuery.TierMode (or the
 	// WithEphemeral/WithBothTiers QueryOpts on the legacy label helpers).
 	Ephemeral bool `json:"ephemeral,omitempty"`
+	// Force, when true, passes `--force` to `bd create`. The validator
+	// honors --force to override prefix-mismatch checks (used when a
+	// formula creates a wisp with a step-suffix ID like "stf-80a.1"
+	// against an HQ store that uses a different prefix). Without this,
+	// cross-prefix routing through `gc sling` fails because the supervisor
+	// drops --force on the way to bd create. Fix for gs-i3u (mechanik
+	// 2026-06-01).
+	Force bool `json:"-"`
 }
 
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.

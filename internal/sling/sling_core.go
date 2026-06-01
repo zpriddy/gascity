@@ -201,6 +201,7 @@ func slingFormula(opts SlingOpts, deps SlingDeps) (SlingResult, error) {
 	mResult, err := InstantiateSlingFormula(context.Background(), opts.BeadOrFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
 		Title: opts.Title,
 		Vars:  formulaVars,
+		Force: opts.Force,
 	}, "", opts.ScopeKind, opts.ScopeRef, a, deps)
 	if err != nil {
 		return SlingResult{Target: a.QualifiedName()}, fmt.Errorf("instantiating formula %q: %w", opts.BeadOrFormula, err)
@@ -242,6 +243,7 @@ func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID 
 			Title:            opts.Title,
 			Vars:             formulaVars,
 			PriorityOverride: BeadPriorityOverride(querier, beadID),
+			Force:            opts.Force,
 		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			return result, fmt.Errorf("instantiating formula %q on %s: %w", opts.OnFormula, beadID, err)
@@ -265,6 +267,7 @@ func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID 
 			Title:            opts.Title,
 			Vars:             formulaVars,
 			PriorityOverride: BeadPriorityOverride(querier, beadID),
+			Force:            opts.Force,
 		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating formula %q on %s: %w", opts.OnFormula, beadID, err)
@@ -306,6 +309,7 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			Title:            opts.Title,
 			Vars:             defaultVars,
 			PriorityOverride: BeadPriorityOverride(querier, beadID),
+			Force:            opts.Force,
 		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			return result, fmt.Errorf("instantiating default formula %q on %s: %w", defaultFormula, beadID, err)
@@ -329,6 +333,7 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			Title:            opts.Title,
 			Vars:             defaultVars,
 			PriorityOverride: BeadPriorityOverride(querier, beadID),
+			Force:            opts.Force,
 		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating default formula %q on %s: %w", defaultFormula, beadID, err)
@@ -875,6 +880,7 @@ func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, chi
 			Title:            opts.Title,
 			Vars:             childVars,
 			PriorityOverride: ClonePriorityPtr(child.Priority),
+			Force:            opts.Force,
 		}, child.ID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating %s %q on %s: %w", formulaLabel, formulaName, child.ID, err)
@@ -902,6 +908,7 @@ func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, chi
 			Title:            opts.Title,
 			Vars:             childVars,
 			PriorityOverride: ClonePriorityPtr(child.Priority),
+			Force:            opts.Force,
 		}, child.ID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", formulaLabel, formulaName, child.ID, err)

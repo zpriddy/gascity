@@ -50,6 +50,13 @@ type Options struct {
 	// DeferAssignees creates assignable beads without an assignee and stores
 	// the intended assignee in metadata for later activation.
 	DeferAssignees bool
+
+	// Force, when true, propagates --force to every bead created during
+	// instantiation. Required when a formula creates step-suffix wisp IDs
+	// (e.g. "stf-80a.1") against an HQ store that uses a different prefix
+	// — the validator rejects such IDs without --force. Fix for gs-i3u
+	// (mechanik 2026-06-01).
+	Force bool
 }
 
 const (
@@ -91,6 +98,10 @@ type FragmentOptions struct {
 	// PriorityOverride forces every created bead to use the given priority.
 	// When nil, the existing workflow root's priority is inherited.
 	PriorityOverride *int
+
+	// Force, when true, propagates --force to every bead created during
+	// fragment instantiation. Same semantic as Options.Force (gs-i3u).
+	Force bool
 }
 
 // ExternalDep binds a fragment step to an already-existing bead.
@@ -616,6 +627,11 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			return nil, err
 		}
 
+		// Propagate Options.Force to the per-step bead so BdStore.Create
+		// passes --force to bd. Required for cross-prefix wisp creation
+		// (gs-i3u).
+		b.Force = opts.Force
+
 		created, err := store.Create(b)
 		if err != nil {
 			// Best-effort cleanup: mark already-created beads as failed.
@@ -811,6 +827,11 @@ func InstantiateFragment(ctx context.Context, store beads.Store, recipe *formula
 			markFailed(store, createdIDs)
 			return nil, err
 		}
+
+		// Propagate Options.Force to the per-step bead so BdStore.Create
+		// passes --force to bd. Required for cross-prefix wisp creation
+		// (gs-i3u).
+		b.Force = opts.Force
 
 		created, err := store.Create(b)
 		if err != nil {

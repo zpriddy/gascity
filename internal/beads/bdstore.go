@@ -648,6 +648,12 @@ func (s *BdStore) Create(b Bead) (Bead, error) {
 		typ = "task"
 	}
 	args := []string{"create", "--json", b.Title, "-t", typ}
+	if b.Force {
+		// --force overrides prefix-mismatch validation; required when a
+		// formula creates a wisp with a step-suffix ID (e.g. "stf-80a.1")
+		// against an HQ store using a different prefix. Fix for gs-i3u.
+		args = append(args, "--force")
+	}
 	if id := strings.TrimSpace(b.ID); id != "" {
 		args = append(args, "--id", id)
 	}
