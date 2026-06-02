@@ -148,10 +148,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	execStdout := &switchableWriter{target: stdout}
 	var jsonStdout bytes.Buffer
 	var observedStdout *countingWriter
-	root := newRootCmd(execStdout, stderr)
 	if args == nil {
 		args = []string{}
 	}
+	root := newRootCmd(execStdout, stderr, args)
 	bufferJSONExecution := shouldBufferJSONExecution(root, args)
 	reportJSONFailure := shouldReportJSONExecutionError(root, args)
 	if bufferJSONExecution {
@@ -204,7 +204,17 @@ func commandFailureMessage(err error) string {
 }
 
 // newRootCmd creates the root cobra command with all subcommands.
-func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
+// args, when non-empty, is used to skip eager pack-command discovery when
+// the first arg matches a known core command — pack discovery loads city
+// config and parses every imported pack, which is expensive (~1-9s) and is
+// only needed when invoking a pack-defined command. Pass no args (or nil)
+// to force eager discovery (the conservative default for callers that do
+// not know which command is about to run, e.g. tests and gen-doc).
+func newRootCmd(stdout, stderr io.Writer, args ...[]string) *cobra.Command {
+	var firstArgs []string
+	if len(args) > 0 {
+		firstArgs = args[0]
+	}
 	root := &cobra.Command{
 		Use:           "gc",
 		Short:         "Gas City CLI — orchestration-builder for multi-agent workflows",
@@ -300,7 +310,14 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newGenDocCmd(stdout, stderr, root))
 
 	// Best-effort: discover pack CLI commands if we're inside a city.
-	registerPackCommands(root, stdout, stderr)
+	// Skip eager discovery when args[0] is a known core command — pack
+	// discovery loads + parses the entire city pack tree (~1-9s) and is
+	// only needed when actually invoking a pack-defined command. The
+	// tryPackCommandFallback in the root RunE handles the rare case where
+	// the user invokes a pack command and we need to discover lazily.
+	if shouldEagerlyDiscoverPackCommands(root, firstArgs) {
+		registerPackCommands(root, stdout, stderr)
+	}
 
 	installArgUsageErrors(root, stderr)
 	installFlagGroupUsageErrors(root, stderr)
@@ -1228,4 +1245,77 @@ func openBdStoreAt(storePath, cityPath string) (beads.Store, error) {
 		cfg = nil
 	}
 	return bdStoreForRig(storePath, cityPath, cfg), nil
+}
+
+// packDiscoverySkipCommands lists core gc commands that never need
+// pack-defined subcommands and can safely skip eager pack discovery.
+// Pack discovery loads + parses the city's full pack tree (~1-9s) and
+// is only needed for commands that surface or interact with pack-defined
+// subcommands. Erring on the side of including discovery (the default)
+// preserves correctness; this list only contains commands that are
+// hot-path-sensitive AND verified to not need pack info.
+//
+// Notably absent (these still pay discovery cost): config, doctor, init,
+// start, gen-doc, completion, and anything else that walks the command
+// tree or surfaces pack-defined commands.
+var packDiscoverySkipCommands = map[string]bool{
+	"version":   true,
+	"nudge":     true,
+	"events":    true,
+	"event":     true,
+	"hook":      true,
+	"prime":     true,
+	"mail":      true,
+	"bd":        true,
+	"beads":     true,
+	"runtime":   true,
+	"shell":     true,
+	"cities":    true,
+	"register":  true,
+	"completion": false, // explicitly false — completion lists all subcommands
+}
+
+// shouldEagerlyDiscoverPackCommands returns true if the caller must register
+// pack-defined commands eagerly given the requested args. Returns false only
+// when the first non-flag arg names a known pack-independent core command;
+// all other cases (no args, unknown args, flag-only args, pack commands)
+// fall through to eager discovery.
+func shouldEagerlyDiscoverPackCommands(root *cobra.Command, args []string) bool {
+	first := firstNonFlagArg(args)
+	if first == "" {
+		return true
+	}
+	if skip, ok := packDiscoverySkipCommands[first]; ok && skip {
+		return false
+	}
+	return true
+}
+
+// firstNonFlagArg returns the first arg that does not start with '-', or ""
+// if there is none. Used to identify the requested subcommand while
+// ignoring leading flags like --city or --rig.
+func firstNonFlagArg(args []string) string {
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if a == "--" {
+			continue
+		}
+		if strings.HasPrefix(a, "--") {
+			// Persistent flag with separate value: --city PATH, --rig NAME.
+			// Single-equals form (--city=PATH) consumes value in same arg.
+			if a == "--city" || a == "--rig" {
+				skipNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		return a
+	}
+	return ""
 }
