@@ -63,7 +63,14 @@ func newInternalMaterializeSkillsCmd(stdout, stderr io.Writer) *cobra.Command {
 				fmt.Fprintf(stderr, "gc internal materialize-skills: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
-			cfg, err := loadCityConfig(cityPath, stderr)
+			// Use the no-refresh variant: this command is invoked from
+			// session pre_start and runs on a hot path (10s SetupTimeout
+			// default in tmux). The supervisor's own startup already
+			// refreshed builtin packs; forcing another refresh here adds
+			// 8+ seconds and was the dominant cause of pre_start[0]:
+			// signal: killed in gs-bm6. Completion paths use this same
+			// variant for the same reason.
+			cfg, err := loadCityConfigWithoutBuiltinPackRefresh(cityPath, stderr)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc internal materialize-skills: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit

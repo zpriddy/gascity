@@ -1335,6 +1335,7 @@ var packDiscoverySkipCommands = map[string]bool{
 	"shell":     true,
 	"cities":    true,
 	"register":  true,
+	"internal":  true, // session pre_start hot path (materialize-skills, project-mcp); 10s SetupTimeout
 	"completion": false, // explicitly false — completion lists all subcommands
 }
 

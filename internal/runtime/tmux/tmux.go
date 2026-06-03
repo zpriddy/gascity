@@ -77,7 +77,7 @@ type Config struct {
 // DefaultConfig returns a Config with the original hardcoded values.
 func DefaultConfig() Config {
 	return Config{
-		SetupTimeout:       10 * time.Second,
+		SetupTimeout:       30 * time.Second,
 		NudgeReadyTimeout:  10 * time.Second,
 		NudgeRetryInterval: 500 * time.Millisecond,
 		NudgeLockTimeout:   30 * time.Second,
