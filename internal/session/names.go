@@ -348,16 +348,25 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 		// Explicit session names are permanent identities; once claimed by any
 		// session bead, including a closed one, they are never reused.
 		//
-		// Exception: closed beads that belong to a configured named session
+		// Exception 1: closed beads that belong to a configured named session
 		// (configured_named_session=true) release their session_name so the
 		// reconciler can re-materialize a fresh canonical bead for the same
 		// identity. The design doc specifies: "Closed historical beads do not
 		// poison future canonical materialization of the reserved identity."
+		//
+		// Exception 2: closed beads from pool-managed sessions
+		// (pool_managed=true) release their session_name so a fresh pool
+		// member can claim it. Pool members draw names from a finite namepool;
+		// permanent retention exhausts the pool after a few city restarts and
+		// forces collision-fallback to ugly suffixed names. See gs-0y8.
 		if strings.TrimSpace(b.Metadata["session_name"]) == name {
 			if continuityIneligibleConfiguredOwner(b, selfOwner) {
 				continue
 			}
 			if b.Status == "closed" && strings.TrimSpace(b.Metadata["configured_named_session"]) == "true" {
+				continue
+			}
+			if b.Status == "closed" && strings.TrimSpace(b.Metadata["pool_managed"]) == "true" {
 				continue
 			}
 			return fmt.Errorf("%w: %q already belongs to %s", ErrSessionNameExists, name, b.ID)
