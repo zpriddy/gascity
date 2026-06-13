@@ -11706,3 +11706,65 @@ func publishRejectingManagedDoltRuntimeForTest(t *testing.T, cityPath string) fu
 		<-done
 	}
 }
+
+// TestNormalizeCanonicalBdScopeFilesToleratesPartialMysqlCity reproduces the
+// race in sc-7v4: a city with backend=mysql metadata that is missing the
+// mysql_* fields (the transient state between `bd init --backend=mysql` and
+// writeMysqlScope, or after an interrupted use-mysql cascade) must not block
+// `gc rig add` and other reconcile paths. normalizeCanonicalBdScopeFiles must
+// detect mysql via the cheap raw-JSON `backend` read and short-circuit before
+// LoadMetadataState's strict validator runs.
+func TestNormalizeCanonicalBdScopeFilesToleratesPartialMysqlCity(t *testing.T) {
+	cityPath := t.TempDir()
+	metadataPath := filepath.Join(cityPath, ".beads", "metadata.json")
+	if err := os.MkdirAll(filepath.Dir(metadataPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Partial state: backend=mysql but no mysql_* fields. Mirrors the on-disk
+	// shape produced by `bd init --backend=mysql` BEFORE writeMysqlScope runs.
+	if err := os.WriteFile(metadataPath, []byte(`{"backend":"mysql","database":"scsagent_beads"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte("issue_prefix: hq\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "race-city"}}
+	if err := normalizeCanonicalBdScopeFiles(cityPath, cfg, io.Discard); err != nil {
+		t.Fatalf("normalizeCanonicalBdScopeFiles must tolerate partial mysql metadata, got: %v", err)
+	}
+}
+
+// TestNormalizeCanonicalBdScopeFilesToleratesPartialMysqlRig is the rig-side
+// counterpart of the above: a rig dir with backend=mysql but missing mysql_*
+// (e.g. left by a failed `gc rig add` mid-cascade) must not block a subsequent
+// reconcile.
+func TestNormalizeCanonicalBdScopeFilesToleratesPartialMysqlRig(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "rigs", "ratlab")
+	// City has fully-canonical mysql metadata.
+	cityMeta := filepath.Join(cityPath, ".beads", "metadata.json")
+	if err := os.MkdirAll(filepath.Dir(cityMeta), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cityMeta, []byte(`{"backend":"mysql","database":"scsagent_beads","mysql_host":"127.0.0.1","mysql_port":"3306","mysql_user":"root","mysql_database":"scsagent_beads"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte("issue_prefix: hq\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Rig has partial mysql metadata.
+	rigMeta := filepath.Join(rigPath, ".beads", "metadata.json")
+	if err := os.MkdirAll(filepath.Dir(rigMeta), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rigMeta, []byte(`{"backend":"mysql","database":"scsagent_beads"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "race-city"},
+		Rigs:      []config.Rig{{Name: "ratlab", Path: rigPath, Prefix: "rl"}},
+	}
+	if err := normalizeCanonicalBdScopeFiles(cityPath, cfg, io.Discard); err != nil {
+		t.Fatalf("normalizeCanonicalBdScopeFiles must tolerate partial mysql rig metadata, got: %v", err)
+	}
+}

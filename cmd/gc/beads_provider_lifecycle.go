@@ -451,6 +451,11 @@ func seedDeferredManagedBeads(cityPath, dir, prefix, doltDatabase string) {
 }
 
 func seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase string) error {
+	// MySQL-first short-circuit (race fix sc-7v4): tolerate transiently
+	// partial mysql metadata that the strict postgres classifier rejects.
+	if scopeUsesMySQLBackendForInit(dir) {
+		return nil
+	}
 	if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, dir); err != nil {
 		return err
 	} else if usesPostgres {
@@ -503,6 +508,11 @@ func canonicalScopeDoltDatabase(cityPath, dir, prefix string) string {
 
 func normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase string) error {
 	if !cityUsesBdStoreContract(cityPath) {
+		return nil
+	}
+	// MySQL-first short-circuit (race fix sc-7v4): same rationale as
+	// normalizeCanonicalBdScopeFiles.
+	if scopeUsesMySQLBackendForInit(dir) {
 		return nil
 	}
 	if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, dir); err != nil {
@@ -1660,13 +1670,24 @@ func normalizeCanonicalBdScopeFiles(cityPath string, cfg *config.City, warns ...
 	}
 	resolveRigPaths(cityPath, cfg.Rigs)
 	if scopeUsesManagedBdStoreContract(cityPath, cityPath) {
-		if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cityPath); err != nil {
-			return fmt.Errorf("classifying city backend: %w", err)
-		} else if !usesPostgres && !scopeUsesMySQLBackendForInit(cityPath) {
-			if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cityPath, defaultScopeDoltDatabase(cityPath, cityPath, config.EffectiveHQPrefix(cfg))); err != nil {
-				return fmt.Errorf("canonicalizing city metadata: %w", err)
-			} else if err := applyProxiedServerScopeOverlay(fsys.OSFS{}, cityPath, cityPath, proxiedServerScopeActive(cfg)); err != nil {
-				return fmt.Errorf("applying proxied overlay to city: %w", err)
+		// Check MySQL first: scopeUsesPostgresBackendForInit calls
+		// contract.LoadMetadataState which strict-validates and rejects
+		// backend=mysql metadata that is missing mysql_* fields. That state
+		// can persist transiently (between `bd init --backend=mysql` and
+		// writeMysqlScope in the use-mysql cascade, or after an interrupted
+		// cascade). The mysql check is a cheap raw-JSON read that only looks
+		// at the `backend` field, so it short-circuits before strict
+		// validation runs. Mirrors the same guard in initDirIfReady@~560.
+		// Race fix: sc-7v4.
+		if !scopeUsesMySQLBackendForInit(cityPath) {
+			if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cityPath); err != nil {
+				return fmt.Errorf("classifying city backend: %w", err)
+			} else if !usesPostgres {
+				if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cityPath, defaultScopeDoltDatabase(cityPath, cityPath, config.EffectiveHQPrefix(cfg))); err != nil {
+					return fmt.Errorf("canonicalizing city metadata: %w", err)
+				} else if err := applyProxiedServerScopeOverlay(fsys.OSFS{}, cityPath, cityPath, proxiedServerScopeActive(cfg)); err != nil {
+					return fmt.Errorf("applying proxied overlay to city: %w", err)
+				}
 			}
 		}
 	}
@@ -1674,9 +1695,13 @@ func normalizeCanonicalBdScopeFiles(cityPath string, cfg *config.City, warns ...
 		if !rigUsesManagedBdStoreContract(cityPath, cfg.Rigs[i]) {
 			continue
 		}
+		// Same mysql-first short-circuit as the city block above. Race fix: sc-7v4.
+		if scopeUsesMySQLBackendForInit(cfg.Rigs[i].Path) {
+			continue
+		}
 		if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cfg.Rigs[i].Path); err != nil {
 			return fmt.Errorf("classifying rig %q backend: %w", cfg.Rigs[i].Name, err)
-		} else if !usesPostgres && !scopeUsesMySQLBackendForInit(cfg.Rigs[i].Path) {
+		} else if !usesPostgres {
 			if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cfg.Rigs[i].Path, defaultScopeDoltDatabase(cityPath, cfg.Rigs[i].Path, cfg.Rigs[i].EffectivePrefix())); err != nil {
 				return fmt.Errorf("canonicalizing rig %q metadata: %w", cfg.Rigs[i].Name, err)
 			} else if err := applyProxiedServerScopeOverlay(fsys.OSFS{}, cityPath, cfg.Rigs[i].Path, proxiedServerScopeActive(cfg)); err != nil {
@@ -1704,12 +1729,17 @@ func syncConfiguredDoltPortFiles(cityPath string, cityDolt config.DoltConfig, ci
 	cityUsesPostgres := false
 	cityUsesMySQL := false
 	if cityUsesBd {
-		usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cityPath)
-		if err != nil {
-			return fmt.Errorf("classifying city backend: %w", err)
-		}
-		cityUsesPostgres = usesPostgres
+		// Check MySQL first (cheap raw-JSON read; tolerates a transiently
+		// partial mysql metadata.json that the strict validator would reject).
+		// Race fix: sc-7v4.
 		cityUsesMySQL = scopeUsesMySQLBackendForInit(cityPath)
+		if !cityUsesMySQL {
+			usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cityPath)
+			if err != nil {
+				return fmt.Errorf("classifying city backend: %w", err)
+			}
+			cityUsesPostgres = usesPostgres
+		}
 	}
 	anyRigUsesBd := false
 	for _, rig := range rigs {
