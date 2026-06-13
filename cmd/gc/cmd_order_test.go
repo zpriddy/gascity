@@ -2618,7 +2618,7 @@ func TestOrderHistoryJSON(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderHistoryWithStoresResolverJSON("digest", "", aa, resolver, true, &stdout, &stderr)
+	code := doOrderHistoryWithStoresResolverJSON("digest", "", aa, resolver, nil, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderHistoryWithStoresResolverJSON = %d, want 0; stderr: %s", code, stderr.String())
 	}

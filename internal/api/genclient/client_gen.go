@@ -3691,6 +3691,18 @@ type TypedEventStreamEnvelopeOrderFired struct {
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeOrderSkipped defines model for TypedEventStreamEnvelopeOrderSkipped.
+type TypedEventStreamEnvelopeOrderSkipped struct {
+	Actor    string                   `json:"actor"`
+	Message  *string                  `json:"message,omitempty"`
+	Payload  NoPayload                `json:"payload"`
+	Seq      int64                    `json:"seq"`
+	Subject  *string                  `json:"subject,omitempty"`
+	Ts       time.Time                `json:"ts"`
+	Type     string                   `json:"type"`
+	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopePgCredentialResolved defines model for TypedEventStreamEnvelopePgCredentialResolved.
 type TypedEventStreamEnvelopePgCredentialResolved struct {
 	Actor    string                            `json:"actor"`
@@ -4502,6 +4514,19 @@ type TypedTaggedEventStreamEnvelopeOrderFailed struct {
 
 // TypedTaggedEventStreamEnvelopeOrderFired defines model for TypedTaggedEventStreamEnvelopeOrderFired.
 type TypedTaggedEventStreamEnvelopeOrderFired struct {
+	Actor    string                   `json:"actor"`
+	City     string                   `json:"city"`
+	Message  *string                  `json:"message,omitempty"`
+	Payload  NoPayload                `json:"payload"`
+	Seq      int64                    `json:"seq"`
+	Subject  *string                  `json:"subject,omitempty"`
+	Ts       time.Time                `json:"ts"`
+	Type     string                   `json:"type"`
+	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeOrderSkipped defines model for TypedTaggedEventStreamEnvelopeOrderSkipped.
+type TypedTaggedEventStreamEnvelopeOrderSkipped struct {
 	Actor    string                   `json:"actor"`
 	City     string                   `json:"city"`
 	Message  *string                  `json:"message,omitempty"`
@@ -8074,6 +8099,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderFired(v Typ
 	return err
 }
 
+// AsTypedEventStreamEnvelopeOrderSkipped returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeOrderSkipped
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeOrderSkipped() (TypedEventStreamEnvelopeOrderSkipped, error) {
+	var body TypedEventStreamEnvelopeOrderSkipped
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeOrderSkipped overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeOrderSkipped
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeOrderSkipped(v TypedEventStreamEnvelopeOrderSkipped) error {
+	v.Type = "order.skipped"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeOrderSkipped performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeOrderSkipped
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderSkipped(v TypedEventStreamEnvelopeOrderSkipped) error {
+	v.Type = "order.skipped"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopePgCredentialResolved returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopePgCredentialResolved
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopePgCredentialResolved() (TypedEventStreamEnvelopePgCredentialResolved, error) {
 	var body TypedEventStreamEnvelopePgCredentialResolved
@@ -8974,6 +9027,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeOrderFailed()
 	case "order.fired":
 		return t.AsTypedEventStreamEnvelopeOrderFired()
+	case "order.skipped":
+		return t.AsTypedEventStreamEnvelopeOrderSkipped()
 	case "pg.credential_resolved":
 		return t.AsTypedEventStreamEnvelopePgCredentialResolved()
 	case "project.identity.stamped":
@@ -10053,6 +10108,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrde
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeOrderSkipped returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeOrderSkipped
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeOrderSkipped() (TypedTaggedEventStreamEnvelopeOrderSkipped, error) {
+	var body TypedTaggedEventStreamEnvelopeOrderSkipped
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeOrderSkipped overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeOrderSkipped
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeOrderSkipped(v TypedTaggedEventStreamEnvelopeOrderSkipped) error {
+	v.Type = "order.skipped"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeOrderSkipped performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeOrderSkipped
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrderSkipped(v TypedTaggedEventStreamEnvelopeOrderSkipped) error {
+	v.Type = "order.skipped"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopePgCredentialResolved returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopePgCredentialResolved
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopePgCredentialResolved() (TypedTaggedEventStreamEnvelopePgCredentialResolved, error) {
 	var body TypedTaggedEventStreamEnvelopePgCredentialResolved
@@ -10953,6 +11036,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFailed()
 	case "order.fired":
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFired()
+	case "order.skipped":
+		return t.AsTypedTaggedEventStreamEnvelopeOrderSkipped()
 	case "pg.credential_resolved":
 		return t.AsTypedTaggedEventStreamEnvelopePgCredentialResolved()
 	case "project.identity.stamped":

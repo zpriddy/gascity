@@ -475,7 +475,19 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		// MySQL cities. The orders ship with the dolt/maintenance system
 		// packs and have no mysql equivalents — quietly skipping them is
 		// the correct behavior, not a workaround.
+		//
+		// Emit an order.skipped event so `gc order check`, `gc order
+		// history`, and `gc doctor`'s order-firing-current check can see
+		// the intentional skip and stop reporting "never run" / blocking
+		// stale errors. Without this event the skip is silent and looks
+		// identical to a broken dispatcher (sc-jgb).
 		if cityIsMySQL && orderRequiresManagedDolt(a) {
+			m.rec.Record(events.Event{
+				Type:    events.OrderSkipped,
+				Actor:   "controller",
+				Subject: a.ScopedName(),
+				Message: "skipped: mysql_city_requires_dolt",
+			})
 			continue
 		}
 

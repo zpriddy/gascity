@@ -8669,3 +8669,69 @@ func TestSweepClosedOrderTrackingRetentionAcrossStoresBounded_ZeroLimitDeletesNo
 		t.Fatalf("deleted = %d, want 0 (limit=0 means no budget)", deleted)
 	}
 }
+
+// TestOrderDispatchEmitsSkippedOnMySQLCity verifies the mysql + managed-dolt
+// skip path emits exactly one order.skipped event with the expected reason
+// and subject. Without the event, gc order check / gc order history /
+// gc doctor's order-firing-current see "never fired" — a false positive
+// that flips doctor to BLOCKING ERROR. See sc-jgb.
+func TestOrderDispatchEmitsSkippedOnMySQLCity(t *testing.T) {
+	cityDir := t.TempDir()
+	beadsDir := filepath.Join(cityDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	// metadata.json with backend=mysql is the canonical mysql-city marker
+	// read by cityUsesMySQLBackend.
+	if err := os.WriteFile(
+		filepath.Join(beadsDir, "metadata.json"),
+		[]byte(`{"backend":"mysql","database":"test_beads"}`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write metadata.json: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	var rec memRecorder
+
+	// orphan-sweep is one of the named dolt-only orders
+	// (orderRequiresManagedDolt). Cooldown trigger so it's auto-dispatched.
+	aa := []orders.Order{{
+		Name:     "orphan-sweep",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "scripts/orphan-sweep.sh",
+		Source:   filepath.Join(".gc", "system", "packs", "maintenance", "orders", "orphan-sweep.toml"),
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, nil, &rec)
+
+	ad.dispatch(context.Background(), cityDir, time.Now())
+	ad.drain(context.Background())
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	skippedCount := 0
+	var got events.Event
+	for _, e := range rec.events {
+		if e.Type == events.OrderSkipped {
+			skippedCount++
+			got = e
+		}
+		if e.Type == events.OrderFired {
+			t.Errorf("unexpected order.fired on mysql city: %+v", e)
+		}
+	}
+	if skippedCount != 1 {
+		t.Fatalf("order.skipped event count = %d, want 1; events: %+v", skippedCount, rec.events)
+	}
+	if got.Subject != "orphan-sweep" {
+		t.Errorf("order.skipped subject = %q, want %q", got.Subject, "orphan-sweep")
+	}
+	if got.Actor != "controller" {
+		t.Errorf("order.skipped actor = %q, want %q", got.Actor, "controller")
+	}
+	wantReason := "skipped: mysql_city_requires_dolt"
+	if got.Message != wantReason {
+		t.Errorf("order.skipped message = %q, want %q", got.Message, wantReason)
+	}
+}

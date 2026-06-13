@@ -111,6 +111,15 @@ const (
 	OrderFired                      = "order.fired"
 	OrderCompleted                  = "order.completed"
 	OrderFailed                     = "order.failed"
+	// OrderSkipped fires when the dispatcher intentionally skips a registered
+	// order because its runtime requirements are not satisfied on this city
+	// (e.g. dolt-runtime-dependent orders on a MySQL-backed city). Without
+	// this event, gc order check + gc order history + gc doctor see a
+	// configured order with zero fired/failed/completed history and report
+	// it as "never run" — a false-positive blocking error. Emission carries
+	// a `reason` field in the Message identifying why the skip happened.
+	// See sc-jgb / orphan-sweep silent-skip diagnostic.
+	OrderSkipped                    = "order.skipped"
 	ProviderSwapped                 = "provider.swapped"
 	WorkerOperation                 = "worker.operation"
 	ProjectIdentityStamped          = "project.identity.stamped"
@@ -185,7 +194,7 @@ var KnownEventTypes = []string{
 	RequestResultSessionCreate, RequestResultSessionMessage,
 	RequestResultSessionSubmit, RequestFailed,
 	CityCreated, CityUnregisterRequested,
-	OrderFired, OrderCompleted, OrderFailed,
+	OrderFired, OrderCompleted, OrderFailed, OrderSkipped,
 	ProviderSwapped, WorkerOperation, ProjectIdentityStamped, SupervisorFSPressureSkippedTick,
 	SupervisorShutdownRequested, SupervisorRequest,
 	ExtMsgBound, ExtMsgUnbound, ExtMsgGroupCreated,

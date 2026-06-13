@@ -1169,7 +1169,7 @@ func routeOrderHistory(cityPath string, cfg *config.City, name, rig string, aa [
 	// missing route=api.
 	if name == "" {
 		logRoute(stderr, cmdName, "fallback", "multi-order")
-		return doOrderHistoryWithStoresResolverJSON(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), jsonOutput, stdout, stderr)
+		return doOrderHistoryWithStoresResolverJSON(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), readOrderSkippedEvents(cityPath, stderr), jsonOutput, stdout, stderr)
 	}
 
 	if c != nil {
@@ -1188,7 +1188,7 @@ func routeOrderHistory(cityPath string, cfg *config.City, name, rig string, aa [
 	} else {
 		logRoute(stderr, cmdName, "fallback", nilReason)
 	}
-	return doOrderHistoryWithStoresResolverJSON(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), jsonOutput, stdout, stderr)
+	return doOrderHistoryWithStoresResolverJSON(name, rig, aa, cachedOrderHistoryStoresResolver(cityPath, cfg, stderr), readOrderSkippedEvents(cityPath, stderr), jsonOutput, stdout, stderr)
 }
 
 // orderScopedName returns the rig-qualified key for the server's
@@ -1306,10 +1306,10 @@ func doOrderHistoryWithStoreResolver(name, rig string, aa []orders.Order, resolv
 }
 
 func doOrderHistoryWithStoresResolver(name, rig string, aa []orders.Order, resolveStores orderStoresResolver, stdout, stderr io.Writer) int {
-	return doOrderHistoryWithStoresResolverJSON(name, rig, aa, resolveStores, false, stdout, stderr)
+	return doOrderHistoryWithStoresResolverJSON(name, rig, aa, resolveStores, nil, false, stdout, stderr)
 }
 
-func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, resolveStores orderStoresResolver, jsonOutput bool, stdout, stderr io.Writer) int {
+func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, resolveStores orderStoresResolver, skippedEvents []events.Event, jsonOutput bool, stdout, stderr io.Writer) int {
 	// Filter orders if name or rig specified.
 	targets := aa
 	if name != "" || rig != "" {
@@ -1330,6 +1330,8 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 		rig       string
 		id        string
 		createdAt time.Time
+		skipped   bool
+		reason    string
 	}
 	var entries []historyEntry
 	seenEntries := make(map[string]bool)
@@ -1374,6 +1376,27 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 				})
 			}
 		}
+		// Merge order.skipped events for this order's scoped name (sc-jgb).
+		// Without this, dolt-only orders skipped on mysql cities show
+		// "No order history" — looking like a broken dispatcher.
+		for _, evt := range skippedEvents {
+			if evt.Subject != a.ScopedName() {
+				continue
+			}
+			key := a.ScopedName() + "\x00skipped\x00" + evt.Ts.Format(time.RFC3339Nano) + "\x00" + evt.Message
+			if seenEntries[key] {
+				continue
+			}
+			seenEntries[key] = true
+			entries = append(entries, historyEntry{
+				order:     a.Name,
+				rig:       a.Rig,
+				id:        "-",
+				createdAt: evt.Ts,
+				skipped:   true,
+				reason:    orderHistorySkipReason(evt.Message),
+			})
+		}
 	}
 
 	if len(entries) == 0 {
@@ -1415,6 +1438,8 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 				BeadID:    e.id,
 				Executed:  e.createdAt.Format(time.RFC3339),
 				CreatedAt: e.createdAt,
+				Skipped:   e.skipped,
+				Reason:    e.reason,
 			})
 		}
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
@@ -1429,21 +1454,65 @@ func doOrderHistoryWithStoresResolverJSON(name, rig string, aa []orders.Order, r
 	}
 
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-15s %-9s %s\n", "ORDER", "RIG", "BEAD", "STATUS", "EXECUTED") //nolint:errcheck
 		for _, e := range entries {
 			rig := e.rig
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339)) //nolint:errcheck
+			status, suffix := orderHistoryStatusForEntry(e.skipped, e.reason)
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-9s %s%s\n", e.order, rig, e.id, status, e.createdAt.Format(time.RFC3339), suffix) //nolint:errcheck
 		}
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-15s %s\n", "ORDER", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-9s %s\n", "ORDER", "BEAD", "STATUS", "EXECUTED") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339)) //nolint:errcheck
+			status, suffix := orderHistoryStatusForEntry(e.skipped, e.reason)
+			fmt.Fprintf(stdout, "%-20s %-15s %-9s %s%s\n", e.order, e.id, status, e.createdAt.Format(time.RFC3339), suffix) //nolint:errcheck
 		}
 	}
 	return 0
+}
+
+// orderHistoryStatusForEntry maps a history entry to its status column
+// label and an optional " (reason=...)" trailing suffix. Used by the
+// human-readable order history renderer to surface order.skipped entries
+// distinctly from completed runs (sc-jgb).
+func orderHistoryStatusForEntry(skipped bool, reason string) (string, string) {
+	if !skipped {
+		return "ran", ""
+	}
+	if reason == "" {
+		return "skipped", ""
+	}
+	return "skipped", " (reason=" + reason + ")"
+}
+
+// orderHistorySkipReason extracts the reason identifier from an
+// order.skipped event message of the form "skipped: <reason>".
+// Falls back to the raw message if the prefix is absent.
+func orderHistorySkipReason(message string) string {
+	const prefix = "skipped: "
+	if strings.HasPrefix(message, prefix) {
+		return strings.TrimSpace(strings.TrimPrefix(message, prefix))
+	}
+	return strings.TrimSpace(message)
+}
+
+// readOrderSkippedEvents reads order.skipped events from the city's
+// events.jsonl. Errors are logged to stderr and a nil slice returned
+// (best-effort observability — the bead-store path is the canonical
+// source for order history). Empty cityPath yields a no-op.
+func readOrderSkippedEvents(cityPath string, stderr io.Writer) []events.Event {
+	if strings.TrimSpace(cityPath) == "" {
+		return nil
+	}
+	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
+	evts, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderSkipped})
+	if err != nil {
+		fmt.Fprintf(stderr, "gc order history: read order.skipped events: %v\n", err) //nolint:errcheck // best-effort stderr
+		return nil
+	}
+	return evts
 }
 
 type orderHistoryJSONResult struct {
@@ -1461,6 +1530,11 @@ type orderHistoryJSONEntry struct {
 	BeadID    string    `json:"bead_id"`
 	Executed  string    `json:"executed"`
 	CreatedAt time.Time `json:"created_at"`
+	// Skipped is true for entries derived from order.skipped events
+	// (e.g. dolt-only orders on a MySQL-backed city). When set, BeadID
+	// is "-" and Reason carries a short identifier (sc-jgb).
+	Skipped bool   `json:"skipped,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 type orderHistoryJSONSummary struct {

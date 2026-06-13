@@ -97,6 +97,13 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 		result.Message = fmt.Sprintf("read order firing events: %v", err)
 		return result
 	}
+	skippedEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderSkipped})
+	if err != nil {
+		result.Status = StatusError
+		result.Message = fmt.Sprintf("read order skipped events: %v", err)
+		return result
+	}
+	skippedSubjects := orderFiringSkippedSubjects(skippedEvents)
 	startedAt, err := latestControllerStartedAt(eventPath)
 	if err != nil {
 		result.Status = StatusError
@@ -122,6 +129,16 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 			continue
 		}
 		if orderFiringCurrentOrderSuspended(suspendedRigs, order) {
+			continue
+		}
+		// Orders intentionally skipped by the dispatcher (e.g. dolt-only
+		// orders on a MySQL-backed city) emit order.skipped instead of
+		// order.fired. Treat any order whose only telemetry is skip
+		// events as "skipped intentionally" and exclude from staleness
+		// classification — it would otherwise read as "never fired."
+		// See sc-jgb / order_dispatch.go OrderSkipped emission.
+		if skippedSubjects[order.ScopedName()] {
+			result.Details = append(result.Details, fmt.Sprintf("%s: skipped intentionally (dispatcher emitted order.skipped)", orderDisplayName(order)))
 			continue
 		}
 		monitored++
@@ -559,6 +576,21 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 		}
 	}
 	return latest
+}
+
+// orderFiringSkippedSubjects returns the set of scoped order names that have
+// at least one order.skipped event in the supplied event slice. Used to
+// exclude intentionally-skipped orders from the order-firing-current
+// staleness classification (sc-jgb).
+func orderFiringSkippedSubjects(evts []events.Event) map[string]bool {
+	out := make(map[string]bool)
+	for _, event := range evts {
+		if event.Subject == "" {
+			continue
+		}
+		out[event.Subject] = true
+	}
+	return out
 }
 
 func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
