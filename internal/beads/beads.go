@@ -52,9 +52,13 @@ type Bead struct {
 	Ref          string            `json:"ref,omitempty"`         // formula step ID or formula name
 	Needs        []string          `json:"needs,omitempty"`       // dependency step refs
 	Description  string            `json:"description,omitempty"` // step instructions
-	Labels       []string          `json:"labels,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
-	Dependencies []Dep             `json:"dependencies,omitempty"`
+	Labels []string `json:"labels,omitempty"`
+	// Metadata is a tolerant string map: it accepts JSON booleans, numbers,
+	// and null from external producers (notably bd CLI's type-inferred
+	// metadata column) and coerces them to their JSON-text representation.
+	// See StringMap.UnmarshalJSON in bdstore.go. Source: sc-lmqvj / sc-iqq3.
+	Metadata     StringMap `json:"metadata,omitempty"`
+	Dependencies []Dep     `json:"dependencies,omitempty"`
 	// Ephemeral routes the bead to the wisps tier on Create. Wisps live in
 	// a separate Dolt table, are not git-synced, and are eligible for TTL
 	// garbage collection. Reads must opt in via ListQuery.TierMode (or the
