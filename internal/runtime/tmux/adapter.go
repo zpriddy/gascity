@@ -757,7 +757,14 @@ type tmuxStartOps struct{ tm *Tmux }
 const (
 	defaultReadyProbeTimeout = 15 * time.Second
 	minReadyProbeTimeout     = 5 * time.Second
-	maxReadyProbeTimeout     = 60 * time.Second
+	// maxReadyProbeTimeout caps the ready-probe wait window. Bumped from 60s
+	// to 300s (gs fork patch) to accommodate slow-spawning agents (refinery,
+	// mayor, mechanik) on heavily-loaded scsagent fleets where pre_start
+	// worktree-setup git operations can push start_call past 60s. The
+	// dominant cap is [session].startup_timeout (60s default); this constant
+	// only matters when ReadyDelayMs > 0 and would otherwise clamp below
+	// the configured startup_timeout.
+	maxReadyProbeTimeout     = 300 * time.Second
 	readyProbeSlack          = 5 * time.Second
 	startupPaneCaptureLines  = 80
 	setupCommandOutputLimit  = 4096
