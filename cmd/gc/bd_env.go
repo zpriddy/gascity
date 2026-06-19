@@ -275,6 +275,29 @@ func canonicalScopeDoltTarget(cityPath, scopeRoot string) (contract.DoltConnecti
 	}
 	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityPath, scopeRoot)
 	if err != nil {
+		// Shared-server fallback: when the city declares dolt.shared-server: true
+		// and the managed runtime state is unavailable (e.g. data_dir is the
+		// shared ~/SAPDevelop tree, not the per-city .beads/dolt path that
+		// validManagedRuntimeState requires), synthesize the target from
+		// ~/.beads/shared-server/dolt-server.port plus the pinned database
+		// name in metadata.json. Prevents native_store_unavailable /
+		// identity_match preflight failures for shared-server cities.
+		if contract.IsManagedRuntimeUnavailable(err) && cityUsesSharedDoltServer(cityPath) {
+			if port := resolveSharedDoltServerPort(); port != "" {
+				database := "beads"
+				if db, ok, dberr := contract.ReadDoltDatabase(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "metadata.json")); dberr == nil && ok {
+					if trimmed := strings.TrimSpace(db); trimmed != "" {
+						database = trimmed
+					}
+				}
+				return contract.DoltConnectionTarget{
+					Host:     defaultManagedDoltHost,
+					Port:     port,
+					Database: database,
+					User:     "root",
+				}, true, nil
+			}
+		}
 		return contract.DoltConnectionTarget{}, true, err
 	}
 	return target, true, nil
