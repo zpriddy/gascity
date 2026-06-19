@@ -25,8 +25,20 @@ const defaultCacheTTL = 2 * time.Second
 // sessions and logs a degraded warning.
 const defaultStaleTTL = 30 * time.Second
 
+// defaultFetchTimeout is the default hard timeout for a single runtime-state
+// fetch. The Darwin path issues TWO sequential `ps -eo …` calls under this
+// shared deadline; on heavy-load Macs (load avg in the 60s, thousands of
+// threads) the original 3s budget was insufficient, leading to
+// `signal: killed` errors when Go's exec package SIGKILL'd a child whose
+// context expired mid-call. 10s leaves headroom for both ps calls plus
+// list-panes while still bounding the worst case. Override via
+// GC_TMUX_CACHE_FETCH_TIMEOUT (Go duration string, e.g. "5s", "15s").
+const defaultFetchTimeout = 10 * time.Second
+
 // fetchTimeout is the hard timeout for a single runtime-state fetch.
-const fetchTimeout = 3 * time.Second
+// It is initialized at package load from GC_TMUX_CACHE_FETCH_TIMEOUT, falling
+// back to defaultFetchTimeout if the env var is unset or unparseable.
+var fetchTimeout = fetchTimeoutFromEnv()
 
 // StateFetcher abstracts tmux subprocess calls for testability.
 type StateFetcher interface {
@@ -401,15 +413,41 @@ func fetchProcessSnapshot(ctx context.Context) (processSnapshot, error) {
 }
 
 func fetchDarwinProcessSnapshot(ctx context.Context) (processSnapshot, error) {
-	argsOut, err := exec.CommandContext(ctx, "ps", processSnapshotPSArgs()...).Output()
+	// Each ps call gets its own sub-context with half the parent budget so a
+	// slow first call cannot starve the second. Without this, a single ps that
+	// burns most of the parent deadline leaves the second ps with little or no
+	// time before SIGKILL — manifesting as `signal: killed`. With the split,
+	// each ps gets a predictable bound and a hung first call is bounded
+	// instead of poisoning the whole snapshot.
+	half := fetchTimeoutHalf(ctx)
+
+	argsCtx, argsCancel := context.WithTimeout(ctx, half)
+	defer argsCancel()
+	argsOut, err := exec.CommandContext(argsCtx, "ps", processSnapshotPSArgs()...).Output()
 	if err != nil {
 		return processSnapshot{}, fmt.Errorf("fetching Darwin process args snapshot: %w", err)
 	}
-	commOut, err := exec.CommandContext(ctx, "ps", darwinCommandSnapshotPSArgs()...).Output()
+
+	commCtx, commCancel := context.WithTimeout(ctx, half)
+	defer commCancel()
+	commOut, err := exec.CommandContext(commCtx, "ps", darwinCommandSnapshotPSArgs()...).Output()
 	if err != nil {
 		return processSnapshot{}, fmt.Errorf("fetching Darwin process command snapshot: %w", err)
 	}
 	return parseDarwinProcessSnapshot(string(argsOut), string(commOut)), nil
+}
+
+// fetchTimeoutHalf returns half of the remaining parent deadline, or half of
+// the configured fetchTimeout if the parent has no deadline. This gives each
+// of the two Darwin ps calls a predictable per-call bound.
+func fetchTimeoutHalf(ctx context.Context) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 {
+			return remaining / 2
+		}
+	}
+	return fetchTimeout / 2
 }
 
 // processSnapshotPSArgs returns the platform-appropriate `ps` arguments for
@@ -615,6 +653,33 @@ func (s processSnapshot) hasDescendantWithNames(pid string, names map[string]str
 // isNoServerError checks if the error is a "no server running" error.
 func isNoServerError(err error) bool {
 	return errors.Is(err, ErrNoServer) || (err != nil && strings.Contains(err.Error(), "no server running"))
+}
+
+// fetchTimeoutFromEnv reads GC_TMUX_CACHE_FETCH_TIMEOUT from the environment
+// and parses it as a duration. Returns defaultFetchTimeout if the env var is
+// unset, empty, or cannot be parsed. Accepts:
+//   - Go duration string: (e.g., "10s", "500ms", "1m")
+//   - integer: interpreted as milliseconds (e.g., "10000" = 10s)
+//
+// A non-positive duration is rejected and the default is used.
+func fetchTimeoutFromEnv() time.Duration {
+	v := os.Getenv("GC_TMUX_CACHE_FETCH_TIMEOUT")
+	if v == "" {
+		return defaultFetchTimeout
+	}
+
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+
+	if strings.TrimSpace(v) == v {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+
+	log.Printf("tmux state cache: invalid GC_TMUX_CACHE_FETCH_TIMEOUT=%q, using default %v", v, defaultFetchTimeout)
+	return defaultFetchTimeout
 }
 
 // cacheTTLFromEnv reads GC_TMUX_CACHE_TTL from the environment and parses

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -751,5 +752,66 @@ func TestStateCache_RefreshLogIsOptInViaEnvVar(t *testing.T) {
 func TestIsNoServerErrorRecognizesSentinel(t *testing.T) {
 	if !isNoServerError(ErrNoServer) {
 		t.Fatal("isNoServerError(ErrNoServer) = false, want true")
+	}
+}
+
+func TestFetchTimeoutFromEnv(t *testing.T) {
+	cases := []struct {
+		name     string
+		envValue string
+		setEnv   bool
+		want     time.Duration
+	}{
+		{name: "unset returns default", setEnv: false, want: defaultFetchTimeout},
+		{name: "empty returns default", envValue: "", setEnv: true, want: defaultFetchTimeout},
+		{name: "go duration string", envValue: "15s", setEnv: true, want: 15 * time.Second},
+		{name: "millisecond integer", envValue: "5000", setEnv: true, want: 5 * time.Second},
+		{name: "submillisecond duration", envValue: "750ms", setEnv: true, want: 750 * time.Millisecond},
+		{name: "invalid string falls back", envValue: "not-a-duration", setEnv: true, want: defaultFetchTimeout},
+		{name: "negative duration falls back", envValue: "-3s", setEnv: true, want: defaultFetchTimeout},
+		{name: "zero duration falls back", envValue: "0", setEnv: true, want: defaultFetchTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.setEnv {
+				t.Setenv("GC_TMUX_CACHE_FETCH_TIMEOUT", tc.envValue)
+			} else {
+				// t.Setenv with empty would still SET it; for "unset" we explicitly unset.
+				if err := os.Unsetenv("GC_TMUX_CACHE_FETCH_TIMEOUT"); err != nil {
+					t.Fatalf("Unsetenv: %v", err)
+				}
+			}
+			got := fetchTimeoutFromEnv()
+			if got != tc.want {
+				t.Fatalf("fetchTimeoutFromEnv() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFetchTimeoutDefaultIsTenSeconds(t *testing.T) {
+	if defaultFetchTimeout != 10*time.Second {
+		t.Fatalf("defaultFetchTimeout = %v, want 10s — heavy-load Macs need a generous budget; see state_cache.go header comment", defaultFetchTimeout)
+	}
+}
+
+func TestFetchTimeoutHalfRespectsParentDeadline(t *testing.T) {
+	parentBudget := 4 * time.Second
+	parentCtx, cancel := context.WithTimeout(context.Background(), parentBudget)
+	defer cancel()
+
+	half := fetchTimeoutHalf(parentCtx)
+	// Allow some slop for time.Until precision; we just want roughly half of remaining.
+	min := parentBudget / 4
+	max := parentBudget / 2
+	if half < min || half > max {
+		t.Fatalf("fetchTimeoutHalf with %v parent = %v, want ~%v", parentBudget, half, parentBudget/2)
+	}
+}
+
+func TestFetchTimeoutHalfFallsBackWithNoDeadline(t *testing.T) {
+	half := fetchTimeoutHalf(context.Background())
+	if half != fetchTimeout/2 {
+		t.Fatalf("fetchTimeoutHalf with no-deadline ctx = %v, want %v", half, fetchTimeout/2)
 	}
 }
