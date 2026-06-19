@@ -152,6 +152,20 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 					{Value: "claude-opus-latest", Label: "Opus (proxy)", FlagArgs: []string{"--model", "claude-opus-latest"}, FlagAliases: [][]string{{"-m", "claude-opus-latest"}}},
 					{Value: "claude-opus-latest[1m]", Label: "Opus (proxy, 1M)", FlagArgs: []string{"--model", "claude-opus-latest[1m]"}, FlagAliases: [][]string{{"-m", "claude-opus-latest[1m]"}}},
 					{Value: "claude-sonnet-latest", Label: "Sonnet (proxy)", FlagArgs: []string{"--model", "claude-sonnet-latest"}, FlagAliases: [][]string{{"-m", "claude-sonnet-latest"}}},
+					// SAP-aicore proxied model IDs (zpriddy 2026-06-18, sc-mhq2).
+					// Operator runs claude through SAP's internal AI Core proxy
+					// which exposes Anthropic models under "anthropic--claude-*"
+					// IDs. These need to be in the OptionsSchema enum so
+					// city.toml [providers.<name>] option_defaults.model =
+					// "anthropic--claude-X-Y" passes the validator. Same shape
+					// as the claude-*-latest proxy entries above (e70e74d62).
+					{Value: "anthropic--claude-4-sonnet", Label: "SAP Sonnet 4", FlagArgs: []string{"--model", "anthropic--claude-4-sonnet"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4-sonnet"}}},
+					{Value: "anthropic--claude-4.5-haiku", Label: "SAP Haiku 4.5", FlagArgs: []string{"--model", "anthropic--claude-4.5-haiku"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4.5-haiku"}}},
+					{Value: "anthropic--claude-4.5-opus", Label: "SAP Opus 4.5", FlagArgs: []string{"--model", "anthropic--claude-4.5-opus"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4.5-opus"}}},
+					{Value: "anthropic--claude-4.5-sonnet", Label: "SAP Sonnet 4.5", FlagArgs: []string{"--model", "anthropic--claude-4.5-sonnet"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4.5-sonnet"}}},
+					{Value: "anthropic--claude-4.6-opus", Label: "SAP Opus 4.6", FlagArgs: []string{"--model", "anthropic--claude-4.6-opus"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4.6-opus"}}},
+					{Value: "anthropic--claude-4.6-sonnet", Label: "SAP Sonnet 4.6", FlagArgs: []string{"--model", "anthropic--claude-4.6-sonnet"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4.6-sonnet"}}},
+					{Value: "anthropic--claude-4.7-opus", Label: "SAP Opus 4.7", FlagArgs: []string{"--model", "anthropic--claude-4.7-opus"}, FlagAliases: [][]string{{"-m", "anthropic--claude-4.7-opus"}}},
 				},
 			},
 		},
