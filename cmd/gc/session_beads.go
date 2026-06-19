@@ -30,6 +30,12 @@ const (
 	poolAliasConflictMetadataKey      = "pool_alias_conflict"
 	poolAliasConflictCountMetadataKey = "pool_alias_conflict_count"
 	poolAliasConflictAtMetadataKey    = "pool_alias_conflict_at"
+
+	// sleepReasonRuntimeDied is set on session beads whose tmux pane was
+	// confirmed dead by the reconciler's cleanDeadRuntimeSessions pass.
+	// Distinct from sleepReasonCityStop (cmd_stop.go) so the dashboard can
+	// distinguish storage-degradation reboots from intentional city stops.
+	sleepReasonRuntimeDied = "runtime-died"
 )
 
 // loadSessionBeads returns all open session beads from the store.
@@ -1996,6 +2002,12 @@ func cleanupDeadRuntimeSessionCorpses(
 		// runtime-Stop side effect still runs in test contexts that do not
 		// wire a real store; closeBead is idempotent on already-closed beads.
 		if store != nil {
+			// Mark sleep_reason=runtime-died before closing so the dashboard
+			// can distinguish storage-degradation reboots from city-stop events.
+			// Only set if unset; don't overwrite a sticky city-stop marker.
+			if strings.TrimSpace(b.Metadata["sleep_reason"]) == "" {
+				_ = store.SetMetadata(b.ID, "sleep_reason", sleepReasonRuntimeDied)
+			}
 			closeBead(store, b.ID, "dead-runtime", clk.Now().UTC(), stderr)
 		}
 		cleaned++
