@@ -112,6 +112,39 @@ if latency_should_warn "$LATENCY_MS" "$LATENCY_WARN_MS"; then
     LATENCY_WARN=" [WARN: latency ${LATENCY_MS}ms >= threshold ${LATENCY_WARN_MS}ms]"
 fi
 
+# --- Step 1.5: CPU + panic watch ---
+# Detects runaway dolt server (e.g., GCSafepointWaiter panic loop at 143% CPU)
+# that still answers SQL probes but is otherwise stuck. Auto-restarts when
+# CPU >= GC_DOCTOR_CPU_RESTART_PCT or a panic appears in dolt-server.log.
+DOLT_PID_FILE="${GC_DOLT_PID_FILE:-$HOME/.beads/shared-server/dolt-server.pid}"
+DOLT_LOG_FILE="${GC_DOLT_LOG_FILE:-$HOME/.beads/shared-server/dolt-server.log}"
+CPU_WARN_PCT="${GC_DOCTOR_CPU_WARN_PCT:-100}"
+CPU_RESTART_PCT="${GC_DOCTOR_CPU_RESTART_PCT:-150}"
+PANIC_RESTART="${GC_DOCTOR_PANIC_RESTART:-1}"
+CPU_WARN=""; PANIC_WARN=""; RESTART_REASON=""
+
+if [ -r "$DOLT_PID_FILE" ]; then
+    DOLT_PID=$(cat "$DOLT_PID_FILE")
+    DOLT_CPU=$(ps -p "$DOLT_PID" -o pcpu= 2>/dev/null | awk '{printf "%.0f",$1+0}')
+    if [ -n "$DOLT_CPU" ] && [ "$DOLT_CPU" -ge "$CPU_RESTART_PCT" ]; then
+        RESTART_REASON="cpu=${DOLT_CPU}% >= ${CPU_RESTART_PCT}%"
+    elif [ -n "$DOLT_CPU" ] && [ "$DOLT_CPU" -ge "$CPU_WARN_PCT" ]; then
+        CPU_WARN=" [WARN: dolt PID $DOLT_PID cpu=${DOLT_CPU}%]"
+    fi
+fi
+if [ -r "$DOLT_LOG_FILE" ] && [ "$PANIC_RESTART" = "1" ]; then
+    if tail -200 "$DOLT_LOG_FILE" | grep -qE 'GCSafepointWaiter|caught panic|sync: WaitGroup is reused'; then
+        PANIC_WARN=" [WARN: panic in last 200 log lines]"
+        [ -z "$RESTART_REASON" ] && RESTART_REASON="panic in dolt-server.log"
+    fi
+fi
+if [ -n "$RESTART_REASON" ]; then
+    send_escalation "ESCALATION: Dolt server auto-restart ($RESTART_REASON) [HIGH]" \
+        "Doctor triggering gc dolt restart --force; reason=$RESTART_REASON"
+    gc dolt restart --force >/dev/null 2>&1 || \
+        send_escalation "ESCALATION: gc dolt restart FAILED" "Manual intervention required"
+fi
+
 # --- Step 2: Check resource conditions ---
 
 CONN_COUNT=$(dolt_sql -r csv -q "SELECT COUNT(*) FROM information_schema.PROCESSLIST" 2>/dev/null \
@@ -178,7 +211,7 @@ fi
 
 # --- Step 3: Compose report and escalate if critical ---
 
-WARNINGS="${LATENCY_WARN}${CONN_WARN}${ORPHAN_WARN}${BACKUP_STALE}"
+WARNINGS="${LATENCY_WARN}${CONN_WARN}${ORPHAN_WARN}${BACKUP_STALE}${CPU_WARN}${PANIC_WARN}"
 if [ -n "$WARNINGS" ]; then
     if ! send_escalation \
         "Dolt health advisory [MEDIUM]" \
