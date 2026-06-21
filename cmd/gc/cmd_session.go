@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -209,6 +210,28 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	if err := validateResolvedSessionTransport(resolved, sessionTransport, sp); err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+
+	// Pool-pattern de-collision (sc-ue9zj): when tmux_alias resolves to a
+	// non-slot-distinguishing name (e.g. "{{.AgentBase}}"), every fresh CLI
+	// spawn against a multi-session pool template yields the same explicit
+	// session_name. The first slot succeeds; subsequent attempts fail with
+	// ErrSessionNameExists. The pool reconciler already deconflicts via
+	// derivePoolSessionName (resolvedTmuxAlias + "-" + beadID); mirror that
+	// here so `gc session new <pool-template>` can scale beyond slot 1 when
+	// the tmux_alias is not slot-aware. Only triggers for multi-session
+	// agents to preserve singleton/named-session naming.
+	if explicitName != "" && found.SupportsMultipleSessions() {
+		if err := session.EnsureSessionNameAvailableWithConfig(store, cfg, explicitName, ""); err != nil {
+			if errors.Is(err, session.ErrSessionNameExists) {
+				adhocName, genErr := session.GenerateAdhocExplicitName(explicitName)
+				if genErr != nil {
+					fmt.Fprintf(stderr, "gc session new: regenerating explicit name after collision: %v\n", genErr) //nolint:errcheck // best-effort stderr
+					return 1
+				}
+				explicitName = adhocName
+			}
+		}
 	}
 
 	// Build the work directory.
