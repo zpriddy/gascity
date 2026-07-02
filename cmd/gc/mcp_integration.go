@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -21,6 +22,7 @@ var managedMCPGitignoreEntries = []string{
 	filepath.ToSlash(filepath.Join(".codex", "config.toml")),
 	filepath.ToSlash(filepath.Join(".cursor", "mcp.json")),
 	"opencode.json",
+	"mimocode.json",
 }
 
 type mcpTargetSpec struct {
@@ -46,6 +48,7 @@ func supportsMCPProviderKind(kind string) bool {
 		materialize.MCPProviderCodex,
 		materialize.MCPProviderGemini,
 		materialize.MCPProviderOpenCode,
+		materialize.MCPProviderMimoCode,
 		materialize.MCPProviderCursor:
 		return true
 	default:
@@ -78,7 +81,7 @@ func resolveAgentMCPProjection(
 		return materialize.MCPCatalog{}, materialize.MCPProjection{}, err
 	}
 	if !supportsMCPProviderKind(providerKind) {
-		if shouldSkipImplicitStartCommandMCP(agent, providerKind) {
+		if shouldSkipDeterministicControlDispatcherMCP(agent, providerKind) {
 			return materialize.MCPCatalog{}, materialize.MCPProjection{}, nil
 		}
 		if len(catalog.Servers) > 0 {
@@ -94,16 +97,11 @@ func resolveAgentMCPProjection(
 	return catalog, projection, nil
 }
 
-// shouldSkipImplicitStartCommandMCP matches implicit infrastructure agents that
-// run from StartCommand without a provider family. Provider-backed implicit
-// agents injected for coverage set Provider and must still project inherited
-// MCP; validateStage2TargetClaimants can skip implicit peers more broadly
-// because it is only checking conflicts from other agents.
-func shouldSkipImplicitStartCommandMCP(agent *config.Agent, providerKind string) bool {
-	return agent != nil &&
-		agent.Implicit &&
-		strings.TrimSpace(agent.StartCommand) != "" &&
-		strings.TrimSpace(agent.Provider) == "" &&
+// shouldSkipDeterministicControlDispatcherMCP matches the providerless
+// control-dispatcher worker. It never invokes provider MCP projection, so an
+// inherited city MCP catalog must not make startup require a provider family.
+func shouldSkipDeterministicControlDispatcherMCP(agent *config.Agent, providerKind string) bool {
+	return config.IsDeterministicControlDispatcher(agent) &&
 		strings.TrimSpace(providerKind) == ""
 }
 
@@ -401,7 +399,7 @@ func resolveSessionMCPProjection(
 	if identity == "" {
 		identity = agent.QualifiedName()
 	}
-	workDir := strings.TrimSpace(bead.Metadata["work_dir"])
+	workDir := strings.TrimSpace(bead.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	if workDir == "" {
 		workDir, err = resolveWorkDirForQualifiedName(cityPath, cfg, agent, identity)
 		if err != nil {

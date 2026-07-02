@@ -1,5 +1,5 @@
 ---
-title: Dolt Bloat Recovery
+title: Recover from Dolt Bloat
 description: Recover a Gas City beads store whose Dolt noms directory has grown out of proportion.
 ---
 
@@ -67,6 +67,75 @@ du -sh .beads/dolt/<database>/.dolt
 If `gc doctor` reports a clean `dolt-noms-size` and agents come back up
 cleanly, the recovery is complete. You may delete the `.dolt.bak-*`
 directory at your leisure once you are confident in the new store.
+
+## Reclaiming a database stranded below the compaction threshold
+
+`gc dolt compact` skips any database with fewer commits than the threshold
+(default 2000, `GC_DOLT_COMPACT_THRESHOLD_COMMITS`). A database can fall *below*
+that threshold yet still carry orphaned chunks — most commonly after a prior
+flatten squashed its history but the post-flatten full GC was deferred (a
+concurrent writer raced the flatten), quarantined and later cleared, or
+otherwise never completed. Scheduled compaction then skips the database forever
+and the space is never reclaimed. The skip is visible in the compactor log as:
+
+```
+compact: db=<database> commits=<n> below_threshold=<t> oldgen_archives=present pending_gc=absent — skip ...
+```
+
+Use the operator-invoked reclaim path to recover such a database without waiting
+for its commit count to climb back over the threshold:
+
+```bash
+# Reclaim one stranded database. Runs CALL DOLT_GC('--full') with no flatten,
+# bypassing the commit-count threshold.
+gc dolt compact --gc-only --only-db <database>
+
+# Preview first, mutating nothing.
+gc dolt compact --gc-only --only-db <database> --dry-run
+```
+
+`--gc-only` refuses any database under an integrity-quarantine marker; resolve
+the underlying reason (see **Compact Quarantine Reasons** below) before
+reclaiming. Unlike the full `dolt gc --archive-level=1` procedure above,
+`--gc-only` runs against the live managed server and does not require stopping
+the city — though quiescing writers still makes the GC faster and more
+thorough.
+
+## Compacting a city whose Dolt remote is uncredentialed
+
+Before flattening (and again before pushing) the compactor runs
+`CALL DOLT_FETCH('<remote>')` to reconcile against the remote. Against an
+**uncredentialed git+https remote**, that call does not merely return an error —
+it **crashes the managed Dolt sql-server process**. The shell tolerates a
+non-zero return code ("proceeding from local source of truth") but cannot catch
+a server-process death across the process boundary: the supervisor restarts the
+server seconds later, but by then every remaining database's probe hits
+`connection refused`, so one misconfigured remote takes down compaction for the
+whole city.
+
+If a city's remote is not (yet) credentialed, opt out of the fetch so
+compaction runs entirely from the local source of truth. The post-compaction
+remote push is deferred via a pending-push marker and resumes automatically on a
+later run once the fetch path is healthy:
+
+```bash
+# Skip the fetch for every database this run.
+gc dolt compact --skip-fetch
+
+# Equivalent environment opt-out (e.g. set in a wrapper or on the city).
+GC_DOLT_COMPACT_SKIP_FETCH=1 gc dolt compact
+
+# Skip the fetch only for specific, known-uncredentialed databases (CSV);
+# credentialed databases in the same city still fetch and push normally.
+GC_DOLT_COMPACT_SKIP_FETCH_DBS=<database>[,<database>...] gc dolt compact
+```
+
+Prefer the per-database `GC_DOLT_COMPACT_SKIP_FETCH_DBS` form over the global
+opt-out when only some databases are uncredentialed — the global form disables
+remote sync for every database, including ones whose push would otherwise
+succeed. Do **not** set the global opt-out in the shared `mol-dog-compactor`
+order for the same reason; set the per-database env on the affected city
+instead.
 
 ## Expected Outcome
 

@@ -64,7 +64,7 @@ endif
 endif
 endif
 
-.PHONY: build build-zp check check-all check-bd check-docker check-docs check-dolt check-native-dependency-surface check-routed-test-rows check-version-tag lint lint-full lint-new lint-changed fmt-check fmt vet test test-fast-parallel test-fsys-darwin-compile test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-smoke
+.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-eventexport-isolation check-gomod-replace check-native-dependency-surface check-routed-test-rows check-version-tag lint lint-full lint-new lint-changed fmt-check fmt vet test test-mac test-fast-parallel test-fsys-darwin-compile test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mail-wisp-insert test-mcp-mail test-openclaw-bridge test-docker test-k8s test-cover test-cover-mac test-cover-noncmdgc test-cover-cmdgc-shard cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-smoke
 
 ## build: compile gc binary with version metadata
 build:
@@ -72,43 +72,6 @@ build:
 ifeq ($(shell uname),Darwin)
 	@scripts/sign-darwin-local.sh $(BUILD_DIR)/$(BINARY)
 endif
-
-# Fork-build counter file — bumped manually each time we apply or change
-# our fork-only patches on top of the current upstream SHA.
-#
-# Format: a semver-style fork tag like "1.0.0-zv1". The build name is
-# "<fork-version>+<sha>" so `gc version` shows e.g. "1.0.0-zv1+18b41fa1"
-# — fork tag for humans, sha for traceability.
-ZP_FORK_VERSION_FILE := .zp-fork-version
-ZP_FORK_VERSION := $(shell cat $(ZP_FORK_VERSION_FILE) 2>/dev/null | tr -d '[:space:]')
-ZP_BUILD := $(ZP_FORK_VERSION)+$(COMMIT)
-ZP_LDFLAGS := -X main.version=$(ZP_BUILD) \
-              -X main.commit=$(COMMIT) \
-              -X main.date=$(BUILD_TIME)
-# Apple developer cert for signing fork builds. Override on the make line:
-#   make build-zp ZP_CODESIGN_IDENTITY="-"
-# to ad-hoc-sign instead.
-ZP_CODESIGN_IDENTITY ?= Apple Development: Zak Priddy (9ULEP73AAX)
-
-## build-zp: build gc with fork version <fork-version>+<sha> (reads .zp-fork-version).
-## Convention: lets us tell forked builds apart from upstream at a glance
-## via `gc version`.
-build-zp:
-	@if [ -z "$(ZP_FORK_VERSION)" ]; then \
-		echo "ERROR: $(ZP_FORK_VERSION_FILE) missing or empty. Create it with a semver fork tag (e.g. echo 1.0.0-zv1 > $(ZP_FORK_VERSION_FILE))." >&2; \
-		exit 1; \
-	fi
-	@echo "Building $(BINARY) (fork build: $(ZP_BUILD))..."
-	go build -ldflags "$(ZP_LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gc
-ifeq ($(shell uname),Darwin)
-	@if codesign -s "$(ZP_CODESIGN_IDENTITY)" -f $(BUILD_DIR)/$(BINARY) 2>/dev/null; then \
-		echo "Signed $(BINARY) with: $(ZP_CODESIGN_IDENTITY)"; \
-	else \
-		echo "WARNING: codesign with '$(ZP_CODESIGN_IDENTITY)' failed; falling back to ad-hoc signature" >&2; \
-		codesign -s - -f $(BUILD_DIR)/$(BINARY) 2>/dev/null || true; \
-	fi
-endif
-	@echo "Built: $(BUILD_DIR)/$(BINARY) ($(ZP_BUILD))"
 
 ## install: build and install gc to GOPATH/bin (same location as go install)
 install: build
@@ -138,7 +101,7 @@ generate:
 
 ## check-schema: verify generated docs are up to date
 check-schema: generate
-	@git diff --exit-code docs/schema/ docs/reference/ || \
+	@git diff --exit-code docs/reference/ || \
 		(echo "Error: generated docs stale. Run 'make generate'" && exit 1)
 
 ## clean: remove build artifacts
@@ -155,9 +118,20 @@ check: fmt-check lint vet check-routed-test-rows test
 check-routed-test-rows:
 	./scripts/check-routed-test-rows.sh
 
+## check-gomod-replace: block unreleased replace directives (pseudo-version, local path, git ref)
+## Tripwire for the 2026-06-11 incident where PR #3489 shipped a pseudo-version replace
+## (=> v1.0.5-0.20260611054652-dc0561af28e9) that violated the public-project release policy.
+## Policy: only released semver tags allowed; human-operator bypass required for exceptions.
+check-gomod-replace:
+	bash scripts/check-gomod-replace.sh go.mod
+
 ## check-native-dependency-surface: guard native beads dependency and binary growth
 check-native-dependency-surface:
 	bash scripts/check-native-dependency-surface.sh
+
+## check-eventexport-isolation: keep the OSS event-export surface brand-free, single-sourced, and internal-free
+check-eventexport-isolation:
+	bash scripts/check-eventexport-isolation.sh
 
 ## check-bd: verify bd (beads CLI) is installed
 check-bd:
@@ -295,6 +269,7 @@ TEST_ENV = env -i \
 	TMPDIR="$${TMPDIR:-/tmp}" \
 	OBSERVABLE_TEST_LOG="$${OBSERVABLE_TEST_LOG-}" \
 	OBSERVABLE_FAILURE_LINES="$${OBSERVABLE_FAILURE_LINES-}" \
+	GC_TEST_NO_SLICE="$${GC_TEST_NO_SLICE-}" \
 	XDG_RUNTIME_DIR="$$XDG_RUNTIME_DIR" \
 	GOPATH="$(GOPATH_VAL)" \
 	GOCACHE="$(GOCACHE_VAL)" \
@@ -338,6 +313,14 @@ TEST_ENV = env -i \
 test: test-fsys-darwin-compile
 	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test -- -p=4 -count=1 -timeout 15m ./...
 
+# MAC_UNIT_PKGS excludes cmd/gc from the Mac unit sweep; cmd/gc runs
+# sharded via the mac-cmd-gc-process CI matrix job instead.
+MAC_UNIT_PKGS = $(shell go list ./... | grep -v '/cmd/gc$$')
+
+## test-mac: Mac unit sweep with cmd/gc excluded; cmd/gc covered by the Mac sharded job.
+test-mac: test-fsys-darwin-compile
+	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test-mac -- -p=4 -count=1 -timeout 15m $(MAC_UNIT_PKGS)
+
 LOCAL_TEST_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 
 ## test-fast-parallel: run the default fast suite with cmd/gc sharded locally
@@ -363,13 +346,17 @@ test-pack-registry-live:
 	$(TEST_ENV) CGO_ENABLED=0 GC_TEST_GASCITY_PACKS_REGISTRY="$${GC_TEST_GASCITY_PACKS_REGISTRY}" go test ./cmd/gc -run '^TestPackRegistryLiveGascityPacksCatalog$$' -count=1
 	$(TEST_ENV) CGO_ENABLED=0 GC_TEST_GASCITY_PACKS_REGISTRY="$${GC_TEST_GASCITY_PACKS_REGISTRY}" go test -tags acceptance_a -timeout 10m ./test/acceptance -run '^TestPackRegistryLiveImportsEveryCatalogPack$$' -count=1
 
-## update-bundled-gastown-pack: sync the embedded gastown pack to the latest registry release
+## update-bundled-gastown-pack: pin the gastown module/constants/example to the latest registry release
 update-bundled-gastown-pack:
 	scripts/update-bundled-gastown-pack
 
 ## test-native-doltlite-beads: compile and run the native DoltLite read-store suite
 test-native-doltlite-beads:
 	$(TEST_ENV) CGO_ENABLED=0 go test -tags gascity_native_beads ./internal/beads -count=1
+
+## sync-bd-corpus: vendor the bd contract corpus from a beads release (BD_CORPUS_TAG=vX.Y.Z)
+sync-bd-corpus:
+	scripts/sync-bd-corpus.sh
 
 ## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
 ## process-backed lifecycle coverage routed out of the default fast loop
@@ -378,6 +365,8 @@ test-cmd-gc-process:
 
 CMD_GC_PROCESS_SHARD ?= 1
 CMD_GC_PROCESS_TOTAL ?= 6
+CMD_GC_COVER_TOTAL ?= 6
+CMD_GC_COVER_SHARD ?= 1
 test-cmd-gc-process-shard:
 	$(TEST_ENV) GC_FAST_UNIT=0 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=20m ./scripts/test-go-test-shard ./cmd/gc $(CMD_GC_PROCESS_SHARD) $(CMD_GC_PROCESS_TOTAL)
 
@@ -412,11 +401,10 @@ test-worker-inference:
 ## test-worker-inference-phase3: alias for the live worker inference conformance package
 test-worker-inference-phase3: test-worker-inference
 
-## test-acceptance: run acceptance tests (Tier A — fast, <5 min, every PR).
-## ACCEPTANCE_TIMEOUT overrides the go-test timeout (defaults to 5m on
-## Linux; Mac CI bumps it because launchd-mediated supervisor start is
-## noticeably slower than systemd).
-ACCEPTANCE_TIMEOUT ?= 5m
+## test-acceptance: run acceptance tests (Tier A — command-level PR gate).
+## ACCEPTANCE_TIMEOUT overrides the go-test timeout. The unsharded local/CI
+## target runs the command-heavy Tier A package serially; RC gate shards it.
+ACCEPTANCE_TIMEOUT ?= 15m
 test-acceptance:
 	$(TEST_ENV) go test -tags acceptance_a -timeout $(ACCEPTANCE_TIMEOUT) ./test/acceptance/...
 
@@ -574,13 +562,36 @@ check-docs:
 # Packages for coverage — exclude noise:
 #   session/tmux: integration-test-only, not meaningful for unit coverage
 #   beadstest: conformance helper, runs under internal/beads coverage
-UNIT_COVER_PKGS = $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e /session/tmux -e /beadstest)
+# cmd/gc excluded: it runs sharded below in test-cover to stay under per-package timeout
+UNIT_COVER_PKGS_NONCMDGC = $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e /session/tmux -e /beadstest -e '/cmd/gc$$')
 
-## test-cover: run fast unit-test coverage without the integration-tagged package sweep
+## test-cover: run fast unit-test coverage without the integration-tagged package sweep.
+## cmd/gc is sharded CMD_GC_COVER_TOTAL (default 6) ways via test-go-test-shard so each
+## shard lands well under the per-package timeout; profiles are merged via merge-coverprofiles.
 ## The skipped cmd/gc process-backed scenarios remain covered by
 ## `make test-cmd-gc-process` locally and the CI `cmd/gc process suite` job.
 test-cover: test-fsys-darwin-compile
-	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 8m -coverprofile=coverage.txt $(UNIT_COVER_PKGS)
+	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 10m -coverprofile=coverage.noncmdgc.txt $(UNIT_COVER_PKGS_NONCMDGC)
+	@rm -f coverage.cmdgc.*.txt
+	@for s in $$(seq 1 $(CMD_GC_COVER_TOTAL)); do \
+		$(TEST_ENV) GO_TEST_COVERPROFILE="coverage.cmdgc.$$s.txt" \
+		GC_FAST_UNIT=1 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=10m \
+		./scripts/test-go-test-shard ./cmd/gc "$$s" $(CMD_GC_COVER_TOTAL) || exit 1; \
+	done
+	./scripts/merge-coverprofiles coverage.txt coverage.noncmdgc.txt coverage.cmdgc.*.txt
+
+## test-cover-mac: Mac coverage sweep with cmd/gc excluded; cmd/gc runs via the Mac sharded job.
+## Running the full test-cover cmd/gc shards sequentially on Mac would exceed the 25m job cap.
+test-cover-mac: test-fsys-darwin-compile
+	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 10m -coverprofile=coverage.txt $(UNIT_COVER_PKGS_NONCMDGC)
+
+## test-cover-noncmdgc: run unit coverage for all packages except cmd/gc (CI parallel half).
+test-cover-noncmdgc: test-fsys-darwin-compile
+	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 10m -coverprofile=coverage.noncmdgc.txt $(UNIT_COVER_PKGS_NONCMDGC)
+
+## test-cover-cmdgc-shard: run unit coverage for one cmd/gc shard (CMD_GC_COVER_SHARD of CMD_GC_COVER_TOTAL).
+test-cover-cmdgc-shard:
+	$(TEST_ENV) GO_TEST_COVERPROFILE=coverage.cmdgc.$(CMD_GC_COVER_SHARD).txt GC_FAST_UNIT=1 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=10m ./scripts/test-go-test-shard ./cmd/gc $(CMD_GC_COVER_SHARD) $(CMD_GC_COVER_TOTAL)
 
 ## cover: run tests and show coverage report
 cover: test-cover
@@ -637,9 +648,21 @@ install-buildx:
 	install -m 0755 "$$tmp" $(HOME)/.docker/cli-plugins/docker-buildx
 	@echo "Installed docker-buildx v$(BUILDX_VERSION)"
 
+## test-mail-wisp-insert: run the beads version-skew regression tests for gc mail send (wisp_events INSERT path)
+## Tripwire for the 2026-06-11 P0: covers both NativeDoltStore and BdStore → Dolt paths.
+test-mail-wisp-insert:
+	@echo "=== NativeDoltStore ephemeral mail (go.mod beads library) ==="
+	$(TEST_ENV) go test -tags integration ./internal/beads/ -run TestNativeDoltStoreEphemeralMailSend -v -count=1
+	@echo "=== BdStore mail wisp INSERT (bd CLI → Dolt SQL) ==="
+	$(TEST_ENV) go test -tags integration ./test/integration/ -run TestBdStoreMailWispInsert -v -count=1
+
 ## test-mcp-mail: run mcp_agent_mail live conformance test (auto-starts server)
 test-mcp-mail:
 	$(TEST_ENV) GC_TEST_MCP_MAIL=1 go test ./internal/mail/exec/ -run TestMCPMailConformanceLive -v -count=1
+
+## test-openclaw-bridge: install + run the contrib/openclaw-bridge Node test suite
+test-openclaw-bridge:
+	cd contrib/openclaw-bridge && npm ci --no-audit --no-fund && npm test
 
 ## test-docker: run Docker session provider integration tests
 test-docker: check-docker
@@ -668,7 +691,7 @@ diagrams-excalidraw:
 		out="$$out_dir/$$base.svg"; \
 		if [ ! -e "$$out" ] || [ "$$f" -nt "$$out" ]; then \
 			echo "excalidraw -> $$out"; \
-			npx -y @swiftlysingh/excalidraw-cli convert "$$f" --format svg --output "$$out"; \
+			npx -y @swiftlysingh/excalidraw-cli convert "$$f" --format svg --padding 16 --output "$$out"; \
 			rendered=$$((rendered+1)); \
 		fi; \
 	done; \
@@ -678,24 +701,24 @@ diagrams-excalidraw:
 docs-dev:
 	./mint.sh dev
 
-## dashboard-build: regenerate SPA types + compile the dist bundle
+## dashboard-build: compile the SPA bundle and sync it into the embedded dist/
 dashboard-build:
-	cd cmd/gc/dashboard/web && npm ci --silent && npm run gen && npm run build
+	cd internal/api/dashboardspa/web && npm ci --silent && npm run build && rm -rf ../dist && cp -rf frontend/dist ../dist
 
 ## dashboard-dev: Vite dev server (HMR) for SPA iteration
 dashboard-dev:
-	cd cmd/gc/dashboard/web && npm run dev
+	cd internal/api/dashboardspa/web && npm run --workspace gas-city-dashboard-frontend dev
 
-## dashboard-check: typecheck + build the SPA, then go test the static handler
+## dashboard-check: typecheck + build the SPA, then go test the embedded handler + BFF
 dashboard-check: dashboard-build
-	cd cmd/gc/dashboard/web && npm run typecheck
-	$(TEST_ENV) go test ./cmd/gc/dashboard/...
+	cd internal/api/dashboardspa/web && npm run typecheck
+	$(TEST_ENV) go test ./internal/api/dashboardspa/... ./internal/api/dashboardbff/...
 
 ## dashboard-smoke: serve the built SPA bundle via Vite preview and verify it responds
 dashboard-smoke: dashboard-build
 	@PORT=$$(python3 -c 'import socket; sock = socket.socket(); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()'); \
 	LOG=$$(mktemp); \
-	( cd cmd/gc/dashboard/web && exec npm run preview -- --host 127.0.0.1 --strictPort --port $$PORT >"$$LOG" 2>&1 ) & \
+	( cd internal/api/dashboardspa/web/frontend && exec npm run preview -- --host 127.0.0.1 --strictPort --port $$PORT >"$$LOG" 2>&1 ) & \
 	PID=$$!; \
 	trap 'kill $$PID >/dev/null 2>&1 || true; wait $$PID >/dev/null 2>&1 || true; rm -f "$$LOG"' EXIT INT TERM; \
 	for attempt in $$(seq 1 40); do \
@@ -707,25 +730,25 @@ dashboard-smoke: dashboard-build
 	cat "$$LOG" >&2; \
 	exit 1
 
-## dashboard-ci: rebuild the SPA bundle and fail if the tracked dist/ is stale.
-## Used by CI to enforce that cmd/gc/dashboard/web/dist/ matches the source.
+## dashboard-ci: rebuild the SPA bundle and fail if the embedded dist/ is stale.
+## Used by CI to enforce that internal/api/dashboardspa/dist/ matches the source.
 dashboard-ci: dashboard-check
-	@if ! git diff --quiet -- cmd/gc/dashboard/web/dist; then \
-		echo "ERROR: cmd/gc/dashboard/web/dist/ is stale — run 'make dashboard-build' and commit." >&2; \
-		git --no-pager diff --stat -- cmd/gc/dashboard/web/dist; \
+	@if ! git diff --quiet -- internal/api/dashboardspa/dist; then \
+		echo "ERROR: internal/api/dashboardspa/dist/ is stale — run 'make dashboard-build' and commit." >&2; \
+		git --no-pager diff --stat -- internal/api/dashboardspa/dist; \
 		exit 1; \
 	fi
 
 ## spec-ci: regenerate the OpenAPI spec + generated Go client, fail on drift.
-## Used by CI to enforce that internal/api/openapi.json, docs/schema JSON
+## Used by CI to enforce that internal/api/openapi.json, docs/reference/schema JSON
 ## artifacts, compatibility .txt mirrors, and internal/api/genclient/client_gen.go
 ## are all in lock-step with Huma.
 spec-ci: install-oapi-codegen
 	go run ./cmd/genspec
 	go generate ./internal/api/genclient
-	@if ! git diff --quiet -- internal/api/openapi.json docs/schema/openapi.json docs/schema/openapi.txt docs/schema/events.json docs/schema/events.txt internal/api/genclient/client_gen.go; then \
+	@if ! git diff --quiet -- internal/api/openapi.json docs/reference/schema/openapi.json docs/reference/schema/openapi.txt docs/reference/schema/events.json docs/reference/schema/events.txt internal/api/genclient/client_gen.go; then \
 		echo "ERROR: spec/client artifacts drifted — run 'make spec-ci' locally and commit." >&2; \
-		git --no-pager diff --stat -- internal/api/openapi.json docs/schema/openapi.json docs/schema/openapi.txt docs/schema/events.json docs/schema/events.txt internal/api/genclient/client_gen.go; \
+		git --no-pager diff --stat -- internal/api/openapi.json docs/reference/schema/openapi.json docs/reference/schema/openapi.txt docs/reference/schema/events.json docs/reference/schema/events.txt internal/api/genclient/client_gen.go; \
 		exit 1; \
 	fi
 

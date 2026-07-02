@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/spf13/cobra"
 )
 
@@ -22,7 +23,7 @@ func newStopCmd(stdout, stderr io.Writer) *cobra.Command {
 	var force bool
 	var jsonOut bool
 	cmd := &cobra.Command{
-		Use:   "stop [path]",
+		Use:   "stop [path|name]",
 		Short: "Stop all agent sessions in the city",
 		Long: `Stop all agent sessions in the city with graceful shutdown.
 
@@ -36,7 +37,8 @@ before giving up; the default budgets configured session interrupt and
 stop waves, the configured shutdown grace wait, and a second orphan
 cleanup pass. Use --force to skip the interrupt grace period and go
 straight to kill.`,
-		Args: cobra.MaximumNArgs(1),
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeCityNames,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdStopJSON(args, stdout, stderr, wallClockTimeout, force, jsonOut) != 0 {
 				return errExit
@@ -155,7 +157,29 @@ func resolveStopCityPath(args []string) (string, error) {
 	if len(args) == 0 {
 		return resolveCommandCity(nil)
 	}
-	abs, err := filepath.Abs(args[0])
+	// A name-shaped positional may be a registered city name or a local rig
+	// directory; route it through the shared name resolver so a slashless rig
+	// dir still resolves to its owning city without reopening the bare-name
+	// walk-up footgun. Path-shaped args keep the exact stop path resolver.
+	if classifyCityRef(args[0]) == cityRefName {
+		ctx, err := resolveCityNameContext(args[0], func(name string) (resolvedContext, error) {
+			cp, perr := stopCityPathFromArg(name)
+			return resolvedContext{CityPath: cp}, perr
+		})
+		if err != nil {
+			return "", err
+		}
+		return ctx.CityPath, nil
+	}
+	return stopCityPathFromArg(args[0])
+}
+
+// stopCityPathFromArg resolves a path-shaped stop argument (or a local city) to
+// a city path, trying an exact city path, then a rig path, then an upward city
+// walk — the original path-only behavior, now invoked as resolveCityRef's path
+// resolver.
+func stopCityPathFromArg(ref string) (string, error) {
+	abs, err := filepath.Abs(ref)
 	if err != nil {
 		return "", err
 	}
@@ -246,9 +270,7 @@ func cmdStopBody(cityPath string, cfg *config.City, force bool, stdout, stderr i
 	cityName := loadedCityName(cfg, cityPath)
 
 	store, _ := openCityStoreAt(cityPath)
-	markCityStopSessionSleepReason(store, stderr)
-	// Close session beads so aliases are released for next start.
-	closeCitySessionBeads(cityPath, stderr)
+	markCityStopSessionSleepReason(sessionFrontDoor(store), stderr)
 
 	// If a controller is running, ask it to shut down (it stops agents).
 	if tryStopControllerWithForce(cityPath, stdout, force) {
@@ -256,8 +278,6 @@ func cmdStopBody(cityPath string, cfg *config.City, force bool, stdout, stderr i
 			fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		// Close session beads so aliases are released for next start.
-		closeCitySessionBeads(cityPath, stderr)
 		// Controller handled the shutdown — still stop bead store below.
 		if err := shutdownBeadsProviderForStop(cityPath); err != nil {
 			fmt.Fprintf(stderr, "gc stop: bead store: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -302,7 +322,7 @@ func cmdStopBody(cityPath string, cfg *config.City, force bool, stdout, stderr i
 
 	// Clean up orphan sessions (sessions with the city prefix that are
 	// not in the current config).
-	stopOrphans(sp, desired, cfg, store, graceTimeout, recorder, stdout, stderr)
+	stopOrphans(sp, desired, cfg, sessionFrontDoor(store), graceTimeout, recorder, stdout, stderr)
 
 	teardownServerForStop(sp, stderr)
 
@@ -325,25 +345,25 @@ func teardownServerForStop(sp runtime.Provider, stderr io.Writer) {
 	}
 }
 
-func markCityStopSessionSleepReason(store beads.Store, stderr io.Writer) {
-	if store == nil {
+func markCityStopSessionSleepReason(sessFront *session.InfoStore, stderr io.Writer) {
+	if sessFront == nil || sessFront.Store().Store == nil {
 		return
 	}
-	sessions, err := store.ListByLabel("gc:session", 0)
+	sessions, err := sessFront.Store().ListByLabel("gc:session", 0)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc stop: marking sessions: %v\n", err) //nolint:errcheck // best-effort warning
 		return
 	}
-	for _, session := range sessions {
-		state := sessionMetadataState(session)
+	for _, s := range sessions {
+		state := sessionMetadataState(s)
 		if state != "active" {
 			continue
 		}
-		if strings.TrimSpace(session.Metadata["sleep_reason"]) != "" {
+		if strings.TrimSpace(s.Metadata["sleep_reason"]) != "" {
 			continue
 		}
-		if err := store.SetMetadata(session.ID, "sleep_reason", sleepReasonCityStop); err != nil {
-			fmt.Fprintf(stderr, "gc stop: marking session %s: %v\n", session.ID, err) //nolint:errcheck // best-effort warning
+		if err := sessFront.SetMarker(s.ID, "sleep_reason", sleepReasonCityStop); err != nil {
+			fmt.Fprintf(stderr, "gc stop: marking session %s: %v\n", s.ID, err) //nolint:errcheck // best-effort warning
 		}
 	}
 }
@@ -355,30 +375,6 @@ func stopCityManagedBeadsProviderAfterSuccessfulStop(cityPath string, stderr io.
 		return false
 	}
 	return true
-}
-
-// closeCitySessionBeads closes all open session beads so their aliases are
-// released for the next gc start. Without this, stale session beads from
-// previous runs hold aliases (e.g. "mayor-1") that prevent new sessions
-// from claiming the same name.
-func closeCitySessionBeads(cityPath string, stderr io.Writer) {
-	store, err := openCityStoreAt(cityPath)
-	if err != nil || store == nil {
-		return
-	}
-	sessions, err := store.ListByLabel("gc:session", 0)
-	if err != nil {
-		return
-	}
-	for _, session := range sessions {
-		if session.Status == "closed" {
-			continue
-		}
-		_ = store.SetMetadata(session.ID, "close_reason", "city stopped")
-		if err := store.Close(session.ID); err != nil {
-			fmt.Fprintf(stderr, "gc stop: closing session bead %s: %v\n", session.ID, err) //nolint:errcheck // best-effort warning
-		}
-	}
 }
 
 func stopCityManagedBeadsProvider(cityPath string) (bool, error) {
@@ -447,7 +443,7 @@ func warnInvalidConfigStopSuccess(err error, stderr io.Writer) {
 // stopOrphans stops sessions that are not in the desired set. Used by gc stop
 // to clean up orphans after stopping config agents. With per-city socket
 // isolation, all sessions on the socket belong to this city.
-func stopOrphans(sp runtime.Provider, desired map[string]bool, cfg *config.City, store beads.Store,
+func stopOrphans(sp runtime.Provider, desired map[string]bool, cfg *config.City, sessFront *session.InfoStore,
 	timeout time.Duration, rec events.Recorder, stdout, stderr io.Writer,
 ) {
 	running, err := sp.ListRunning("")
@@ -466,7 +462,7 @@ func stopOrphans(sp runtime.Provider, desired map[string]bool, cfg *config.City,
 		}
 		orphans = append(orphans, name)
 	}
-	gracefulStopAll(orphans, sp, timeout, rec, cfg, store, stdout, stderr)
+	gracefulStopAll(orphans, sp, timeout, rec, cfg, sessFront.Store(), stdout, stderr)
 }
 
 // tryStopController connects to the controller socket and sends "stop".
@@ -562,7 +558,7 @@ func doStop(sessionNames []string, sp runtime.Provider, cfg *config.City, store 
 			running = append(running, sn)
 		}
 	}
-	gracefulStopAll(running, sp, timeout, rec, cfg, store, stdout, stderr)
+	gracefulStopAll(running, sp, timeout, rec, cfg, beads.SessionStore{Store: store}, stdout, stderr)
 	fmt.Fprintln(stdout, "City stopped.") //nolint:errcheck // best-effort stdout
 	return 0
 }

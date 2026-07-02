@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
@@ -37,12 +38,12 @@ type workOptionLegacyKey struct {
 }
 
 var workOptionLegacyKeys = []workOptionLegacyKey{
-	{legacy: "gc.model", canonical: dispatchOptionMetadataKey("model")},
-	{legacy: "gc.reasoning", canonical: dispatchOptionMetadataKey("effort")},
+	{legacy: beadmeta.ModelMetadataKey, canonical: dispatchOptionMetadataKey("model")},
+	{legacy: beadmeta.ReasoningMetadataKey, canonical: dispatchOptionMetadataKey("effort")},
 }
 
 const (
-	legacyPerDispatchModelSourceKey = "gc.per_dispatch_model"
+	legacyPerDispatchModelSourceKey = beadmeta.PerDispatchModelMetadataKey
 	templateOverridesMetadataKey    = "template_overrides"
 )
 

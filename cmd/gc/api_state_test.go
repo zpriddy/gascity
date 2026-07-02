@@ -33,7 +33,7 @@ type corruptCityAfterRemoveFS struct {
 
 func (f *corruptCityAfterRemoveFS) Remove(name string) error {
 	err := f.OSFS.Remove(name)
-	if err == nil && !f.fired && filepath.Clean(name) == filepath.Clean(f.triggerPath) {
+	if err == nil && !f.fired && canonicalTestPath(name) == canonicalTestPath(f.triggerPath) {
 		f.fired = true
 		if writeErr := os.WriteFile(f.cityToml, []byte("["), 0o644); writeErr != nil {
 			return writeErr
@@ -51,13 +51,78 @@ type corruptCityAfterRenameFS struct {
 
 func (f *corruptCityAfterRenameFS) Rename(oldpath, newpath string) error {
 	err := f.OSFS.Rename(oldpath, newpath)
-	if err == nil && !f.fired && filepath.Clean(newpath) == filepath.Clean(f.triggerPath) {
+	if err == nil && !f.fired && canonicalTestPath(newpath) == canonicalTestPath(f.triggerPath) {
 		f.fired = true
 		if writeErr := os.WriteFile(f.cityToml, []byte("["), 0o644); writeErr != nil {
 			return writeErr
 		}
 	}
 	return err
+}
+
+// corruptCityThenFailFormulaRemoveFS corrupts city.toml right after the formula
+// file is written (forcing the post-write refresh to fail) and then fails the
+// Remove that the new-file rollback issues, so both the mutation and its rollback
+// fault. It exercises the double-fault path where the rollback error must be
+// surfaced rather than swallowed.
+type corruptCityThenFailFormulaRemoveFS struct {
+	fsys.OSFS
+	triggerPath string
+	cityToml    string
+	fired       bool
+}
+
+func (f *corruptCityThenFailFormulaRemoveFS) Rename(oldpath, newpath string) error {
+	err := f.OSFS.Rename(oldpath, newpath)
+	if err == nil && !f.fired && canonicalTestPath(newpath) == canonicalTestPath(f.triggerPath) {
+		f.fired = true
+		if writeErr := os.WriteFile(f.cityToml, []byte("["), 0o644); writeErr != nil {
+			return writeErr
+		}
+	}
+	return err
+}
+
+func (f *corruptCityThenFailFormulaRemoveFS) Remove(name string) error {
+	if canonicalTestPath(name) == canonicalTestPath(f.triggerPath) {
+		return fmt.Errorf("injected formula remove failure")
+	}
+	return f.OSFS.Remove(name)
+}
+
+// failFormulaReadFS fails ReadFile for one specific path (a city-local formula
+// source) while leaving every other filesystem op intact, so a controller
+// formula mutation cannot read its prior source. It exercises the guard that
+// aborts the mutation before touching disk rather than treating an unreadable
+// prior as absent and destroying the only restorable copy.
+type failFormulaReadFS struct {
+	fsys.OSFS
+	failReadPath string
+}
+
+func (f *failFormulaReadFS) ReadFile(name string) ([]byte, error) {
+	if canonicalTestPath(name) == canonicalTestPath(f.failReadPath) {
+		return nil, fmt.Errorf("injected formula read failure")
+	}
+	return f.OSFS.ReadFile(name)
+}
+
+// failFormulaWriteFS fails the atomic rename that publishes a city-local formula
+// file, so a brand-new formula write faults before the target file is ever
+// created. With no prior source on disk, the controller's new-file rollback then
+// issues a DeleteFormula against an absent file; this exercises that the
+// resulting ErrNotFound is treated as a satisfied rollback rather than joined
+// into the returned error (which would mis-map the real write failure to 404).
+type failFormulaWriteFS struct {
+	fsys.OSFS
+	formulaPath string
+}
+
+func (f *failFormulaWriteFS) Rename(oldpath, newpath string) error {
+	if canonicalTestPath(newpath) == canonicalTestPath(f.formulaPath) {
+		return fmt.Errorf("injected formula write failure")
+	}
+	return f.OSFS.Rename(oldpath, newpath)
 }
 
 type blockingLatestEventProvider struct {
@@ -114,7 +179,7 @@ type failAgentTomlRenameOSFS struct {
 }
 
 func (f *failAgentTomlRenameOSFS) Rename(oldpath, newpath string) error {
-	if filepath.Clean(newpath) == filepath.Clean(f.target) {
+	if canonicalTestPath(newpath) == canonicalTestPath(f.target) {
 		return errors.New("injected agent.toml write failure")
 	}
 	return f.OSFS.Rename(oldpath, newpath)
@@ -240,6 +305,48 @@ func TestControllerStateUpdate(t *testing.T) {
 	}
 	if cs.Config() != cfg2 {
 		t.Error("Config() not updated")
+	}
+}
+
+// TestControllerStateRawConfigCachedFromGateBasis verifies RawConfig returns a
+// cached raw snapshot loaded from the same basis the mutation gate uses, so a
+// provenance read (pack_derived) agrees with the ErrPackDerived/409 decision.
+// The snapshot is captured at construction and refreshed on update — not
+// re-parsed per call — and a read of an inline agent's origin against it must
+// match the gate's AgentOrigin verdict.
+func TestControllerStateRawConfigCachedFromGateBasis(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	cityToml := "[workspace]\nname = \"city1\"\n\n[beads]\nprovider = \"file\"\n\n[[agent]]\nname = \"mayor\"\nprovider = \"claude\"\n"
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+		Agents:    []config.Agent{{Name: "mayor", Provider: "claude"}},
+	}
+	cs := newControllerState(context.Background(), cfg, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+
+	raw := cs.RawConfig()
+	if raw == nil {
+		t.Fatal("RawConfig() = nil; want cached raw snapshot")
+	}
+	// The cached basis must agree with the mutation gate: "mayor" is inline.
+	if got := configedit.AgentOrigin(raw, raw, "mayor"); got != configedit.OriginInline {
+		t.Errorf("AgentOrigin(RawConfig) = %v, want OriginInline (must match the 409 gate)", got)
+	}
+
+	// A second read returns the same cached pointer (no per-request re-parse).
+	if cs.RawConfig() != raw {
+		t.Error("RawConfig() re-parsed instead of returning the cached snapshot")
+	}
+
+	// After an update, the snapshot refreshes from disk and stays non-nil.
+	cs.update(&config.City{Workspace: config.Workspace{Name: "city1"}}, runtime.NewFake())
+	if cs.RawConfig() == nil {
+		t.Error("RawConfig() = nil after update; the cache must refresh, not clear")
 	}
 }
 
@@ -445,6 +552,7 @@ func TestControllerStateRuntimeUpdateIgnoresEmptyRevisionDuringPendingMutation(t
 }
 
 func TestControllerStateRuntimeUpdateAcceptsBuiltinAwareRevision(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	configureTestDoltIdentityEnv(t)
 	disableManagedDoltRecoveryForTest(t)
 	t.Setenv("GC_BEADS", "")
@@ -452,9 +560,10 @@ func TestControllerStateRuntimeUpdateAcceptsBuiltinAwareRevision(t *testing.T) {
 	cityDir := shortSocketTempDir(t, "gc-state-runtime-builtin-")
 	cleanupManagedDoltTestCity(t, cityDir)
 	tomlPath := filepath.Join(cityDir, "city.toml")
-	if err := os.WriteFile(tomlPath, []byte("[workspace]\nname = \"test\"\nincludes = [\".gc/system/packs/core\", \".gc/system/packs/bd\"]\n"), 0o644); err != nil {
+	if err := os.WriteFile(tomlPath, []byte("[workspace]\nname = \"test\"\n"+builtinImportsTOML("core", "bd")), 0o644); err != nil {
 		t.Fatalf("write initial city.toml: %v", err)
 	}
+	writeBuiltinImportsLock(t, cityDir, "core", "bd")
 
 	initial, err := tryReloadConfig(tomlPath, "test", cityDir)
 	if err != nil {
@@ -464,7 +573,7 @@ func TestControllerStateRuntimeUpdateAcceptsBuiltinAwareRevision(t *testing.T) {
 	cs := newControllerState(context.Background(), initial.Cfg, runtime.NewFake(), events.NewFake(), "test", cityDir)
 
 	rigDir := t.TempDir()
-	updatedToml := fmt.Sprintf("[workspace]\nname = \"test\"\nincludes = [\".gc/system/packs/core\", \".gc/system/packs/bd\"]\n\n[[rigs]]\nname = \"alpha\"\npath = %q\n", rigDir)
+	updatedToml := fmt.Sprintf("[workspace]\nname = \"test\"\n\n[[rigs]]\nname = \"alpha\"\npath = %q\n", rigDir) + builtinImportsTOML("core", "bd")
 	if err := os.WriteFile(tomlPath, []byte(updatedToml), 0o644); err != nil {
 		t.Fatalf("write updated city.toml: %v", err)
 	}
@@ -483,6 +592,7 @@ func TestControllerStateRuntimeUpdateAcceptsBuiltinAwareRevision(t *testing.T) {
 }
 
 func TestControllerStateMutationRefreshKeepsBuiltinOrdersAndClearsPending(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	configureTestDoltIdentityEnv(t)
 	disableManagedDoltRecoveryForTest(t)
 	t.Setenv("GC_BEADS", "")
@@ -490,9 +600,10 @@ func TestControllerStateMutationRefreshKeepsBuiltinOrdersAndClearsPending(t *tes
 	cityDir := shortSocketTempDir(t, "gc-state-mutation-builtin-")
 	cleanupManagedDoltTestCity(t, cityDir)
 	tomlPath := filepath.Join(cityDir, "city.toml")
-	if err := os.WriteFile(tomlPath, []byte("[workspace]\nname = \"test\"\nincludes = [\".gc/system/packs/core\", \".gc/system/packs/bd\"]\n"), 0o644); err != nil {
+	if err := os.WriteFile(tomlPath, []byte("[workspace]\nname = \"test\"\n"+builtinImportsTOML("core", "bd")), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
 	}
+	writeBuiltinImportsLock(t, cityDir, "core", "bd")
 
 	initial, err := tryReloadConfig(tomlPath, "test", cityDir)
 	if err != nil {
@@ -988,6 +1099,351 @@ func TestControllerStateMutationRollsBackAgentOverrideWhenRefreshFails(t *testin
 	}
 }
 
+func TestControllerStateUpsertFormulaRollsBackNewFileWhenRefreshFails(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	originalCity := []byte("[workspace]\nname = \"city1\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, originalCity, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&corruptCityAfterRenameFS{
+		triggerPath: formulaPath,
+		cityToml:    tomlPath,
+	}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+	beforeCfg := cs.Config()
+
+	err := cs.UpsertFormula("hello", []byte("formula = \"hello\"\n"))
+	if err == nil {
+		t.Fatal("UpsertFormula should fail when refreshing the updated snapshot fails")
+	}
+	if _, statErr := os.Stat(formulaPath); !os.IsNotExist(statErr) {
+		t.Fatalf("formula stat err = %v, want file removed on rollback", statErr)
+	}
+	restored, readErr := os.ReadFile(tomlPath)
+	if readErr != nil {
+		t.Fatalf("read restored city.toml: %v", readErr)
+	}
+	if string(restored) != string(originalCity) {
+		t.Fatalf("city.toml = %q, want rollback to %q", restored, originalCity)
+	}
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("UpsertFormula should not poke the reconciler after rollback")
+	default:
+	}
+	if cs.configDirty.Load() {
+		t.Fatal("UpsertFormula should not mark config dirty after rollback")
+	}
+	if got := cs.Config(); got != beforeCfg {
+		t.Fatalf("Config() pointer changed after failed upsert: got %p want %p", got, beforeCfg)
+	}
+}
+
+// TestControllerStateUpsertFormulaNewFileWriteFailurePreservesErrorClass pins
+// that when a brand-new formula write itself faults (no prior file), the no-prior
+// rollback's DeleteFormula returning ErrNotFound — the desired absent post-state
+// — is not surfaced. Surfacing it would let the API layer map a failed create to
+// HTTP 404 and hide the real failure class.
+func TestControllerStateUpsertFormulaNewFileWriteFailurePreservesErrorClass(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, []byte("[workspace]\nname = \"city1\"\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&failFormulaWriteFS{formulaPath: formulaPath}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+
+	err := cs.UpsertFormula("hello", []byte("formula = \"hello\"\n"))
+	if err == nil {
+		t.Fatal("UpsertFormula should fail when the new-formula write faults")
+	}
+	if errors.Is(err, configedit.ErrNotFound) {
+		t.Fatalf("UpsertFormula error = %v, must not surface rollback ErrNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "injected formula write failure") {
+		t.Fatalf("UpsertFormula error = %v, want the real write failure preserved", err)
+	}
+	if _, statErr := os.Stat(formulaPath); !os.IsNotExist(statErr) {
+		t.Fatalf("formula stat err = %v, want no file created on rollback", statErr)
+	}
+}
+
+func TestControllerStateUpsertFormulaRestoresExistingFileWhenRefreshFails(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	originalCity := []byte("[workspace]\nname = \"city1\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, originalCity, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+	originalFormula := []byte("formula = \"hello\"\nmessage = \"original\"\n")
+	if err := os.MkdirAll(filepath.Dir(formulaPath), 0o755); err != nil {
+		t.Fatalf("mkdir formulas dir: %v", err)
+	}
+	if err := os.WriteFile(formulaPath, originalFormula, 0o644); err != nil {
+		t.Fatalf("write original formula: %v", err)
+	}
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&corruptCityAfterRenameFS{
+		triggerPath: formulaPath,
+		cityToml:    tomlPath,
+	}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+	beforeCfg := cs.Config()
+
+	err := cs.UpsertFormula("hello", []byte("formula = \"hello\"\nmessage = \"updated\"\n"))
+	if err == nil {
+		t.Fatal("UpsertFormula should fail when refreshing the updated snapshot fails")
+	}
+	gotFormula, readErr := os.ReadFile(formulaPath)
+	if readErr != nil {
+		t.Fatalf("read restored formula: %v", readErr)
+	}
+	if string(gotFormula) != string(originalFormula) {
+		t.Fatalf("formula = %q, want rollback to %q", gotFormula, originalFormula)
+	}
+	restored, readErr := os.ReadFile(tomlPath)
+	if readErr != nil {
+		t.Fatalf("read restored city.toml: %v", readErr)
+	}
+	if string(restored) != string(originalCity) {
+		t.Fatalf("city.toml = %q, want rollback to %q", restored, originalCity)
+	}
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("UpsertFormula should not poke the reconciler after rollback")
+	default:
+	}
+	if cs.configDirty.Load() {
+		t.Fatal("UpsertFormula should not mark config dirty after rollback")
+	}
+	if got := cs.Config(); got != beforeCfg {
+		t.Fatalf("Config() pointer changed after failed upsert: got %p want %p", got, beforeCfg)
+	}
+}
+
+func TestControllerStateDeleteFormulaRestoresExistingFileWhenRefreshFails(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	originalCity := []byte("[workspace]\nname = \"city1\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, originalCity, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+	originalFormula := []byte("formula = \"hello\"\nmessage = \"original\"\n")
+	if err := os.MkdirAll(filepath.Dir(formulaPath), 0o755); err != nil {
+		t.Fatalf("mkdir formulas dir: %v", err)
+	}
+	if err := os.WriteFile(formulaPath, originalFormula, 0o644); err != nil {
+		t.Fatalf("write original formula: %v", err)
+	}
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&corruptCityAfterRemoveFS{
+		triggerPath: formulaPath,
+		cityToml:    tomlPath,
+	}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+	beforeCfg := cs.Config()
+
+	err := cs.DeleteFormula("hello")
+	if err == nil {
+		t.Fatal("DeleteFormula should fail when refreshing the updated snapshot fails")
+	}
+	gotFormula, readErr := os.ReadFile(formulaPath)
+	if readErr != nil {
+		t.Fatalf("read restored formula: %v", readErr)
+	}
+	if string(gotFormula) != string(originalFormula) {
+		t.Fatalf("formula = %q, want rollback to %q", gotFormula, originalFormula)
+	}
+	restored, readErr := os.ReadFile(tomlPath)
+	if readErr != nil {
+		t.Fatalf("read restored city.toml: %v", readErr)
+	}
+	if string(restored) != string(originalCity) {
+		t.Fatalf("city.toml = %q, want rollback to %q", restored, originalCity)
+	}
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("DeleteFormula should not poke the reconciler after rollback")
+	default:
+	}
+	if cs.configDirty.Load() {
+		t.Fatal("DeleteFormula should not mark config dirty after rollback")
+	}
+	if got := cs.Config(); got != beforeCfg {
+		t.Fatalf("Config() pointer changed after failed delete: got %p want %p", got, beforeCfg)
+	}
+}
+
+func TestControllerStateUpsertFormulaJoinsRollbackFailure(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	originalCity := []byte("[workspace]\nname = \"city1\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, originalCity, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&corruptCityThenFailFormulaRemoveFS{
+		triggerPath: formulaPath,
+		cityToml:    tomlPath,
+	}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+
+	err := cs.UpsertFormula("hello", []byte("formula = \"hello\"\n"))
+	if err == nil {
+		t.Fatal("UpsertFormula should fail when both the refresh and its rollback fault")
+	}
+	if !strings.Contains(err.Error(), "rolling back formula") {
+		t.Fatalf("returned error should surface the rollback failure, got: %v", err)
+	}
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("UpsertFormula should not poke the reconciler after a faulted rollback")
+	default:
+	}
+}
+
+func TestControllerStateUpsertFormulaAbortsWhenPriorSourceUnreadable(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	originalCity := []byte("[workspace]\nname = \"city1\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, originalCity, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+	originalFormula := []byte("formula = \"hello\"\nmessage = \"original\"\n")
+	if err := os.MkdirAll(filepath.Dir(formulaPath), 0o755); err != nil {
+		t.Fatalf("mkdir formulas dir: %v", err)
+	}
+	if err := os.WriteFile(formulaPath, originalFormula, 0o644); err != nil {
+		t.Fatalf("write original formula: %v", err)
+	}
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&failFormulaReadFS{failReadPath: formulaPath}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+	beforeCfg := cs.Config()
+
+	err := cs.UpsertFormula("hello", []byte("formula = \"hello\"\nmessage = \"updated\"\n"))
+	if err == nil {
+		t.Fatal("UpsertFormula should fail when the prior source cannot be read")
+	}
+	if !strings.Contains(err.Error(), "reading prior formula") {
+		t.Fatalf("error = %v, want a prior-source read failure", err)
+	}
+	// The mutation must abort before any write, leaving the prior source as-is.
+	gotFormula, readErr := os.ReadFile(formulaPath)
+	if readErr != nil {
+		t.Fatalf("read formula: %v", readErr)
+	}
+	if string(gotFormula) != string(originalFormula) {
+		t.Fatalf("formula = %q, want untouched %q", gotFormula, originalFormula)
+	}
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("UpsertFormula should not poke the reconciler when it aborts early")
+	default:
+	}
+	if cs.configDirty.Load() {
+		t.Fatal("UpsertFormula should not mark config dirty when it aborts early")
+	}
+	if got := cs.Config(); got != beforeCfg {
+		t.Fatalf("Config() pointer changed after aborted upsert: got %p want %p", got, beforeCfg)
+	}
+}
+
+func TestControllerStateDeleteFormulaAbortsWhenPriorSourceUnreadable(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	originalCity := []byte("[workspace]\nname = \"city1\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, originalCity, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaPath := filepath.Join(cityDir, "formulas", "hello.toml")
+	originalFormula := []byte("formula = \"hello\"\nmessage = \"original\"\n")
+	if err := os.MkdirAll(filepath.Dir(formulaPath), 0o755); err != nil {
+		t.Fatalf("mkdir formulas dir: %v", err)
+	}
+	if err := os.WriteFile(formulaPath, originalFormula, 0o644); err != nil {
+		t.Fatalf("write original formula: %v", err)
+	}
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.editor = configedit.NewEditor(&failFormulaReadFS{failReadPath: formulaPath}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+
+	err := cs.DeleteFormula("hello")
+	if err == nil {
+		t.Fatal("DeleteFormula should fail when the prior source cannot be read")
+	}
+	if !strings.Contains(err.Error(), "reading prior formula") {
+		t.Fatalf("error = %v, want a prior-source read failure", err)
+	}
+	// The delete must abort before mutating, leaving the prior source intact.
+	gotFormula, readErr := os.ReadFile(formulaPath)
+	if readErr != nil {
+		t.Fatalf("read formula: %v", readErr)
+	}
+	if string(gotFormula) != string(originalFormula) {
+		t.Fatalf("formula = %q, want untouched %q", gotFormula, originalFormula)
+	}
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("DeleteFormula should not poke the reconciler when it aborts early")
+	default:
+	}
+	if cs.configDirty.Load() {
+		t.Fatal("DeleteFormula should not mark config dirty when it aborts early")
+	}
+}
+
 func TestControllerStateMutationRestoresFullAgentScaffoldWhenRefreshFails(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 
@@ -1058,6 +1514,74 @@ func TestControllerStateMutationRestoresFullAgentScaffoldWhenRefreshFails(t *tes
 	}
 	if cs.configDirty.Load() {
 		t.Fatal("DeleteAgent should not mark config dirty after rollback")
+	}
+}
+
+// TestControllerStateMutationRestoresSymlinkedCityTomlWhenRefreshFails proves
+// the controller config-mutation rollback is symlink-aware, matching the CLI
+// rollback snapshots. When a forward mutation writes through a city.toml
+// symlink and the post-mutation config reload fails, restore must rewrite the
+// real target file and leave the live city.toml symlink intact. Before the fix,
+// captureConfigMutationSnapshot/restore operated on the unresolved link path,
+// so rollback replaced the symlink with a regular file and left the
+// forward-modified target un-reverted.
+func TestControllerStateMutationRestoresSymlinkedCityTomlWhenRefreshFails(t *testing.T) {
+	dir := t.TempDir()
+	repoDir := filepath.Join(dir, "repo")
+	cityDir := filepath.Join(dir, "city")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cityDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	repoCityPath := filepath.Join(repoDir, "city.toml")
+	liveCityPath := filepath.Join(cityDir, "city.toml")
+	original := []byte("[workspace]\nname = \"city1\"\n")
+	if err := os.WriteFile(repoCityPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "repo", "city.toml"), liveCityPath); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := &controllerState{
+		cityPath: cityDir,
+		cfg:      &config.City{Workspace: config.Workspace{Name: "city1"}},
+	}
+
+	mutErr := cs.mutateAndPoke(func() error {
+		// Forward mutation writes through the resolved symlink target, exactly
+		// like the config editor's ResolveCityRewritePath path. The broken TOML
+		// then makes refreshConfigSnapshot fail and triggers rollback -- the
+		// same post-mutation refresh failure the production path hits.
+		resolved, err := fsys.ResolveSymlinks(fsys.OSFS{}, liveCityPath)
+		if err != nil {
+			return err
+		}
+		return fsys.WriteFileAtomic(fsys.OSFS{}, resolved, []byte("["), 0o644)
+	})
+	if mutErr == nil {
+		t.Fatal("mutateAndPoke should fail when refreshing the post-mutation config fails")
+	}
+	if !strings.Contains(mutErr.Error(), "refreshing updated city config") {
+		t.Fatalf("mutateAndPoke error = %v, want refresh failure after mutation", mutErr)
+	}
+
+	info, err := os.Lstat(liveCityPath)
+	if err != nil {
+		t.Fatalf("Lstat(live city.toml): %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("rollback replaced the city.toml symlink with a regular file")
+	}
+	restored, readErr := os.ReadFile(repoCityPath)
+	if readErr != nil {
+		t.Fatalf("read repo city.toml: %v", readErr)
+	}
+	if string(restored) != string(original) {
+		t.Fatalf("repo city.toml = %q, want restored original %q", restored, original)
 	}
 }
 
@@ -3503,5 +4027,331 @@ func TestStoreMetadataSignatureChangesOnRigSuspensionFlip(t *testing.T) {
 	after := storeMetadataSignature(cityDir, cfg)
 	if before == after {
 		t.Fatalf("signature unchanged across rig suspension flip:\n%s", before)
+	}
+}
+
+func TestConfigMutationSnapshotRestoresThroughSymlinks(t *testing.T) {
+	cityDir := t.TempDir()
+	checkoutDir := filepath.Join(cityDir, "checkout")
+	if err := os.MkdirAll(checkoutDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	links := make(map[string]string) // link path -> target path
+	for link, target := range map[string]string{
+		filepath.Join(cityDir, "city.toml"):        filepath.Join(checkoutDir, "city.toml"),
+		filepath.Join(cityDir, ".gc", "site.toml"): filepath.Join(checkoutDir, "site.toml"),
+	} {
+		if err := os.WriteFile(target, []byte("original = true\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		links[link] = target
+	}
+
+	snapshot, err := captureConfigMutationSnapshot(cityDir)
+	if err != nil {
+		t.Fatalf("captureConfigMutationSnapshot: %v", err)
+	}
+
+	for _, target := range links {
+		if err := os.WriteFile(target, []byte("mutated = true\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := snapshot.restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	for link, target := range links {
+		info, err := os.Lstat(link)
+		if err != nil {
+			t.Fatalf("Lstat %s: %v", link, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s symlink was replaced by a %v entry; restore must write through the link", link, info.Mode())
+		}
+		data, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", target, err)
+		}
+		if string(data) != "original = true\n" {
+			t.Fatalf("%s target content = %q, want original bytes restored", link, data)
+		}
+	}
+}
+
+func TestConfigMutationSnapshotRestoresSymlinkedAgentTomlTarget(t *testing.T) {
+	cityDir := t.TempDir()
+	checkoutDir := filepath.Join(cityDir, "checkout")
+	if err := os.MkdirAll(checkoutDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(cityDir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// agents/worker/agent.toml is symlinked to an operator file checked out of
+	// the agents/ tree (the ga-lurp5d "linked into a repo" case). The forward
+	// agent mutation path writes/removes the resolved target, so a rollback must
+	// restore the target bytes — SnapshotTree only preserves the link entry.
+	target := filepath.Join(checkoutDir, "worker-agent.toml")
+	original := []byte("provider = \"claude\"\n")
+	if err := os.WriteFile(target, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(agentDir, "agent.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	snapshot, err := captureConfigMutationSnapshot(cityDir)
+	if err != nil {
+		t.Fatalf("captureConfigMutationSnapshot: %v", err)
+	}
+
+	// A suspend writes through the link, mutating the resolved target content.
+	if err := os.WriteFile(target, []byte("provider = \"claude\"\nsuspended = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := snapshot.restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat %s: %v", link, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s symlink was replaced by a %v entry; restore must write through the link", link, info.Mode())
+	}
+	if got, err := os.Readlink(link); err != nil || got != target {
+		t.Fatalf("agent.toml symlink target = %q, %v; want %q", got, err, target)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile %s: %v", target, err)
+	}
+	if string(data) != string(original) {
+		t.Fatalf("agent.toml target content = %q, want original bytes %q restored", data, original)
+	}
+}
+
+func TestConfigMutationSnapshotRecreatesRemovedSymlinkedAgentTomlTarget(t *testing.T) {
+	cityDir := t.TempDir()
+	checkoutDir := filepath.Join(cityDir, "checkout")
+	if err := os.MkdirAll(checkoutDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(cityDir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// An empty resume/delete removes the resolved target through the link. The
+	// rollback must recreate the operator's target bytes, not leave a dangling
+	// link with the durable config gone.
+	target := filepath.Join(checkoutDir, "worker-agent.toml")
+	original := []byte("provider = \"claude\"\n")
+	if err := os.WriteFile(target, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(agentDir, "agent.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	snapshot, err := captureConfigMutationSnapshot(cityDir)
+	if err != nil {
+		t.Fatalf("captureConfigMutationSnapshot: %v", err)
+	}
+
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := snapshot.restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat %s: %v", link, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s symlink was replaced by a %v entry; restore must keep the link", link, info.Mode())
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile restored %s: %v", target, err)
+	}
+	if string(data) != string(original) {
+		t.Fatalf("agent.toml target content = %q, want original bytes %q recreated", data, original)
+	}
+}
+
+func TestControllerStateSuspendRestoresSymlinkedAgentTomlTargetWhenRefreshFails(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "pack.toml"), []byte("[pack]\nname = \"city1\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatalf("write pack.toml: %v", err)
+	}
+	checkoutDir := filepath.Join(cityDir, "checkout")
+	if err := os.MkdirAll(checkoutDir, 0o755); err != nil {
+		t.Fatalf("mkdir checkout: %v", err)
+	}
+	agentDir := filepath.Join(cityDir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatalf("mkdir agent dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatalf("write prompt.template.md: %v", err)
+	}
+
+	// agents/worker/agent.toml is symlinked to a checked-out operator file.
+	agentTarget := filepath.Join(checkoutDir, "worker-agent.toml")
+	originalAgent := []byte("provider = \"claude\"\n")
+	if err := os.WriteFile(agentTarget, originalAgent, 0o644); err != nil {
+		t.Fatalf("write agent target: %v", err)
+	}
+	agentLink := filepath.Join(agentDir, "agent.toml")
+	if err := os.Symlink(agentTarget, agentLink); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	resolvedAgentTarget, err := fsys.ResolveSymlinks(fsys.OSFS{}, agentLink)
+	if err != nil {
+		t.Fatalf("resolve agent symlink: %v", err)
+	}
+
+	original := []byte("[workspace]\nname = \"city1\"\n\n[providers.claude]\nbase = \"builtin:claude\"\n")
+	tomlPath := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(tomlPath, original, 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
+	cs := newControllerState(context.Background(), &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+		Providers: map[string]config.ProviderSpec{
+			"claude": config.BuiltinProviderAlias("claude"),
+		},
+	}, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	// The suspend write renames a temp file onto the resolved agent.toml target;
+	// corrupt city.toml at that moment so the post-mutation refresh fails and
+	// the rollback path runs.
+	cs.editor = configedit.NewEditor(&corruptCityAfterRenameFS{
+		triggerPath: resolvedAgentTarget,
+		cityToml:    tomlPath,
+	}, tomlPath)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+
+	err = cs.SuspendAgent("worker")
+	if err == nil {
+		t.Fatal("SuspendAgent should fail when refreshing the updated snapshot fails")
+	}
+	if !strings.Contains(err.Error(), "refreshing updated city config") {
+		t.Fatalf("SuspendAgent error = %v, want refresh failure after mutation", err)
+	}
+
+	info, err := os.Lstat(agentLink)
+	if err != nil {
+		t.Fatalf("Lstat agent symlink: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("agent.toml symlink was replaced by a %v entry after rollback", info.Mode())
+	}
+	gotAgent, err := os.ReadFile(agentTarget)
+	if err != nil {
+		t.Fatalf("read restored agent target: %v", err)
+	}
+	if string(gotAgent) != string(originalAgent) {
+		t.Fatalf("agent.toml target = %q, want rollback to %q", gotAgent, originalAgent)
+	}
+	if cs.configDirty.Load() {
+		t.Fatal("SuspendAgent should not mark config dirty after rollback")
+	}
+}
+
+// TestApplyBeadEventToStoresTriggersConvoyAutoclose verifies that a
+// bead.closed event processed by the controller triggers convoy autoclose via
+// the in-process path, without spawning a gc subprocess.
+func TestApplyBeadEventToStoresTriggersConvoyAutoclose(t *testing.T) {
+	prev := beadCloseAutocloseDispatch
+	beadCloseAutocloseDispatch = func(fn func()) { fn() } // synchronous in tests
+	t.Cleanup(func() { beadCloseAutocloseDispatch = prev })
+
+	backing := beads.NewMemStore()
+	// gc-1: convoy, gc-2 and gc-3 are child members tracked by the convoy
+	convoy, err := backing.Create(beads.Bead{Title: "batch", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("Create convoy: %v", err)
+	}
+	childA, err := backing.Create(beads.Bead{Title: "task A", ParentID: convoy.ID})
+	if err != nil {
+		t.Fatalf("Create childA: %v", err)
+	}
+	childB, err := backing.Create(beads.Bead{Title: "task B", ParentID: convoy.ID})
+	if err != nil {
+		t.Fatalf("Create childB: %v", err)
+	}
+
+	// Close childA first; convoy still has an open child.
+	if err := backing.Close(childA.ID); err != nil {
+		t.Fatalf("Close childA: %v", err)
+	}
+
+	// Prime the CachingStore so it knows about all beads.
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// Close childB in the backing store only (simulates an agent bd close).
+	if err := backing.Close(childB.ID); err != nil {
+		t.Fatalf("Close childB: %v", err)
+	}
+	// Update the cache to reflect the close (normally done by the event watcher).
+	if err := cached.Update(childB.ID, beads.UpdateOpts{Status: stringPtr("closed")}); err != nil {
+		t.Fatalf("Update childB in cache: %v", err)
+	}
+
+	closedPayload, err := json.Marshal(beads.Bead{
+		ID:     childB.ID,
+		Title:  "task B",
+		Status: "closed",
+		Type:   "task",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	cs := &controllerState{
+		beadStores: map[string]beads.Store{"test": cached},
+		pokeCh:     make(chan struct{}, 1),
+	}
+
+	cs.applyBeadEventToStores(events.Event{
+		Type:    events.BeadClosed,
+		Actor:   "agent",
+		Subject: childB.ID,
+		Payload: closedPayload,
+	})
+
+	// Convoy should now be auto-closed since all children are terminal.
+	got, err := backing.Get(convoy.ID)
+	if err != nil {
+		t.Fatalf("Get convoy: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Errorf("convoy status = %q after all children closed, want %q", got.Status, "closed")
 	}
 }

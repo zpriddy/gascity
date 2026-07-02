@@ -5,11 +5,21 @@ package beads
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
 // ErrNotFound is returned when a bead ID does not exist in the store.
 var ErrNotFound = errors.New("bead not found")
+
+// ErrIDCollision is returned when bd's fuzzy/substring resolver returns a bead
+// whose ID differs from the requested ID (e.g. "gcy-dv7" resolves to
+// "gcy-wisp-dv78"). This is a distinct sub-case of not-found: the requested
+// bead is absent AND bd silently matched a different one. errors.Is(err,
+// ErrNotFound) remains true so existing not-found callers are unaffected;
+// mutation guards that need to distinguish a genuine collision from a plain
+// absent bead should check errors.Is(err, ErrIDCollision).
+var ErrIDCollision = fmt.Errorf("bd resolved a different bead ID (substring collision): %w", ErrNotFound)
 
 // ErrCacheUnavailable is returned by cache-only read handles when the cache
 // cannot answer without consulting the backing store.
@@ -45,16 +55,24 @@ type Bead struct {
 	Priority  *int      `json:"priority,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is zero for legacy beads; UpdatedBefore falls back to CreatedAt.
-	UpdatedAt    time.Time         `json:"updated_at,omitempty,omitzero"`
-	Assignee     string            `json:"assignee,omitempty"`
-	From         string            `json:"from,omitempty"`
-	ParentID     string            `json:"parent,omitempty"`      // step → molecule; matches bd wire format
-	Ref          string            `json:"ref,omitempty"`         // formula step ID or formula name
-	Needs        []string          `json:"needs,omitempty"`       // dependency step refs
-	Description  string            `json:"description,omitempty"` // step instructions
-	Labels       []string          `json:"labels,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
-	Dependencies []Dep             `json:"dependencies,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at,omitempty,omitzero"`
+	Assignee    string    `json:"assignee,omitempty"`
+	From        string    `json:"from,omitempty"`
+	ParentID    string    `json:"parent,omitempty"`      // step → molecule; matches bd wire format
+	Ref         string    `json:"ref,omitempty"`         // formula step ID or formula name
+	Needs       []string  `json:"needs,omitempty"`       // dependency step refs
+	Description string    `json:"description,omitempty"` // step instructions
+	Labels      []string  `json:"labels,omitempty"`
+	// Metadata uses StringMap (not map[string]string) so decode tolerates the
+	// non-string JSON values the external bd CLI emits — `--set-metadata
+	// key=true` is type-inferred to a JSON boolean, and a strict decode of a
+	// single such bead used to poison the whole `gc hook --claim` work_query
+	// batch, blocking every worker in the rig from claiming. StringMap coerces
+	// bool/number values to their string form on decode and its underlying type
+	// is map[string]string, so every read/write call site is unaffected and the
+	// marshaled wire form is unchanged (still string-valued).
+	Metadata     StringMap `json:"metadata,omitempty"`
+	Dependencies []Dep     `json:"dependencies,omitempty"`
 	// Ephemeral routes the bead to the wisps tier on Create. Wisps live in
 	// a separate Dolt table, are not git-synced, and are eligible for TTL
 	// garbage collection. Reads must opt in via ListQuery.TierMode (or the
@@ -103,10 +121,31 @@ type ConditionalAssignmentReleaser interface {
 	ReleaseIfCurrent(id, expectedAssignee string) (bool, error)
 }
 
+// AtomicTxStore is implemented by stores whose Tx commits the whole callback
+// atomically: when the callback returns an error, none of its writes persist.
+// Stores that do not implement it (or whose AtomicTx returns false) may leave
+// partial writes after a failed Tx — see the Store.Tx contract — so callers that
+// need an all-or-nothing multi-write swap must either require such a store or
+// sequence their writes so a partial failure stays recoverable on non-atomic
+// backends.
+type AtomicTxStore interface {
+	// AtomicTx reports whether Store.Tx rolls the whole callback back on error.
+	AtomicTx() bool
+}
+
+// StoreSupportsAtomicTx reports whether store's Tx provides atomic rollback. It
+// returns false for any store that does not implement AtomicTxStore, matching
+// the conservative Store.Tx contract for backends without native transactions.
+func StoreSupportsAtomicTx(store Store) bool {
+	a, ok := store.(AtomicTxStore)
+	return ok && a.AtomicTx()
+}
+
 // Tx is the write surface available inside a Store.Tx callback.
 // Keep this interface limited to methods needed by current transactional
 // write pairs; do not add Store methods speculatively.
 type Tx interface {
+	Create(b Bead) (Bead, error)
 	Update(id string, opts UpdateOpts) error
 	SetMetadataBatch(id string, kvs map[string]string) error
 	Close(id string) error
@@ -177,6 +216,7 @@ var readyExcludeTypes = map[string]bool{
 	"gate":          true, // async wait conditions
 	"molecule":      true, // workflow containers
 	"step":          true, // non-root formula steps; parent molecule is the actionable unit (#1039)
+	"convoy":        true, // sling-minted container; groups child beads, never actionable Ready work (#3591)
 	"message":       true, // mail/communication items
 	"session":       true, // runtime/session continuity beads, never actionable work
 	"agent":         true, // identity/state tracking beads
@@ -233,9 +273,16 @@ func IsReadyCandidateForTier(b Bead, now time.Time, tier TierMode) bool {
 // IsReadyExcludedBead reports whether a bead is infrastructure rather than
 // actionable Ready work.
 func IsReadyExcludedBead(b Bead) bool {
-	if IsReadyExcludedType(b.Type) {
-		return true
-	}
+	return IsReadyExcludedType(b.Type) || HasReadyExcludedLabel(b)
+}
+
+// HasReadyExcludedLabel reports whether a bead carries a label that marks it
+// as infrastructure bookkeeping (session continuity, order tracking) rather
+// than actionable Ready work. Distinct from IsReadyExcludedType: a bead may be
+// label-excluded regardless of its type. Callers that have already constrained
+// the bead's type (e.g. iterating known-convoy beads) use this to test only
+// the label dimension.
+func HasReadyExcludedLabel(b Bead) bool {
 	for _, label := range b.Labels {
 		switch label {
 		case "gc:session", "gc:order-tracking", "order-tracking":

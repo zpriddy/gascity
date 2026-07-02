@@ -8,6 +8,8 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
 // cacheLatencyWindowSize is the size of the rolling window of bd-list
@@ -27,6 +29,38 @@ const cacheLatencyWindowSize = 10
 // a quarter of the small cadence is evidence of sustained backend
 // pressure.
 const cacheLatencyHighWaterMark = cacheReconcileIntervalSmall / 4
+
+// cacheReconcileScanWarnThreshold is the active-bead count at which a
+// reconcile full scan emits beads.cache.scan_large telemetry. Sits between
+// the bead-count cadence thresholds (MEDIUM at 1000, LARGE at 5000): healthy
+// large rigs above the MEDIUM floor stay quiet, while a store drifting toward
+// LARGE warns before every cycle pays multi-second, multi-MB bd round-trips
+// (ga-698fl2: a dev store silently reached 3,272 active beads / ~11MB of
+// JSON / ~2s bd latency per cycle).
+const cacheReconcileScanWarnThreshold = 2500
+
+// recordCacheScanLarge emits the over-threshold scan-size telemetry; a var so
+// internal tests can intercept emission. Swaps are unsynchronized: tests that
+// replace it must stay sequential (no t.Parallel) and must not leave a
+// reconcile loop running across the swap.
+var recordCacheScanLarge = telemetry.RecordCacheScanLarge
+
+// cacheFullScanQuery is the single query shape Prime and the reconciler use
+// to load the cache's authoritative snapshot. The reconcile diff treats the
+// result as the COMPLETE active universe: any cached bead absent from it is
+// re-verified per ID (recoverMissingFromList) and then evicted with a
+// synthetic bead.closed event. Two bounds follow from that authority:
+//
+//   - Limit must stay unset (0). A bounded list would route every active
+//     bead beyond the limit through the per-bead Get recovery path on every
+//     cycle — O(active−limit) bd round-trips — and synthesize false
+//     bead.closed evictions whenever those Gets degrade.
+//   - IncludeClosed is pinned false. The scan cost is O(active beads) by
+//     design; closed history grows without bound and would multiply the
+//     per-cycle bd payload without changing the diff result.
+func cacheFullScanQuery() ListQuery {
+	return ListQuery{AllowScan: true, SkipLabels: true, IncludeClosed: false, TierMode: TierBoth}
+}
 
 func (c *CachingStore) reconcileLoop(ctx context.Context, stagger time.Duration) {
 	if stagger > 0 {
@@ -257,7 +291,7 @@ func (c *CachingStore) runReconciliation() {
 	c.mu.RUnlock()
 
 	bdStart := time.Now()
-	fresh, err := c.backing.List(ListQuery{AllowScan: true, SkipLabels: true, TierMode: TierBoth})
+	fresh, err := c.backing.List(cacheFullScanQuery())
 	if err != nil {
 		bdLatency := time.Since(bdStart)
 		c.mu.Lock()
@@ -272,9 +306,12 @@ func (c *CachingStore) runReconciliation() {
 		c.mu.Unlock()
 		return
 	}
+	if len(fresh) >= cacheReconcileScanWarnThreshold {
+		recordCacheScanLarge(context.Background(), c.idPrefix, len(fresh),
+			cacheReconcileScanWarnThreshold, time.Since(bdStart))
+	}
 	enriched, enrichErr := c.enrichReadyProjectionForCache(fresh)
 	bdLatency := time.Since(bdStart)
-	projectionFailed := enrichErr != nil
 	if enrichErr != nil {
 		c.recordProblem("reconcile ready projection", enrichErr)
 	} else {
@@ -296,9 +333,16 @@ func (c *CachingStore) runReconciliation() {
 
 	c.mu.Lock()
 	now := time.Now()
-	if projectionFailed {
-		c.preserveCachedReadyProjectionLocked(freshByID, depMap, useFreshDeps)
-	}
+	// Preserve a cached is_blocked for any row the projection did not return
+	// this cycle. Two cases land here: a full projection failure (enrichErr
+	// left every row unenriched) and the narrower race where a row is still
+	// open in the list snapshot but closes before the bounded active-row
+	// projection query, so the SQL no longer returns it. Without preservation
+	// the row's is_blocked flips false->nil and beadChanged emits a spurious
+	// bead.updated. The guards inside drop the preservation when the row's deps
+	// or a blocking target's status actually changed, so a real transition is
+	// never masked.
+	c.preserveCachedReadyProjectionLocked(freshByID, depMap, useFreshDeps)
 	if c.mutationSeq != startSeq {
 		var adds, removes, updates int64
 		notifications := make([]cacheNotification, 0, len(freshByID))

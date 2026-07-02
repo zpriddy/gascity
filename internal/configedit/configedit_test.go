@@ -10,6 +10,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
@@ -20,7 +21,7 @@ type failRenameFS struct {
 }
 
 func (f *failRenameFS) Rename(oldpath, newpath string) error {
-	if !f.failed && filepath.Clean(newpath) == filepath.Clean(f.target) {
+	if !f.failed && pathutil.SamePath(newpath, f.target) {
 		f.failed = true
 		return errors.New("injected rename failure")
 	}
@@ -297,6 +298,33 @@ func TestAgentOrigin_Inline(t *testing.T) {
 	}
 }
 
+// TestLoadRaw_MatchesGateBasis verifies Editor.LoadRaw returns the same raw
+// (pre-expansion, site-bound) config the mutation gate uses. The read path's
+// provenance must be computed from this exact basis so pack_derived agrees
+// with the ErrPackDerived/409 gate (Editor.UpdateAgent → AgentOrigin).
+func TestLoadRaw_MatchesGateBasis(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	raw, err := ed.LoadRaw()
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	if raw == nil {
+		t.Fatal("LoadRaw returned nil config")
+	}
+	// minimalCity declares "mayor" inline. AgentOrigin computed against the
+	// LoadRaw basis must agree it is inline (not pack-derived), which is the
+	// exact decision the 409 gate makes.
+	if got := configedit.AgentOrigin(raw, raw, "mayor"); got != configedit.OriginInline {
+		t.Errorf("AgentOrigin(LoadRaw) = %v, want OriginInline", got)
+	}
+	if len(raw.Agents) != 1 || raw.Agents[0].Name != "mayor" {
+		t.Errorf("LoadRaw agents = %+v, want single inline mayor", raw.Agents)
+	}
+}
+
 func TestAgentOrigin_Derived(t *testing.T) {
 	raw := &config.City{
 		Agents: []config.Agent{{Name: "mayor"}},
@@ -542,6 +570,126 @@ schema = 2
 	}
 	if worker.Provider != "codex" {
 		t.Fatalf("worker.Provider = %q, want codex", worker.Provider)
+	}
+}
+
+// setupSymlinkedConventionAgent builds a schema-2 city with a convention
+// "worker" whose agents/worker/agent.toml is a symlink into a separate
+// checked-in location. It returns the city.toml path, the agent.toml link
+// path, and the resolved checked-in target path.
+func setupSymlinkedConventionAgent(t *testing.T, agentTomlBody string) (cityTOML, link, target string) {
+	t.Helper()
+	dir := t.TempDir()
+	cityTOML = writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte("[pack]\nname = \"test-city\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkedIn := filepath.Join(dir, "checked-in")
+	if err := os.MkdirAll(checkedIn, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target = filepath.Join(checkedIn, "worker.agent.toml")
+	if err := os.WriteFile(target, []byte(agentTomlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link = filepath.Join(agentDir, "agent.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	return cityTOML, link, target
+}
+
+func assertStillSymlink(t *testing.T, link string) {
+	t.Helper()
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat %q: %v", link, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%q symlink was replaced by a regular file", link)
+	}
+}
+
+func TestSuspendAgent_LocalDiscovered_SymlinkedAgentTomlWritesThroughLink(t *testing.T) {
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "provider = \"codex\"\n")
+
+	ed := configedit.NewEditor(fsys.OSFS{}, cityTOML)
+	if err := ed.SuspendAgent("worker"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	assertStillSymlink(t, link)
+	got := string(mustReadFile(t, target))
+	if !strings.Contains(got, "suspended = true") {
+		t.Fatalf("checked-in target = %q, want suspended = true written through the link", got)
+	}
+	if !strings.Contains(got, `provider = "codex"`) {
+		t.Fatalf("checked-in target = %q, want provider preserved", got)
+	}
+}
+
+func TestResumeAgent_LocalDiscovered_SymlinkedAgentTomlEmptyClearsTarget(t *testing.T) {
+	// Only the suspended flag is durable, so resume empties the config and the
+	// resolved checked-in target is cleared. The operator's link is left in
+	// place (edits act on the target, not the link).
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "suspended = true\n")
+
+	ed := configedit.NewEditor(fsys.OSFS{}, cityTOML)
+	if err := ed.ResumeAgent("worker"); err != nil {
+		t.Fatalf("ResumeAgent: %v", err)
+	}
+
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("checked-in target should be cleared on empty resume, stat err = %v", err)
+	}
+	assertStillSymlink(t, link)
+	cfg := readExpandedTOML(t, cityTOML)
+	if findAgent(t, cfg, "worker").Suspended {
+		t.Fatal("worker should not be suspended after resume")
+	}
+}
+
+func TestUpdateAgent_LocalDiscovered_SymlinkedAgentTomlWritesThroughLink(t *testing.T) {
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "provider = \"codex\"\n")
+
+	ed := configedit.NewEditor(fsys.OSFS{}, cityTOML)
+	if err := ed.UpdateAgent("worker", configedit.AgentUpdate{Provider: "claude"}); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+
+	assertStillSymlink(t, link)
+	got := string(mustReadFile(t, target))
+	if !strings.Contains(got, `provider = "claude"`) {
+		t.Fatalf("checked-in target = %q, want provider updated through the link", got)
+	}
+}
+
+func TestWriteLocalDiscoveredAgentConfig_SymlinkedAgentTomlWritesThroughLink(t *testing.T) {
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "provider = \"codex\"\n")
+	cityRoot := filepath.Dir(cityTOML)
+
+	agent := config.Agent{
+		Name:     "worker",
+		Provider: "claude",
+		Scope:    "city",
+	}
+	if err := configedit.WriteLocalDiscoveredAgentConfig(fsys.OSFS{}, cityRoot, agent); err != nil {
+		t.Fatalf("WriteLocalDiscoveredAgentConfig: %v", err)
+	}
+
+	assertStillSymlink(t, link)
+	got := string(mustReadFile(t, target))
+	if !strings.Contains(got, `provider = "claude"`) {
+		t.Fatalf("checked-in target = %q, want provider written through the link", got)
 	}
 }
 
@@ -2166,6 +2314,118 @@ func TestUpdateProvider_PreservesUnchangedFields(t *testing.T) {
 	}
 	if got.DisplayName != "Custom Agent" {
 		t.Errorf("display_name was lost: %q", got.DisplayName)
+	}
+}
+
+// cityWithModelProvider returns a city.toml with a custom provider whose
+// options_schema declares model + permission_mode, so option_defaults for
+// those keys pass schema validation.
+func cityWithModelProvider() string {
+	return `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+provider = "custom"
+
+[providers.custom]
+command = "custom-cli"
+
+[[providers.custom.options_schema]]
+key = "model"
+label = "Model"
+type = "select"
+default = "x"
+
+  [[providers.custom.options_schema.choices]]
+  value = "x"
+  label = "X"
+  flag_args = ["--model", "x"]
+
+  [[providers.custom.options_schema.choices]]
+  value = "y"
+  label = "Y"
+  flag_args = ["--model", "y"]
+
+[[providers.custom.options_schema]]
+key = "permission_mode"
+label = "Permission Mode"
+type = "select"
+default = "plan"
+
+  [[providers.custom.options_schema.choices]]
+  value = "plan"
+  label = "Plan"
+  flag_args = ["--permission-mode", "plan"]
+
+  [[providers.custom.options_schema.choices]]
+  value = "unrestricted"
+  label = "Unrestricted"
+  flag_args = ["--dangerously-skip-permissions"]
+`
+}
+
+// TestCreateProvider_OptionDefaults verifies a create with an option_defaults
+// map (e.g. model) round-trips to the provider's TOML.
+func TestCreateProvider_OptionDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	spec := config.ProviderSpec{
+		Command: "custom-cli",
+		OptionsSchema: []config.ProviderOption{{
+			Key:   "model",
+			Label: "Model",
+			Type:  "select",
+			Choices: []config.OptionChoice{
+				{Value: "x", Label: "X", FlagArgs: []string{"--model", "x"}},
+				{Value: "y", Label: "Y", FlagArgs: []string{"--model", "y"}},
+			},
+		}},
+		OptionDefaults: map[string]string{"model": "x"},
+	}
+	if err := ed.CreateProvider("myprov", spec); err != nil {
+		t.Fatalf("CreateProvider: %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	got := cfg.Providers["myprov"]
+	if got.OptionDefaults["model"] != "x" {
+		t.Errorf("OptionDefaults[model] = %q, want %q", got.OptionDefaults["model"], "x")
+	}
+}
+
+// TestUpdateProvider_OptionDefaultsMergeNotReplace verifies that updating
+// option_defaults merges keys: a model-only edit changes model while leaving
+// a pre-existing unrelated option-default key untouched.
+func TestUpdateProvider_OptionDefaultsMergeNotReplace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, cityWithModelProvider())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	// Seed a provider with two option defaults.
+	if err := ed.UpdateProvider("custom", configedit.ProviderUpdate{
+		OptionDefaults: map[string]string{"model": "x", "permission_mode": "unrestricted"},
+	}); err != nil {
+		t.Fatalf("seed UpdateProvider: %v", err)
+	}
+
+	// Edit only model; permission_mode must survive.
+	if err := ed.UpdateProvider("custom", configedit.ProviderUpdate{
+		OptionDefaults: map[string]string{"model": "y"},
+	}); err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	got := cfg.Providers["custom"]
+	if got.OptionDefaults["model"] != "y" {
+		t.Errorf("OptionDefaults[model] = %q, want %q", got.OptionDefaults["model"], "y")
+	}
+	if got.OptionDefaults["permission_mode"] != "unrestricted" {
+		t.Errorf("OptionDefaults[permission_mode] = %q, want %q (merge, not replace)",
+			got.OptionDefaults["permission_mode"], "unrestricted")
 	}
 }
 

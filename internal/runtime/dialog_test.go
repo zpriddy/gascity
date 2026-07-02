@@ -343,6 +343,100 @@ func TestAcceptStartupDialogsHandlesTrustThenCodexHookReview(t *testing.T) {
 	}
 }
 
+func TestContainsMCPTrustDialog(t *testing.T) {
+	t.Parallel()
+
+	if !containsMCPTrustDialog(mcpTrustDialogFixture()) {
+		t.Error("containsMCPTrustDialog should match the MCP trust modal")
+	}
+	if containsMCPTrustDialog("Do you trust the contents of this directory?") {
+		t.Error("containsMCPTrustDialog should not match the workspace trust dialog")
+	}
+	if containsMCPTrustDialog("› Implement {feature}") {
+		t.Error("containsMCPTrustDialog should not match a ready prompt")
+	}
+}
+
+func TestAcceptStartupDialogsAcceptsMCPTrustDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			if len(sent) == 0 {
+				return mcpTrustDialogFixture(), nil
+			}
+			return "› Implement {feature}", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs returned error: %v", err)
+	}
+	if got, want := strings.Join(sent, ","), "Down,Enter"; got != want {
+		t.Fatalf("sent keys = %q, want %q", got, want)
+	}
+}
+
+func TestAcceptStartupDialogsHandlesTrustThenMCPTrust(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			switch len(sent) {
+			case 0:
+				return "Do you trust the contents of this directory?", nil
+			case 1:
+				return mcpTrustDialogFixture(), nil
+			default:
+				return "› Implement {feature}", nil
+			}
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs returned error: %v", err)
+	}
+	if got, want := strings.Join(sent, ","), "Enter,Down,Enter"; got != want {
+		t.Fatalf("sent keys = %q, want %q", got, want)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamAcceptsMCPTrustDialog(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 2)
+	snapshots <- mcpTrustDialogFixture()
+	snapshots <- "› Implement {feature}"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if got, want := strings.Join(sent, ","), "Down,Enter"; got != want {
+		t.Fatalf("sent keys = %q, want %q", got, want)
+	}
+}
+
 func TestAcceptStartupDialogsFromStreamSkipsCodexUpdateDialog(t *testing.T) {
 	var sent []string
 	snapshots := make(chan string, 2)
@@ -726,7 +820,13 @@ func TestContainsPromptIndicator(t *testing.T) {
 		{name: "claude prompt with text", content: "❯ run tests", want: true},
 		{name: "boxed grok prompt", content: "│ ❯ ", want: true},
 		{name: "boxed grok prompt with text", content: "│ ❯ start working", want: true},
+		// gemini renders an ASCII "> " prompt followed by placeholder text
+		// (gastownhall/gascity#2874); the dialog poller must see it as ready so
+		// it stops burning the 8s-per-handler budget and the start deadline.
+		{name: "gemini ascii prompt with placeholder", content: "> Type your message or @path/to/file", want: true},
+		{name: "boxed gemini ascii prompt", content: "│ > Type your message or @path/to/file              │", want: true},
 		{name: "codex numbered menu row", content: "› 1. Update now (runs `bun install -g @openai/codex`)", want: false},
+		{name: "ascii numbered menu row", content: "> 1. Update now", want: false},
 		{name: "empty content", content: "", want: false},
 		{name: "no prompt", content: "loading...", want: false},
 		{name: "blank lines only", content: "\n\n", want: false},
@@ -759,6 +859,15 @@ func codexHookReviewDialogFixture() string {
 		"  2. Trust all and continue\n" +
 		"  3. Continue without trusting (hooks won't run)\n\n" +
 		"  Press enter to confirm or esc to go back"
+}
+
+func mcpTrustDialogFixture() string {
+	return "New MCP server found in this project: mcptest-probe\n" +
+		"MCP servers may execute code or access system resources. All tool calls require approval. Learn more in the MCP documentation.\n" +
+		"❯ 1. Use this MCP server\n" +
+		"  2. Use this and all future MCP servers in this project\n" +
+		"  3. Continue without using this MCP server\n" +
+		"Enter to confirm · Esc to cancel"
 }
 
 func TestExitsEarlyOnPrompt(t *testing.T) {
@@ -927,6 +1036,30 @@ func TestContainsProviderRateLimitScreen(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := ContainsProviderRateLimitScreen(tt.content); got != tt.want {
 				t.Errorf("ContainsProviderRateLimitScreen(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProviderTerminalErrorReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "codex model not found code", content: "model_not_found: gpt-5.3-codex-spark", want: "model_not_found"},
+		{name: "model not found text", content: "Error: model gpt-x was not found", want: "model_not_found"},
+		{name: "model and not-found on different lines is not terminal", content: "loading model weights\n... file path not found", want: ""},
+		{name: "quota exceeded", content: "Error: quota exceeded", want: "quota_exceeded"},
+		{name: "insufficient quota", content: "insufficient_quota: billing required", want: "quota_exceeded"},
+		{name: "disk quota is not provider quota", content: "disk quota exceeded while writing log", want: ""},
+		{name: "generic rate limit remains transient", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ProviderTerminalErrorReason(tt.content); got != tt.want {
+				t.Errorf("ProviderTerminalErrorReason(%q) = %q, want %q", tt.content, got, tt.want)
 			}
 		})
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/hooks"
 	"github.com/gastownhall/gascity/internal/overlay"
+	"github.com/gastownhall/gascity/internal/pricing"
 	"github.com/spf13/cobra"
 )
 
@@ -61,38 +62,42 @@ type initPackConfig struct {
 	NamedSessions  []config.NamedSession          `toml:"named_session,omitempty"`
 	Services       []config.Service               `toml:"service,omitempty"`
 	Providers      map[string]config.ProviderSpec `toml:"providers,omitempty"`
+	Upstreams      map[string]config.UpstreamSpec `toml:"upstreams,omitempty"`
 	Formulas       config.FormulasConfig          `toml:"formulas,omitempty"`
 	Patches        config.Patches                 `toml:"patches,omitempty"`
 	Doctor         []config.PackDoctorEntry       `toml:"doctor,omitempty"`
 	Commands       []config.PackCommandEntry      `toml:"commands,omitempty"`
 	Global         config.PackGlobal              `toml:"global,omitempty"`
+	Pricing        []pricing.ModelPricing         `toml:"pricing,omitempty"`
 }
 
 var initConventionDirs = cityinit.InitConventionDirs()
+
+const defaultInitTemplate = "gascity"
 
 // wizardConfig carries the results of the interactive init wizard (or defaults
 // for non-interactive paths). doInit uses it to decide which config to write.
 type wizardConfig struct {
 	interactive      bool   // true if the wizard ran with user interaction
-	configName       string // canonical values: "minimal", "gastown", or "custom"
+	configName       string // canonical values: "minimal", "gastown", "gascity", or "custom"
 	defaultProvider  string // selected default provider key
 	providers        []string
-	provider         string // compatibility mirror for older internal callers
-	startCommand     string // custom start command (workspace-level)
-	bootstrapProfile string // hosted bootstrap profile, or "" for local defaults
-	mysql            initMysqlOptions
-	err              error // wizard-time error (e.g. provider-discovery failure); doInit short-circuits when set
+	provider         string                // compatibility mirror for older internal callers
+	startCommand     string                // custom start command (workspace-level)
+	bootstrapProfile string                // hosted bootstrap profile, or "" for local defaults
+	hostedDolt       hostedDoltInitOptions // external/hosted Dolt ledger endpoint (disabled when zero)
+	err              error
 }
 
 // defaultWizardConfig returns a non-interactive wizardConfig that produces
-// a single mayor agent with no provider.
+// the default init template with no provider.
 func defaultWizardConfig() wizardConfig {
-	return wizardConfig{configName: "minimal"}
+	return wizardConfig{configName: defaultInitTemplate}
 }
 
 func canBootstrapExistingCity(wiz wizardConfig) bool {
 	return !wiz.interactive &&
-		wiz.configName == "minimal" &&
+		(wiz.configName == "minimal" || wiz.configName == defaultInitTemplate) &&
 		wizardDefaultProvider(wiz) == "" &&
 		len(wiz.providers) == 0 &&
 		wiz.startCommand == "" &&
@@ -104,6 +109,114 @@ const (
 	bootstrapProfileK8sCell          = cityinit.BootstrapProfileK8sCell
 	bootstrapProfileSingleHostCompat = cityinit.BootstrapProfileSingleHostCompat
 )
+
+// isTerminal reports whether f is connected to a terminal (not a pipe or file).
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+var isTerminalFunc = isTerminal
+
+// readLine reads a single line from br and returns it trimmed.
+// Returns empty string on EOF or error.
+func readLine(br *bufio.Reader) string {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return strings.TrimSpace(line)
+	}
+	return strings.TrimSpace(line)
+}
+
+// runWizard runs the interactive init wizard, asking the user to choose a
+// config template and a coding agent provider. If stdin is nil, returns
+// defaultWizardConfig() (non-interactive).
+func runWizard(stdin io.Reader, stdout io.Writer) wizardConfig {
+	if stdin == nil {
+		return defaultWizardConfig()
+	}
+
+	br := bufio.NewReader(stdin)
+
+	fmt.Fprintln(stdout, "Welcome to Gas City SDK!")                                         //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(stdout, "")                                                                 //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(stdout, "Choose a config template:")                                        //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(stdout, "  1. gascity   — planning & implementation skills pack (default)") //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(stdout, "  2. minimal   — default coding agent")                            //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(stdout, "  3. gastown   — multi-agent orchestration pack")                  //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(stdout, "  4. custom    — empty workspace, configure it yourself")          //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "Template [1]: ")                                                    //nolint:errcheck // best-effort stdout
+
+	configChoice := readLine(br)
+	configName := defaultInitTemplate
+
+	switch configChoice {
+	case "", "1", "gascity":
+		configName = "gascity"
+	case "2", "minimal", "tutorial":
+		configName = "minimal"
+	case "3", "gastown":
+		configName = "gastown"
+	case "4", "custom":
+		configName = "custom"
+	default:
+		fmt.Fprintf(stdout, "Unknown template %q, using gascity.\n", configChoice) //nolint:errcheck // best-effort stdout
+	}
+
+	// Custom config → skip agent question, return minimal config.
+	if configName == "custom" {
+		return wizardConfig{
+			interactive: true,
+			configName:  "custom",
+		}
+	}
+
+	fmt.Fprintln(stdout, "") //nolint:errcheck // best-effort stdout
+	choices, err := configuredWizardProviderChoices(context.Background())
+	if err != nil {
+		return wizardConfig{interactive: true, configName: configName, err: err}
+	}
+	if len(choices) == 0 {
+		return wizardConfig{
+			interactive: true,
+			configName:  configName,
+			err:         fmt.Errorf("no configured coding agents found; configure your coding agent and restart the wizard"),
+		}
+	}
+
+	fmt.Fprintln(stdout, "Choose your coding agent:") //nolint:errcheck // best-effort stdout
+	for i, choice := range choices {
+		fmt.Fprintf(stdout, "  %d. %s\n", i+1, choice.DisplayName) //nolint:errcheck // best-effort stdout
+	}
+	fmt.Fprintln(stdout, "If you don't see your coding agent, configure it and restart the wizard.") //nolint:errcheck // best-effort stdout
+
+	providers := providerChoiceKeys(choices)
+	defaultProvider := choices[0].Name
+	if len(choices) > 1 {
+		fmt.Fprintf(stdout, "Agent: ") //nolint:errcheck // best-effort stdout
+		agentChoice := readLine(br)
+		defaultProvider = resolveDefaultProviderChoice(agentChoice, choices)
+		if defaultProvider == "" {
+			return wizardConfig{
+				interactive: true,
+				configName:  configName,
+				providers:   providers,
+				err:         fmt.Errorf("provider selection is required; enter a number or exact provider key"),
+			}
+		}
+	}
+
+	return wizardConfig{
+		interactive:     true,
+		configName:      configName,
+		defaultProvider: defaultProvider,
+		providers:       providers,
+		provider:        defaultProvider,
+	}
+}
 
 type wizardProviderChoice struct {
 	Name        string
@@ -159,163 +272,6 @@ func resolveDefaultProviderChoice(input string, choices []wizardProviderChoice) 
 	return ""
 }
 
-// isTerminal reports whether f is connected to a terminal (not a pipe or file).
-func isTerminal(f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
-
-var isTerminalFunc = isTerminal
-
-// readLine reads a single line from br and returns it trimmed.
-// Returns empty string on EOF or error.
-func readLine(br *bufio.Reader) string {
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return strings.TrimSpace(line)
-	}
-	return strings.TrimSpace(line)
-}
-
-// runWizard runs the interactive init wizard, asking the user to choose a
-// config template and a coding agent provider. If stdin is nil, returns
-// defaultWizardConfig() (non-interactive).
-func runWizard(stdin io.Reader, stdout io.Writer) wizardConfig {
-	if stdin == nil {
-		return defaultWizardConfig()
-	}
-
-	br := bufio.NewReader(stdin)
-
-	fmt.Fprintln(stdout, "Welcome to Gas City SDK!")                                //nolint:errcheck // best-effort stdout
-	fmt.Fprintln(stdout, "")                                                        //nolint:errcheck // best-effort stdout
-	fmt.Fprintln(stdout, "Choose a config template:")                               //nolint:errcheck // best-effort stdout
-	fmt.Fprintln(stdout, "  1. minimal   — default coding agent (default)")         //nolint:errcheck // best-effort stdout
-	fmt.Fprintln(stdout, "  2. gastown   — multi-agent orchestration pack")         //nolint:errcheck // best-effort stdout
-	fmt.Fprintln(stdout, "  3. custom    — empty workspace, configure it yourself") //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "Template [1]: ")                                           //nolint:errcheck // best-effort stdout
-
-	configChoice := readLine(br)
-	configName := "minimal"
-
-	switch configChoice {
-	case "", "1", "minimal", "tutorial":
-		configName = "minimal"
-	case "2", "gastown":
-		configName = "gastown"
-	case "3", "custom":
-		configName = "custom"
-	default:
-		fmt.Fprintf(stdout, "Unknown template %q, using minimal.\n", configChoice) //nolint:errcheck // best-effort stdout
-	}
-
-	// Custom config → skip agent question, return minimal config.
-	if configName == "custom" {
-		return wizardConfig{
-			interactive: true,
-			configName:  "custom",
-		}
-	}
-
-	fmt.Fprintln(stdout, "") //nolint:errcheck // best-effort stdout
-	choices, err := configuredWizardProviderChoices(context.Background())
-	if err != nil {
-		return wizardConfig{interactive: true, configName: configName, err: err}
-	}
-	if len(choices) == 0 {
-		return wizardConfig{
-			interactive: true,
-			configName:  configName,
-			err:         fmt.Errorf("no configured coding agents found; configure your coding agent and restart the wizard"),
-		}
-	}
-
-	fmt.Fprintln(stdout, "Choose your coding agent:") //nolint:errcheck // best-effort stdout
-	for i, choice := range choices {
-		fmt.Fprintf(stdout, "  %d. %s\n", i+1, choice.DisplayName) //nolint:errcheck // best-effort stdout
-	}
-	fmt.Fprintln(stdout, "If you don't see your coding agent, configure it and restart the wizard.") //nolint:errcheck // best-effort stdout
-
-	providers := providerChoiceKeys(choices)
-	defaultProvider := choices[0].Name
-	if len(choices) > 1 {
-		fmt.Fprintf(stdout, "Agent: ") //nolint:errcheck // best-effort stdout
-		agentChoice := readLine(br)
-		defaultProvider = resolveDefaultProviderChoice(agentChoice, choices)
-		if defaultProvider == "" {
-			return wizardConfig{
-				interactive: true,
-				configName:  configName,
-				providers:   providers,
-				err:         fmt.Errorf("provider selection is required; enter a number or exact provider key"),
-			}
-		}
-	}
-
-	return wizardConfig{
-		interactive:     true,
-		configName:      configName,
-		defaultProvider: defaultProvider,
-		providers:       providers,
-		mysql:           promptWizardBackend(br, stdout),
-	}
-}
-
-// promptWizardBackend asks the user whether the new city should use the
-// default managed-dolt backend or a MySQL backend. When mysql is selected,
-// also prompts for host/port/user/database (password is left for the env
-// var since we don't echo it). Returns an empty initMysqlOptions when dolt
-// is chosen — the regular gc init pipeline handles dolt natively.
-func promptWizardBackend(br *bufio.Reader, stdout io.Writer) initMysqlOptions {
-	fmt.Fprintln(stdout, "")                                                        //nolint:errcheck
-	fmt.Fprintln(stdout, "Choose beads backend:")                                   //nolint:errcheck
-	fmt.Fprintln(stdout, "  1. managed dolt — local, git-versioned (default)")      //nolint:errcheck
-	fmt.Fprintln(stdout, "  2. mysql        — external server, shared across rigs") //nolint:errcheck
-	fmt.Fprintf(stdout, "Backend [1]: ")                                            //nolint:errcheck
-
-	choice := readLine(br)
-	switch choice {
-	case "", "1", "dolt", "managed", "managed-dolt":
-		return initMysqlOptions{}
-	case "2", "mysql":
-		// fall through to prompts
-	default:
-		fmt.Fprintf(stdout, "Unknown backend %q, using managed dolt.\n", choice) //nolint:errcheck
-		return initMysqlOptions{}
-	}
-
-	opts := initMysqlOptions{Backend: "mysql"}
-	fmt.Fprintf(stdout, "MySQL host [127.0.0.1]: ") //nolint:errcheck
-	if v := readLine(br); v != "" {
-		opts.Host = v
-	} else {
-		opts.Host = "127.0.0.1"
-	}
-	fmt.Fprintf(stdout, "MySQL port [3306]: ") //nolint:errcheck
-	if v := readLine(br); v != "" {
-		opts.Port = v
-	} else {
-		opts.Port = "3306"
-	}
-	fmt.Fprintf(stdout, "MySQL user [root]: ") //nolint:errcheck
-	if v := readLine(br); v != "" {
-		opts.User = v
-	} else {
-		opts.User = "root"
-	}
-	fmt.Fprintf(stdout, "MySQL database (required): ") //nolint:errcheck
-	opts.Database = readLine(br)
-	if opts.Database == "" {
-		fmt.Fprintln(stdout, "  (no database name; falling back to managed dolt)") //nolint:errcheck
-		return initMysqlOptions{}
-	}
-	fmt.Fprintln(stdout, "  Password is read from $GC_MYSQL_PASSWORD; export it before continuing if your server requires one.") //nolint:errcheck
-	return opts
-}
-
 // resolveAgentChoice maps user input to a provider name. Input can be a
 // number (1-based), a display name, or a provider key. Returns "" if the
 // input doesn't match any built-in provider.
@@ -365,15 +321,15 @@ func newInitCmd(stdout, stderr io.Writer) *cobra.Command {
 	var providersFlag []string
 	var defaultProviderFlag string
 	var bootstrapProfileFlag string
+	var doltHostFlag string
+	var doltPortFlag string
+	var doltUserFlag string
+	var doltDatabaseFlag string
+	var doltProjectIDFlag string
 	var skipProviderReadiness bool
 	var preserveExisting bool
 	var jsonOut bool
-	var backendFlag string
-	var mysqlHostFlag string
-	var mysqlPortFlag string
-	var mysqlUserFlag string
-	var mysqlPasswordFlag string
-	var mysqlDatabaseFlag string
+	var noStart bool
 	cmd := &cobra.Command{
 		Use:   "init [path]",
 		Short: "Initialize a new city",
@@ -381,19 +337,14 @@ func newInitCmd(stdout, stderr io.Writer) *cobra.Command {
 
 Runs an interactive wizard to choose a config template and coding agent
 provider. Creates the .gc/ runtime directory plus pack.toml, city.toml,
-the standard top-level directories, and .template.md prompt templates, then
-materializes builtin packs under .gc/system/packs. Use --template with
---default-provider to create a city non-interactively, or --file to initialize
-from an existing TOML config file.
+the standard top-level directories, and .template.md prompt templates, and
+pins the builtin pack imports (resolved from the user-global pack cache).
+Use --template with --default-provider to create a city non-interactively,
+or --file to initialize from an existing TOML config file.
 
 Pass --preserve-existing to keep any pre-authored pack.toml, city.toml, or
 agent prompt files in the target directory (useful when bootstrapping a
-committed workspace — e.g. from a bootstrap.sh shipped in the repo).
-
-Pass --backend=mysql with --mysql-database=<name> to provision a MySQL-backed
-beads scope as part of init: gc creates the database, runs bd init, and writes
-canonical metadata. Default --mysql-host/port/user are 127.0.0.1/3306/root;
-the password is read from --mysql-password or $GC_MYSQL_PASSWORD.`,
+committed workspace — e.g. from a bootstrap.sh shipped in the repo).`,
 		Example: `  gc init
   gc init ~/my-city
   gc init --default-provider codex ~/my-city
@@ -403,9 +354,10 @@ the password is read from --mysql-password or $GC_MYSQL_PASSWORD.`,
   gc init --name my-city
   gc init --from ~/elan --name elan /city
   gc init --file ./my-city.toml ~/bright-lights
-  gc init --file examples/gastown.toml ~/bright-lights
   gc init --file city.toml --preserve-existing .
-  gc init --provider claude --backend mysql --mysql-database mycity_beads ~/my-city`,
+  gc init --template gascity --default-provider claude \
+    --dolt-host db.example.com --dolt-port 4406 \
+    --dolt-database bd_prj_x --dolt-project-id prj_x --no-start /city`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(runCmd *cobra.Command, args []string) error {
 			out := stdout
@@ -413,29 +365,24 @@ the password is read from --mysql-password or $GC_MYSQL_PASSWORD.`,
 				out = io.Discard
 			}
 			mode := "default"
-			mysql := initMysqlOptions{
-				Backend:  backendFlag,
-				Host:     mysqlHostFlag,
-				Port:     mysqlPortFlag,
-				User:     mysqlUserFlag,
-				Password: mysqlPasswordFlag,
-				Database: mysqlDatabaseFlag,
-			}
-			if err := validateInitMysqlOptions(mysql); err != nil {
-				fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck
-				return errExit
-			}
 			if fromFlag != "" {
 				mode = "from"
-				code := cmdInitFromDirWithOptions(fromFlag, args, nameFlag, out, stderr, skipProviderReadiness)
+				code := cmdInitFromDirWithOptionsInternal(fromFlag, args, nameFlag, out, stderr, skipProviderReadiness, noStart)
 				return writeInitJSONOrExit(code, jsonOut, args, nameFlag, "", "", nil, bootstrapProfileFlag, mode, stdout)
 			}
 			if fileFlag != "" {
 				mode = "file"
-				code := cmdInitFromFileWithOptions(fileFlag, args, nameFlag, out, stderr, skipProviderReadiness, preserveExisting)
+				code := cmdInitFromFileWithOptionsInternal(fileFlag, args, nameFlag, out, stderr, skipProviderReadiness, preserveExisting, noStart)
 				return writeInitJSONOrExit(code, jsonOut, args, nameFlag, "", "", nil, bootstrapProfileFlag, mode, stdout)
 			}
-			wiz, flagMode, err := initWizardConfigFromFlags(runCmd, providerFlag, defaultProviderFlag, providersFlag, templateFlag, bootstrapProfileFlag)
+			hosted := resolveHostedDoltInitOptions(hostedDoltInitFlagValues{
+				Host:      doltHostFlag,
+				Port:      doltPortFlag,
+				User:      doltUserFlag,
+				Database:  doltDatabaseFlag,
+				ProjectID: doltProjectIDFlag,
+			}, os.Getenv)
+			wiz, flagMode, err := initWizardConfigFromFlags(runCmd, providerFlag, defaultProviderFlag, providersFlag, templateFlag, bootstrapProfileFlag, hosted)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 				return err
@@ -443,8 +390,8 @@ the password is read from --mysql-password or $GC_MYSQL_PASSWORD.`,
 			if flagMode != "" {
 				mode = flagMode
 			}
-			code := cmdInitWithOptionsInternal(args, providerFlag, bootstrapProfileFlag, nameFlag, out, stderr, skipProviderReadiness, preserveExisting, jsonOut, mysql)
-			return writeInitJSONOrExit(code, jsonOut, args, nameFlag, wiz.configName, wiz.defaultProvider, wiz.providers, bootstrapProfileFlag, mode, stdout)
+			code := cmdInitWithPreparedWizardInternal(args, wiz, flagMode != "", nameFlag, out, stderr, skipProviderReadiness, preserveExisting, jsonOut, noStart)
+			return writeInitJSONOrExit(code, jsonOut, args, nameFlag, wiz.configName, wizardDefaultProvider(wiz), wizardProviders(wiz), bootstrapProfileFlag, mode, stdout)
 		},
 	}
 	cmd.Flags().StringVar(&fileFlag, "file", "", "path to a TOML file to use as city.toml")
@@ -453,17 +400,18 @@ the password is read from --mysql-password or $GC_MYSQL_PASSWORD.`,
 	cmd.Flags().StringVar(&providerFlag, "provider", "", "deprecated alias for --default-provider")
 	cmd.Flags().StringVar(&defaultProviderFlag, "default-provider", "", "default readiness-aware provider to select from --providers")
 	cmd.Flags().StringArrayVar(&providersFlag, "providers", nil, "readiness-aware providers to write to city.toml (repeatable or comma-separated)")
-	cmd.Flags().StringVar(&templateFlag, "template", "", "non-interactive template to write: minimal, gastown, or custom")
+	cmd.Flags().StringVar(&templateFlag, "template", "", "non-interactive template to write: minimal, gastown, gascity, or custom")
 	cmd.Flags().StringVar(&bootstrapProfileFlag, "bootstrap-profile", "", "bootstrap profile to apply for hosted/container defaults")
+	cmd.Flags().StringVar(&doltHostFlag, "dolt-host", "", "external/hosted Dolt host for the city beads ledger (or "+envDoltHost+"); pins the city to an external endpoint instead of bootstrapping a managed-local Dolt")
+	cmd.Flags().StringVar(&doltPortFlag, "dolt-port", "", "external/hosted Dolt port (or "+envDoltPort+"); required with --dolt-host")
+	cmd.Flags().StringVar(&doltUserFlag, "dolt-user", "", "external/hosted Dolt user (or "+envDoltUser+"); optional")
+	cmd.Flags().StringVar(&doltDatabaseFlag, "dolt-database", "", "hosted beads project database, e.g. bd_prj_… (or "+envDoltDatabase+"); required with --dolt-host")
+	cmd.Flags().StringVar(&doltProjectIDFlag, "dolt-project-id", "", "authoritative beads project_id for the identity handshake (or "+envBeadsProjectID+"); derived from a bd_<id> --dolt-database when omitted")
 	cmd.Flags().BoolVar(&skipProviderReadiness, "skip-provider-readiness", false, "skip provider login/readiness checks during init and continue startup")
+	cmd.Flags().BoolVar(&noStart, "no-start", false, "initialize files and imports without registering or starting the city")
 	cmd.Flags().BoolVar(&preserveExisting, "preserve-existing", false, "keep any pre-authored pack.toml, city.toml, or agent prompt files instead of overwriting them")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON summary")
-	cmd.Flags().StringVar(&backendFlag, "backend", "", "beads backend for the new city (only \"mysql\" is supported here; default leaves init's regular dolt-managed backend in place)")
-	cmd.Flags().StringVar(&mysqlHostFlag, "mysql-host", "127.0.0.1", "MySQL server host (used with --backend=mysql)")
-	cmd.Flags().StringVar(&mysqlPortFlag, "mysql-port", "3306", "MySQL server port (used with --backend=mysql)")
-	cmd.Flags().StringVar(&mysqlUserFlag, "mysql-user", "root", "MySQL server user (used with --backend=mysql)")
-	cmd.Flags().StringVar(&mysqlPasswordFlag, "mysql-password", "", "MySQL server password (used with --backend=mysql; falls back to $GC_MYSQL_PASSWORD)")
-	cmd.Flags().StringVar(&mysqlDatabaseFlag, "mysql-database", "", "MySQL database name (required with --backend=mysql)")
+	cmd.Flags().BoolVar(&assumeYesForSupervisorCycle, "yes", false, "bypass the cross-city supervisor cycle confirmation prompt (warning is still printed for the audit trail)")
 	cmd.MarkFlagsMutuallyExclusive("file", "from")
 	cmd.MarkFlagsMutuallyExclusive("provider", "file")
 	cmd.MarkFlagsMutuallyExclusive("provider", "from")
@@ -475,6 +423,10 @@ the password is read from --mysql-password or $GC_MYSQL_PASSWORD.`,
 	cmd.MarkFlagsMutuallyExclusive("template", "from")
 	cmd.MarkFlagsMutuallyExclusive("bootstrap-profile", "file")
 	cmd.MarkFlagsMutuallyExclusive("bootstrap-profile", "from")
+	for _, doltFlag := range []string{"dolt-host", "dolt-port", "dolt-user", "dolt-database", "dolt-project-id"} {
+		cmd.MarkFlagsMutuallyExclusive(doltFlag, "file")
+		cmd.MarkFlagsMutuallyExclusive(doltFlag, "from")
+	}
 	_ = cmd.Flags().MarkHidden("provider")
 	return cmd
 }
@@ -524,50 +476,38 @@ func initTargetPath(args []string) (string, error) {
 	return os.Getwd()
 }
 
-// initMysqlOptions captures --backend / --mysql-* flags. When Backend is empty
-// the init flow is unchanged; when Backend == "mysql" gc init runs
-// doBeadsCityUseMysql against the freshly-scaffolded city after doInit
-// completes.
-type initMysqlOptions struct {
-	Backend  string
-	Host     string
-	Port     string
-	User     string
-	Password string
-	Database string
-}
-
-// validateInitMysqlOptions checks the --backend / --mysql-* flag combo. Empty
-// Backend means dolt (default); Backend == "mysql" requires Database.
-func validateInitMysqlOptions(opts initMysqlOptions) error {
-	backend := strings.TrimSpace(opts.Backend)
-	if backend == "" {
-		// Backend not requested. mysql.* flags are advisory at this point —
-		// leave them alone.
-		return nil
-	}
-	if backend != "mysql" {
-		return fmt.Errorf("--backend=%q not supported (only \"mysql\" can be requested at init time)", opts.Backend)
-	}
-	if strings.TrimSpace(opts.Database) == "" {
-		return fmt.Errorf("--backend=mysql requires --mysql-database")
-	}
-	return nil
-}
-
 // cmdInit initializes a new city at the given path (or cwd if no path given).
 // Runs the interactive wizard to choose a config template and provider.
 // Creates the runtime scaffold and city.toml. If the bead provider is "bd", also
 // runs bd init.
 func cmdInit(args []string, providerFlag, bootstrapProfileFlag string, stdout, stderr io.Writer) int {
-	return cmdInitWithOptions(args, providerFlag, bootstrapProfileFlag, "", stdout, stderr, false, false, initMysqlOptions{})
+	return cmdInitWithOptions(args, providerFlag, bootstrapProfileFlag, "", stdout, stderr, false, false)
 }
 
-func cmdInitWithOptions(args []string, providerFlag, bootstrapProfileFlag, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, mysql initMysqlOptions) int {
-	return cmdInitWithOptionsInternal(args, providerFlag, bootstrapProfileFlag, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, false, mysql)
+func cmdInitWithOptions(args []string, providerFlag, bootstrapProfileFlag, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool) int {
+	return cmdInitWithOptionsInternal(args, providerFlag, bootstrapProfileFlag, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, false)
 }
 
-func cmdInitWithOptionsInternal(args []string, providerFlag, bootstrapProfileFlag, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, forceDefaultWizard bool, mysql initMysqlOptions) int {
+func cmdInitWithOptionsInternal(args []string, providerFlag, bootstrapProfileFlag, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, forceDefaultWizard bool) int {
+	var prepared wizardConfig
+	preparedSet := false
+	if providerFlag != "" || bootstrapProfileFlag != "" {
+		var err error
+		prepared, err = initWizardConfig(providerFlag, bootstrapProfileFlag)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		preparedSet = true
+	}
+	return cmdInitWithPreparedWizard(args, prepared, preparedSet, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, forceDefaultWizard)
+}
+
+func cmdInitWithPreparedWizard(args []string, prepared wizardConfig, preparedSet bool, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, forceDefaultWizard bool) int {
+	return cmdInitWithPreparedWizardInternal(args, prepared, preparedSet, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, forceDefaultWizard, false)
+}
+
+func cmdInitWithPreparedWizardInternal(args []string, prepared wizardConfig, preparedSet bool, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, forceDefaultWizard bool, noStart bool) int {
 	var cityPath string
 	if len(args) > 0 {
 		var err error
@@ -584,11 +524,13 @@ func cmdInitWithOptionsInternal(args []string, providerFlag, bootstrapProfileFla
 			return 1
 		}
 	}
-	if handled, code := resumeExistingInitIfPossible(fsys.OSFS{}, cityPath, stdout, stderr, "gc init", true, skipProviderReadiness); handled {
+	if handled, code := resumeExistingInitIfPossibleInternal(fsys.OSFS{}, cityPath, stdout, stderr, "gc init", true, skipProviderReadiness, noStart); handled {
 		return code
 	}
 	var wiz wizardConfig
 	switch {
+	case preparedSet:
+		wiz = prepared
 	case forceDefaultWizard:
 		wiz = defaultWizardConfig()
 	case isTerminalFunc(os.Stdin):
@@ -598,11 +540,6 @@ func cmdInitWithOptionsInternal(args []string, providerFlag, bootstrapProfileFla
 			return 1
 		}
 		maybePrintWizardProviderGuidance(wiz, stdout)
-		// Honor the wizard's backend choice when the user didn't pass --backend
-		// on the command line. Explicit flags always win over wizard answers.
-		if strings.TrimSpace(mysql.Backend) == "" && strings.TrimSpace(wiz.mysql.Backend) != "" {
-			mysql = wiz.mysql
-		}
 	default:
 		wiz = defaultWizardConfig()
 	}
@@ -613,37 +550,15 @@ func cmdInitWithOptionsInternal(args []string, providerFlag, bootstrapProfileFla
 	if code := doInit(fsys.OSFS{}, cityPath, wiz, nameOverride, stdout, stderr, preserveExisting); code != 0 {
 		return code
 	}
-	if code := finalizeInit(cityPath, stdout, stderr, initFinalizeOptions{
+	return finalizeInit(cityPath, stdout, stderr, initFinalizeOptions{
 		skipProviderReadiness: skipProviderReadiness,
 		showProgress:          true,
 		commandName:           "gc init",
-	}); code != 0 {
-		return code
-	}
-	if strings.TrimSpace(mysql.Backend) == "mysql" {
-		if code := runInitMysqlSwitch(cityPath, mysql, stdout, stderr); code != 0 {
-			return code
-		}
-	}
-	return 0
+		noStart:               noStart,
+	})
 }
 
-// runInitMysqlSwitch flips a freshly-scaffolded city to a MySQL beads backend
-// by delegating to doBeadsCityUseMysql. Called only when --backend=mysql was
-// requested. Errors propagate to the caller's exit code.
-func runInitMysqlSwitch(cityPath string, mysql initMysqlOptions, stdout, stderr io.Writer) int {
-	fmt.Fprintln(stdout, "gc init: switching new city to mysql backend") //nolint:errcheck
-	opts := cityMysqlOptions{
-		Host:     mysql.Host,
-		Port:     mysql.Port,
-		User:     mysql.User,
-		Password: mysql.Password,
-		Database: mysql.Database,
-	}
-	return doBeadsCityUseMysql(fsys.OSFS{}, cityPath, opts, stdout, stderr)
-}
-
-func resumeExistingInitIfPossible(fs fsys.FS, cityPath string, stdout, stderr io.Writer, commandName string, showProgress bool, skipProviderReadiness bool) (bool, int) {
+func resumeExistingInitIfPossibleInternal(fs fsys.FS, cityPath string, stdout, stderr io.Writer, commandName string, showProgress bool, skipProviderReadiness bool, noStart bool) (bool, int) {
 	if !cityCanResumeInitFS(fs, cityPath) {
 		return false, 0
 	}
@@ -654,6 +569,7 @@ func resumeExistingInitIfPossible(fs fsys.FS, cityPath string, stdout, stderr io
 		skipProviderReadiness: skipProviderReadiness,
 		showProgress:          showProgress,
 		commandName:           commandName,
+		noStart:               noStart,
 	})
 }
 
@@ -671,7 +587,7 @@ func initWizardConfig(providerFlag, bootstrapProfileFlag string) (wizardConfig, 
 		providers = []string{defaultProvider}
 	}
 	return wizardConfig{
-		configName:       "minimal",
+		configName:       defaultInitTemplate,
 		defaultProvider:  defaultProvider,
 		providers:        providers,
 		provider:         defaultProvider,
@@ -679,15 +595,18 @@ func initWizardConfig(providerFlag, bootstrapProfileFlag string) (wizardConfig, 
 	}, nil
 }
 
-func initWizardConfigFromFlags(cmd *cobra.Command, providerFlag, defaultProviderFlag string, providersFlag []string, templateFlag, bootstrapProfileFlag string) (wizardConfig, string, error) {
+func initWizardConfigFromFlags(cmd *cobra.Command, providerFlag, defaultProviderFlag string, providersFlag []string, templateFlag, bootstrapProfileFlag string, hosted hostedDoltInitOptions) (wizardConfig, string, error) {
 	legacyChanged := cmd.Flags().Changed("provider")
 	defaultChanged := cmd.Flags().Changed("default-provider")
 	providersChanged := cmd.Flags().Changed("providers")
 	templateChanged := cmd.Flags().Changed("template")
 	bootstrapChanged := strings.TrimSpace(bootstrapProfileFlag) != ""
 
-	if !legacyChanged && !defaultChanged && !providersChanged && !templateChanged && !bootstrapChanged {
+	if !legacyChanged && !defaultChanged && !providersChanged && !templateChanged && !bootstrapChanged && !hosted.enabled() {
 		return wizardConfig{}, "", nil
+	}
+	if err := hosted.validate(); err != nil {
+		return wizardConfig{}, "", err
 	}
 	if legacyChanged && defaultChanged {
 		return wizardConfig{}, "", fmt.Errorf("--provider is deprecated; use --default-provider, not both")
@@ -724,7 +643,7 @@ func initWizardConfigFromFlags(cmd *cobra.Command, providerFlag, defaultProvider
 	if template == "custom" && (legacyChanged || defaultChanged || providersChanged) {
 		return wizardConfig{}, "", fmt.Errorf("--template custom cannot be combined with provider flags")
 	}
-	if (template == "minimal" || template == "gastown") && defaultProvider == "" {
+	if (template == "minimal" || template == "gastown" || template == "gascity") && defaultProvider == "" {
 		return wizardConfig{}, "", fmt.Errorf("--template %s requires --default-provider", template)
 	}
 
@@ -742,6 +661,7 @@ func initWizardConfigFromFlags(cmd *cobra.Command, providerFlag, defaultProvider
 		providers:        providers,
 		provider:         defaultProvider,
 		bootstrapProfile: bootstrapProfile,
+		hostedDolt:       hosted,
 	}, mode, nil
 }
 
@@ -787,16 +707,16 @@ func normalizeInitProviders(values []string) ([]string, error) {
 func normalizeInitTemplate(template string, supplied bool) (string, error) {
 	template = strings.TrimSpace(template)
 	if template == "" {
-		return "minimal", nil
+		return defaultInitTemplate, nil
 	}
 	switch template {
-	case "minimal", "gastown", "custom":
+	case "minimal", "gastown", "gascity", "custom":
 		return template, nil
 	default:
 		if supplied {
-			return "", fmt.Errorf("unknown template %q (expected one of: minimal, gastown, custom)", template)
+			return "", fmt.Errorf("unknown template %q (expected one of: minimal, gastown, gascity, custom)", template)
 		}
-		return "minimal", nil
+		return defaultInitTemplate, nil
 	}
 }
 
@@ -922,11 +842,13 @@ func marshalInitPackConfig(cfg initPackConfig) ([]byte, error) {
 		NamedSessions []config.NamedSession          `toml:"named_session,omitempty"`
 		Services      []config.Service               `toml:"service,omitempty"`
 		Providers     map[string]config.ProviderSpec `toml:"providers,omitempty"`
+		Upstreams     map[string]config.UpstreamSpec `toml:"upstreams,omitempty"`
 		Formulas      *config.FormulasConfig         `toml:"formulas,omitempty"`
 		Patches       *config.Patches                `toml:"patches,omitempty"`
 		Doctor        []config.PackDoctorEntry       `toml:"doctor,omitempty"`
 		Commands      []config.PackCommandEntry      `toml:"commands,omitempty"`
 		Global        *config.PackGlobal             `toml:"global,omitempty"`
+		Pricing       []pricing.ModelPricing         `toml:"pricing,omitempty"`
 	}
 
 	encCfg := encodedInitPackConfig{
@@ -944,8 +866,10 @@ func marshalInitPackConfig(cfg initPackConfig) ([]byte, error) {
 		NamedSessions: cfg.NamedSessions,
 		Services:      cfg.Services,
 		Providers:     cfg.Providers,
+		Upstreams:     cfg.Upstreams,
 		Doctor:        cfg.Doctor,
 		Commands:      cfg.Commands,
+		Pricing:       cfg.Pricing,
 	}
 	if !isZeroValue(cfg.AgentDefaults) {
 		encCfg.AgentDefaults = &cfg.AgentDefaults
@@ -1114,6 +1038,25 @@ func applyInitPackTemplateExtras(dst *initPackConfig, src initPackConfig) {
 	}
 }
 
+// addBuiltinImportsToInitPack merges the required bundled-pack imports
+// into the init pack manifest, preserving any imports the template (or a
+// preserved pack.toml) already declares.
+func addBuiltinImportsToInitPack(packCfg *initPackConfig, cityProvider string) {
+	imports, names := builtinImportsForInit(cityProvider)
+	if len(names) == 0 {
+		return
+	}
+	if packCfg.Imports == nil {
+		packCfg.Imports = make(map[string]config.Import, len(names))
+	}
+	for _, name := range names {
+		if _, exists := packCfg.Imports[name]; exists {
+			continue
+		}
+		packCfg.Imports[name] = imports[name]
+	}
+}
+
 func appendUniqueStrings(dst []string, items ...string) []string {
 	seen := make(map[string]struct{}, len(dst))
 	for _, item := range dst {
@@ -1130,6 +1073,10 @@ func appendUniqueStrings(dst []string, items ...string) []string {
 }
 
 func cmdInitFromFileWithOptions(fileArg string, args []string, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool) int {
+	return cmdInitFromFileWithOptionsInternal(fileArg, args, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, false)
+}
+
+func cmdInitFromFileWithOptionsInternal(fileArg string, args []string, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, noStart bool) int {
 	var cityPath string
 	if len(args) > 0 {
 		var err error
@@ -1147,7 +1094,7 @@ func cmdInitFromFileWithOptions(fileArg string, args []string, nameOverride stri
 		}
 	}
 
-	return cmdInitFromTOMLFileWithOptions(fsys.OSFS{}, fileArg, cityPath, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting)
+	return cmdInitFromTOMLFileWithOptionsInternal(fsys.OSFS{}, fileArg, cityPath, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, noStart)
 }
 
 // cmdInitFromTOMLFile initializes a city by copying a user-provided TOML
@@ -1157,6 +1104,10 @@ func cmdInitFromTOMLFile(fs fsys.FS, tomlSrc, cityPath string, stdout, stderr io
 }
 
 func cmdInitFromTOMLFileWithOptions(fs fsys.FS, tomlSrc, cityPath, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool) int {
+	return cmdInitFromTOMLFileWithOptionsInternal(fs, tomlSrc, cityPath, nameOverride, stdout, stderr, skipProviderReadiness, preserveExisting, false)
+}
+
+func cmdInitFromTOMLFileWithOptionsInternal(fs fsys.FS, tomlSrc, cityPath, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness, preserveExisting bool, noStart bool) int {
 	// Validate the source file parses as a valid city config.
 	data, err := os.ReadFile(tomlSrc)
 	if err != nil {
@@ -1219,13 +1170,11 @@ func cmdInitFromTOMLFileWithOptions(fs fsys.FS, tomlSrc, cityPath, nameOverride 
 	rewriteInitPromptTemplates(cfg)
 	packCfg, cityCfg := splitInitConfig(cityName, cfg)
 	applyInitPackTemplateExtras(&packCfg, templatePack)
-	// Builtin packs compose only through explicit includes: write the
-	// canonical city-relative paths for this city's providers into
-	// city.toml (mirrors doInit; gc doctor --fix repairs them later).
-	cityCfg.Workspace.SetLegacyIncludes(appendUniqueStrings(
-		cityCfg.Workspace.LegacyIncludes(),
-		builtinIncludesForInit(cityCfg.Beads.Provider)...,
-	))
+	// Builtin packs compose only through explicit imports: write the
+	// canonical bundled-source entries for this city's providers into
+	// pack.toml (mirrors doInit; the builtin-pack-imports doctor check
+	// repairs them later).
+	addBuiltinImportsToInitPack(&packCfg, cityCfg.Beads.Provider)
 	var rigSiteBindings []config.Rig
 	if hasInitRigSiteBindings(cityCfg.Rigs) {
 		rigSiteBindings = append([]config.Rig(nil), cityCfg.Rigs...)
@@ -1310,6 +1259,7 @@ func cmdInitFromTOMLFileWithOptions(fs fsys.FS, tomlSrc, cityPath, nameOverride 
 	return finalizeInit(cityPath, stdout, stderr, initFinalizeOptions{
 		skipProviderReadiness: skipProviderReadiness,
 		commandName:           "gc init",
+		noStart:               noStart,
 	})
 }
 
@@ -1382,6 +1332,8 @@ func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, nameOverride string, 
 		cfg = config.EmptyCity(cityName)
 	case wiz.configName == "gastown":
 		cfg = config.GastownCityWithProviders(cityName, defaultProvider, providers)
+	case wiz.configName == "gascity":
+		cfg = config.GascityCityWithProviders(cityName, defaultProvider, providers)
 	case defaultProvider != "" || len(providers) > 0:
 		cfg = config.WizardCityWithProviders(cityName, defaultProvider, providers)
 	case wiz.startCommand != "":
@@ -1390,6 +1342,12 @@ func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, nameOverride string, 
 		cfg = config.DefaultCity(cityName)
 	}
 	applyBootstrapProfile(&cfg, wiz.bootstrapProfile)
+	if wiz.hostedDolt.enabled() {
+		if err := wiz.hostedDolt.applyToCityConfig(&cfg); err != nil {
+			fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
 	cityPrefix := strings.TrimSpace(cfg.Workspace.Prefix)
 
 	// Write prompt files only for the agents declared by the init template.
@@ -1416,15 +1374,11 @@ func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, nameOverride string, 
 	// pack.toml. The built-in templates currently only need the prompt
 	// scaffold plus the pack-owned named session.
 	packCfg.Agents = nil
-	// Builtin packs compose only through explicit includes: write the
-	// canonical city-relative paths for this city's providers into
-	// city.toml. gc doctor --fix repairs them if they go missing. These are
-	// deployment-local (.gc paths), so they belong in city.toml, not in the
-	// portable pack.toml.
-	cityCfg.Workspace.SetLegacyIncludes(appendUniqueStrings(
-		cityCfg.Workspace.LegacyIncludes(),
-		builtinIncludesForInit(cityCfg.Beads.Provider)...,
-	))
+	// Builtin packs compose only through explicit imports: write the
+	// canonical bundled-source entries for this city's providers into
+	// pack.toml. The builtin-pack-imports doctor check repairs them if
+	// they go missing.
+	addBuiltinImportsToInitPack(&packCfg, cityCfg.Beads.Provider)
 	content, err := cityCfg.Marshal()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1452,6 +1406,23 @@ func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, nameOverride string, 
 	if err := persistInitWorkspaceIdentity(fs, cityPath, tomlPath, &cityCfg, cityName, cityPrefix); err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+
+	// When a hosted/external Dolt endpoint was supplied, write the full
+	// canonical external config now (R2/R3/R4/R5) so the unconditional
+	// initDirIfReady that follows resolves the city as external and skips the
+	// managed-local Dolt bootstrap. Reject incompatible effective backends
+	// (file or doltlite) before writing any canonical files so a rejected init
+	// leaves no mixed ledger state.
+	if wiz.hostedDolt.enabled() {
+		if err := hostedDoltBackendError(cityPath); err != nil {
+			fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if err := applyInitHostedDoltCanonicalConfig(fs, cityPath, cityPrefix, wiz.hostedDolt); err != nil {
+			fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
 	}
 
 	// Write .gitignore entries for city-managed directories.
@@ -1712,7 +1683,7 @@ func resolveCityName(nameOverride, sourceName, cityPath string) string {
 	return cityinit.ResolveCityName(nameOverride, sourceName, cityPath)
 }
 
-func cmdInitFromDirWithOptions(fromDir string, args []string, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness bool) int {
+func cmdInitFromDirWithOptionsInternal(fromDir string, args []string, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness bool, noStart bool) int {
 	var cityPath string
 	if len(args) > 0 {
 		var err error
@@ -1736,7 +1707,7 @@ func cmdInitFromDirWithOptions(fromDir string, args []string, nameOverride strin
 		return 1
 	}
 
-	return doInitFromDirWithOptions(srcDir, cityPath, nameOverride, stdout, stderr, skipProviderReadiness)
+	return doInitFromDirWithOptionsInternal(srcDir, cityPath, nameOverride, stdout, stderr, skipProviderReadiness, noStart)
 }
 
 // doInitFromDir copies an example city directory to a new city path,
@@ -1747,6 +1718,10 @@ func doInitFromDir(srcDir, cityPath string, stdout, stderr io.Writer) int {
 }
 
 func doInitFromDirWithOptionsFS(fs fsys.FS, srcDir, cityPath, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness bool) int {
+	return doInitFromDirWithOptionsFSInternal(fs, srcDir, cityPath, nameOverride, stdout, stderr, skipProviderReadiness, false)
+}
+
+func doInitFromDirWithOptionsFSInternal(fs fsys.FS, srcDir, cityPath, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness bool, noStart bool) int {
 	srcToml := filepath.Join(srcDir, "city.toml")
 	if _, err := os.Stat(srcToml); err != nil {
 		fmt.Fprintf(stderr, "gc init --from: source %q has no city.toml\n", srcDir) //nolint:errcheck // best-effort stderr
@@ -1822,11 +1797,16 @@ func doInitFromDirWithOptionsFS(fs fsys.FS, srcDir, cityPath, nameOverride strin
 	return finalizeInit(cityPath, stdout, stderr, initFinalizeOptions{
 		skipProviderReadiness: skipProviderReadiness,
 		commandName:           "gc init",
+		noStart:               noStart,
 	})
 }
 
 func doInitFromDirWithOptions(srcDir, cityPath, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness bool) int {
 	return doInitFromDirWithOptionsFS(fsys.OSFS{}, srcDir, cityPath, nameOverride, stdout, stderr, skipProviderReadiness)
+}
+
+func doInitFromDirWithOptionsInternal(srcDir, cityPath, nameOverride string, stdout, stderr io.Writer, skipProviderReadiness bool, noStart bool) int {
+	return doInitFromDirWithOptionsFSInternal(fsys.OSFS{}, srcDir, cityPath, nameOverride, stdout, stderr, skipProviderReadiness, noStart)
 }
 
 func rewriteCopiedInitFromIdentity(fs fsys.FS, cityPath, nameOverride string) (*config.City, string, string, bool, error) {

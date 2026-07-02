@@ -250,6 +250,11 @@ func (c *BuiltinPackFamilyCheck) Run(_ *CheckContext) *CheckResult {
 	if v := os.Getenv("GC_BEADS"); v != "" {
 		provider = v
 	}
+	if strings.EqualFold(strings.TrimSpace(c.cfg.Beads.Backend), "doltlite") {
+		r.Status = StatusOK
+		r.Message = "builtin bd/dolt pack family not required for doltlite backend"
+		return r
+	}
 	if !providerUsesBDDoltStore(provider) {
 		r.Status = StatusOK
 		r.Message = "builtin bd/dolt pack family not required"
@@ -284,12 +289,21 @@ func (c *BuiltinPackFamilyCheck) Fix(_ *CheckContext) error { return nil }
 
 func (c *BuiltinPackFamilyCheck) userBuiltinPackOverrides() map[string]bool {
 	systemRoot := filepath.Clean(filepath.Join(c.cityPath, citylayout.SystemPacksRoot))
+	// Builtin packs compose from the user-global repo cache; dirs under it
+	// are the bundled packs themselves, not user-authored overrides.
+	cacheRoot := ""
+	if root, err := config.GlobalRepoCacheRoot(); err == nil {
+		cacheRoot = filepath.Clean(root)
+	}
 	seenDirs := make(map[string]bool)
 	overrides := make(map[string]bool)
 
 	for _, dir := range packDirsForCheck(c.cfg) {
 		dir = filepath.Clean(dir)
 		if seenDirs[dir] || isSubpath(systemRoot, dir) {
+			continue
+		}
+		if cacheRoot != "" && isSubpath(cacheRoot, dir) {
 			continue
 		}
 		seenDirs[dir] = true
@@ -650,40 +664,9 @@ func NewBeadsStoreCheck(cityPath string, newStore func(string) (beads.Store, err
 // Name returns the check identifier.
 func (c *BeadsStoreCheck) Name() string { return "beads-store" }
 
-// scopeUsesMySQLBackend returns true when the metadata.json at scopePath
-// declares backend: mysql. MySQL-backed scopes have no managed Dolt
-// runtime — checks that resolve dolt connection state must skip them.
-func scopeUsesMySQLBackend(scopePath string) bool {
-	metaPath := filepath.Join(scopePath, ".beads", "metadata.json")
-	state, ok, err := contract.LoadMetadataState(fsys.OSFS{}, metaPath)
-	if err != nil || !ok {
-		return false
-	}
-	return state.Backend == "mysql"
-}
-
 // Run opens the store and pings it to verify accessibility.
 func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
-	// MySQL-backed cities have no managed Dolt — bd connects directly to
-	// the configured MySQL server using .beads/config.yaml. Skip the
-	// dolt-target validation and go straight to the store ping.
-	if scopeUsesMySQLBackend(c.cityPath) {
-		store, err := c.newStore(c.cityPath)
-		if err != nil {
-			r.Status = StatusError
-			r.Message = fmt.Sprintf("store open failed: %v", err)
-			return r
-		}
-		if err := store.Ping(); err != nil {
-			r.Status = StatusError
-			r.Message = fmt.Sprintf("store ping failed: %v", err)
-			return r
-		}
-		r.Status = StatusOK
-		r.Message = "store accessible (mysql backend)"
-		return r
-	}
 	target, fixHint, active, err := validateBDStoreTarget(c.cityPath, c.cityPath)
 	if err != nil {
 		r.Status = StatusError
@@ -982,21 +965,8 @@ func validateBDStoreTarget(cityPath, scopeRoot string) (contract.DoltConnectionT
 	if !scopeUsesBDDoltStore(cityPath, scopeRoot) {
 		return contract.DoltConnectionTarget{}, "", false, nil
 	}
-	// Shared-server cities don't have managed runtime state.
-	// Resolve directly to the shared server port.
-	cfgPath := filepath.Join(cityPath, ".beads", "config.yaml")
-	if shared, _ := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath); shared {
-		port := os.Getenv("BEADS_DOLT_SERVER_PORT")
-		if port == "" {
-			port = readSharedServerPortFile()
-		}
-		if port != "" {
-			target := contract.DoltConnectionTarget{
-				Host: "127.0.0.1",
-				Port: port,
-			}
-			return target, "", true, nil
-		}
+	if scopeUsesBDDoltliteStore(cityPath, scopeRoot) {
+		return contract.DoltConnectionTarget{}, "", false, nil
 	}
 	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, scopeRoot, "")
 	if err != nil {
@@ -1010,18 +980,6 @@ func validateBDStoreTarget(cityPath, scopeRoot string) (contract.DoltConnectionT
 		return contract.DoltConnectionTarget{}, fixHintForBDScopeResolution(cityPath, resolved), true, err
 	}
 	return target, "", true, nil
-}
-
-func readSharedServerPortFile() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".beads", "shared-server", "dolt-server.port"))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
 }
 
 func fixHintForBDScopeResolution(cityPath string, resolved contract.ScopeConfigResolution) string {
@@ -1168,34 +1126,10 @@ func (c *DoltServerCheck) Run(_ *CheckContext) *CheckResult {
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
 	}
-	// MySQL-backed cities have no Dolt server — skip.
-	if scopeUsesMySQLBackend(c.cityPath) {
+	if scopeUsesBDDoltliteStore(c.cityPath, c.cityPath) {
 		r.Status = StatusOK
-		r.Message = "skipped (mysql backend)"
+		r.Message = "not required (bd backend=doltlite)"
 		return r
-	}
-
-	// Shared-server cities: resolve directly to the shared server port.
-	cfgPath := filepath.Join(c.cityPath, ".beads", "config.yaml")
-	if shared, _ := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath); shared {
-		port := os.Getenv("BEADS_DOLT_SERVER_PORT")
-		if port == "" {
-			port = readSharedServerPortFile()
-		}
-		if port != "" {
-			addr := net.JoinHostPort("127.0.0.1", port)
-			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-			if err != nil {
-				r.Status = StatusError
-				r.Message = fmt.Sprintf("shared dolt server not reachable at %s", addr)
-				r.FixHint = "start the shared dolt server: bd dolt start (or check ~/.beads/shared-server/)"
-				return r
-			}
-			conn.Close() //nolint:errcheck
-			r.Status = StatusOK
-			r.Message = fmt.Sprintf("shared server reachable on %s", addr)
-			return r
-		}
 	}
 
 	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, c.cityPath, c.cityPath)
@@ -1488,26 +1422,6 @@ func (c *RigBeadsCheck) Run(_ *CheckContext) *CheckResult {
 	rigPath := c.rig.Path
 	if !filepath.IsAbs(rigPath) {
 		rigPath = filepath.Join(c.cityPath, rigPath)
-	}
-	// MySQL-backed cities (and their rigs, which inherit the backend)
-	// have no managed Dolt — bd connects directly to MySQL via
-	// .beads/config.yaml. Skip dolt-target resolution and ping the
-	// store directly.
-	if scopeUsesMySQLBackend(rigPath) || scopeUsesMySQLBackend(c.cityPath) {
-		store, err := c.newStore(rigPath)
-		if err != nil {
-			r.Status = StatusError
-			r.Message = fmt.Sprintf("store open failed: %v", err)
-			return r
-		}
-		if err := store.Ping(); err != nil {
-			r.Status = StatusError
-			r.Message = fmt.Sprintf("store ping failed: %v", err)
-			return r
-		}
-		r.Status = StatusOK
-		r.Message = "store accessible (mysql backend)"
-		return r
 	}
 	target, fixHint, active, err := validateBDStoreTarget(c.cityPath, rigPath)
 	if err != nil {
@@ -2159,11 +2073,6 @@ func managedLocalDoltChecksApplicable(cityPath string) bool {
 	if strings.TrimSpace(cityPath) == "" {
 		return true
 	}
-	// Shared-server cities don't have managed local dolt — skip these checks.
-	cfgPath := filepath.Join(cityPath, ".beads", "config.yaml")
-	if shared, _ := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath); shared {
-		return false
-	}
 
 	cityConfigPath := filepath.Join(cityPath, "city.toml")
 	cityHasConfig := false
@@ -2524,26 +2433,17 @@ type DoltConfigExpectedValue struct {
 // follows the same GC_DOLT_WAIT_TIMEOUT environment override as config
 // generation. Dynamic values such as data_dir are checked by DoltConfigCheck
 // because they depend on the inspected city path.
-//
-// Auto-gc and autocommit are configurable: their expected values follow the
-// same resolution chain as the writer (env → city.toml [dolt] → ~/.gc/dolt-config.yaml
-// → defaults). Pass cityPath="" for static defaults (auto_gc=true,
-// autocommit=false/batch).
 func DoltConfigExpectedValues() []DoltConfigExpectedValue {
-	return DoltConfigExpectedValuesForCity("")
+	return DoltConfigExpectedValuesForConfig(config.DoltConfig{})
 }
 
-// DoltConfigExpectedValuesForCity returns expected dolt-config.yaml values
-// after resolving auto_gc and autocommit from env/city/global config.
-func DoltConfigExpectedValuesForCity(cityPath string) []DoltConfigExpectedValue {
-	autoGcEnable, autoGcSysVar := resolveExpectedAutoGc(cityPath)
-	autocommit := resolveExpectedAutocommit(cityPath)
-	doltConfig := resolveExpectedDoltConfig(cityPath)
+// DoltConfigExpectedValuesForConfig returns the managed Dolt config contract
+// after applying city-level [dolt] overrides.
+func DoltConfigExpectedValuesForConfig(doltConfig config.DoltConfig) []DoltConfigExpectedValue {
 	values := []DoltConfigExpectedValue{
-		{"behavior.autocommit", autocommit},
-		{"behavior.auto_gc_behavior.enable", autoGcEnable},
-		{"behavior.auto_gc_behavior.archive_level", 0},
-		{"system_variables.dolt_auto_gc_enabled", autoGcSysVar},
+		{"behavior.auto_gc_behavior.enable", doltConfig.EffectiveAutoGCEnabled()},
+		{"behavior.auto_gc_behavior.archive_level", doltConfig.EffectiveArchiveLevel()},
+		{"system_variables.dolt_auto_gc_enabled", doltConfig.AutoGCSysVar()},
 		{"system_variables.dolt_stats_enabled", "OFF"},
 		{"system_variables.dolt_stats_gc_enabled", "OFF"},
 		{"system_variables.dolt_stats_memory_only", "ON"},
@@ -2577,99 +2477,6 @@ func managedDoltConfigExpectedWaitTimeout() int {
 		return 0
 	}
 	return n
-}
-
-// resolveExpectedDoltConfig returns the DoltConfig used to compute Effective*
-// listener fields, walking the same priority chain as the writer: city.toml
-// [dolt] → ~/.gc/city.toml [dolt] → zero value.
-func resolveExpectedDoltConfig(cityPath string) config.DoltConfig {
-	if cityPath != "" {
-		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); err == nil && cfg != nil {
-			return cfg.Dolt
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(home, ".gc", "city.toml")); err == nil && cfg != nil {
-			return cfg.Dolt
-		}
-	}
-	return config.DoltConfig{}
-}
-
-// resolveExpectedAutoGc returns (behavior.auto_gc_behavior.enable,
-// system_variables.dolt_auto_gc_enabled) per the same priority chain as the
-// writer in cmd/gc/cmd_dolt_config.go: env GC_DOLT_AUTO_GC → city.toml [dolt]
-// auto_gc → ~/.gc/dolt-config.yaml dolt.auto_gc → default (true / "ON").
-func resolveExpectedAutoGc(cityPath string) (bool, string) {
-	enabled := resolveAutoGcExpectedBool(cityPath)
-	if enabled {
-		return true, "ON"
-	}
-	return false, "OFF"
-}
-
-func resolveAutoGcExpectedBool(cityPath string) bool {
-	if v, ok := parseAutoGcConfigValue(os.Getenv("GC_DOLT_AUTO_GC")); ok {
-		return v
-	}
-	if cityPath != "" {
-		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); err == nil && cfg != nil {
-			if v, ok := parseAutoGcConfigValue(cfg.Dolt.AutoGc); ok {
-				return v
-			}
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(home, ".gc", "city.toml")); err == nil && cfg != nil {
-			if v, ok := parseAutoGcConfigValue(cfg.Dolt.AutoGc); ok {
-				return v
-			}
-		}
-	}
-	return true
-}
-
-// resolveExpectedAutocommit returns the expected behavior.autocommit boolean
-// using the same chain as the writer.
-func resolveExpectedAutocommit(cityPath string) bool {
-	if v, ok := parseAutocommitConfigValue(os.Getenv("GC_DOLT_AUTOCOMMIT")); ok {
-		return v
-	}
-	if cityPath != "" {
-		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); err == nil && cfg != nil {
-			if v, ok := parseAutocommitConfigValue(cfg.Dolt.Autocommit); ok {
-				return v
-			}
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if cfg, err := config.Load(fsys.OSFS{}, filepath.Join(home, ".gc", "city.toml")); err == nil && cfg != nil {
-			if v, ok := parseAutocommitConfigValue(cfg.Dolt.Autocommit); ok {
-				return v
-			}
-		}
-	}
-	return false
-}
-
-func parseAutoGcConfigValue(raw string) (bool, bool) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "true", "on", "enabled", "yes", "1":
-		return true, true
-	case "false", "off", "disabled", "no", "0":
-		return false, true
-	}
-	return false, false
-}
-
-func parseAutocommitConfigValue(raw string) (bool, bool) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "on", "true", "yes", "1":
-		return true, true
-	case "batch", "off", "false", "no", "0":
-		return false, true
-	}
-	return false, false
 }
 
 // lookupYAMLPath walks a dotted key path through a decoded YAML map and
@@ -2787,7 +2594,7 @@ func (c *DoltConfigCheck) Run(_ *CheckContext) *CheckResult {
 	}
 
 	var drifted []string
-	for _, exp := range DoltConfigExpectedValuesForCity(c.cityPath) {
+	for _, exp := range DoltConfigExpectedValuesForConfig(c.doltConfig) {
 		got, present := lookupYAMLPath(doc, exp.Path)
 		if !present {
 			drifted = append(drifted, exp.Path+" (missing)")

@@ -53,6 +53,7 @@ MAX_AGE="${GC_REAPER_MAX_AGE:-24h}"
 PURGE_AGE="${GC_REAPER_PURGE_AGE:-168h}"
 STALE_ISSUE_AGE="${GC_REAPER_STALE_ISSUE_AGE:-720h}"
 SESSION_PURGE_AGE="${GC_REAPER_SESSION_PURGE_AGE:-720h}"
+SESSION_BEAD_PATTERN="${GC_REAPER_SESSION_BEAD_PATTERN-gm-*}"
 SESSION_STATE_PRUNE_AGE="${GC_REAPER_SESSION_STATE_PRUNE_AGE:-24h}"
 ALERT_THRESHOLD="${GC_REAPER_ALERT_THRESHOLD:-500}"
 MAIL_ALERT_THRESHOLD="${GC_REAPER_MAIL_ALERT_THRESHOLD:-0}"  # 0 = disabled
@@ -519,10 +520,17 @@ has_dependency_target_column() {
         return 0
     fi
 
-    printf '%s\n' "$fields" | grep -qx 'issue_id' || return 1
-    printf '%s\n' "$fields" | grep -qx 'depends_on_issue_id' || return 1
-    printf '%s\n' "$fields" | grep -qx 'depends_on_wisp_id' || return 1
-    printf '%s\n' "$fields" | grep -qx 'depends_on_external' || return 1
+    # Check membership with a here-string, never `printf ... | grep -q`. `grep -q`
+    # closes its stdin the instant it matches, so the upstream `printf` races into
+    # a SIGPIPE; under `set -o pipefail` that SIGPIPE becomes the pipeline's exit
+    # status and `|| return 1` fires spuriously, making the reaper skip the whole
+    # database's workflow-root cleanup. A here-string is a simple command
+    # (pipefail does not apply) with no upstream writer to kill.
+    local field
+    for field in issue_id depends_on_issue_id depends_on_wisp_id depends_on_external; do
+        grep -qx "$field" <<<"$fields" || return 1
+    done
+    return 0
 }
 
 workflow_root_candidates_cte() {
@@ -772,6 +780,7 @@ while IFS= read -r DB; do
     get_sql_count "$DB" "stale non-closed wisp" "
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status IN ('open', 'hooked', 'in_progress')
+        AND issue_type NOT IN ('message')
         AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
     "
     STALE_WISP_COUNT=$SQL_COUNT_RESULT
@@ -1104,27 +1113,62 @@ done <<EOF
 $DATABASES
 EOF
 
-# Step 6: prune closed gm session beads from the city's primary bead store.
-if [ -d "$CITY_BEADS_DIR" ] && command -v bd >/dev/null 2>&1; then
+# Step 6: prune closed session beads from the city's primary bead store.
+# GC_REAPER_SESSION_BEAD_PATTERN defaults to 'gm-*' (legacy Gas Manager prefix).
+# Set to empty string to activate the type-safe SQL path (targets issue_type=session only).
+if [ -d "$CITY_BEADS_DIR" ]; then
     SESSION_PRUNE_ATTEMPTED=1
-    BD_PRUNE_ARGS=(prune --pattern 'gm-*' --older-than "$SESSION_PURGE_AGE")
-    if [ -z "$DRY_RUN" ]; then
-        BD_PRUNE_ARGS+=(--force)
-    fi
-    BD_PRUNE_ARGS+=(--json)
-
-    if PRUNE_JSON=$( (
-        cd "$CITY_ABS" && BEADS_DIR="$CITY_BEADS_DIR" bd "${BD_PRUNE_ARGS[@]}"
-    ) 2>/dev/null); then
-        :
+    if [ -n "$SESSION_BEAD_PATTERN" ]; then
+        # ── bd prune path (existing behaviour, now pattern-configurable) ──────
+        SESSION_PRUNE_ANOMALY_SCOPE="session"
+        case "$SESSION_BEAD_PATTERN" in
+            *-*) SESSION_PRUNE_ANOMALY_SCOPE="${SESSION_BEAD_PATTERN%%-*}" ;;
+        esac
+        BD_PRUNE_ARGS=(prune --pattern "$SESSION_BEAD_PATTERN" --older-than "$SESSION_PURGE_AGE")
+        if [ -z "$DRY_RUN" ]; then BD_PRUNE_ARGS+=(--force); fi
+        BD_PRUNE_ARGS+=(--json)
+        if PRUNE_JSON=$( ( cd "$CITY_ABS" && BEADS_DIR="$CITY_BEADS_DIR" bd "${BD_PRUNE_ARGS[@]}" ) 2>/dev/null ); then :
+        else PRUNE_JSON='{"pruned_count":0}'; fi
+        PRUNE_COUNT=$(printf '%s' "$PRUNE_JSON" | sed -n 's/.*"pruned_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+        [ -z "$PRUNE_COUNT" ] && PRUNE_COUNT=0
+        TOTAL_SESSIONS_PRUNED=$PRUNE_COUNT
+        if [ "$PRUNE_COUNT" -gt 1000 ]; then
+            record_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "$PRUNE_COUNT closed session beads pruned (pattern=$SESSION_BEAD_PATTERN threshold: 1000)"
+        fi
     else
-        PRUNE_JSON='{"pruned_count":0}'
-    fi
-    PRUNE_COUNT=$(printf '%s' "$PRUNE_JSON" | sed -n 's/.*"pruned_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
-    [ -z "$PRUNE_COUNT" ] && PRUNE_COUNT=0
-    TOTAL_SESSIONS_PRUNED=$PRUNE_COUNT
-    if [ "$PRUNE_COUNT" -gt 1000 ]; then
-        record_anomaly "gm" "$PRUNE_COUNT closed session beads pruned in one run (threshold: 1000)"
+        # ── type-safe SQL path (issue_type=session only) ──────────────────────
+        # Activated when GC_REAPER_SESSION_BEAD_PATTERN="". Targets only rows
+        # with issue_type='session' so it cannot accidentally prune non-session beads.
+        SESSION_AGE_H=$(printf '%s' "$SESSION_PURGE_AGE" | sed 's/h$//')
+        if [ -z "$CITY_DB" ]; then
+            record_anomaly "session" "type-safe SQL path: city database unresolved — skipping"
+        else
+            if [ -n "$DRY_RUN" ]; then
+                RAW=$(dolt_sql -r csv -q "USE \`${CITY_DB}\`; SELECT COUNT(*) FROM issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(NOW(), INTERVAL ${SESSION_AGE_H} HOUR);") 2>/dev/null || RAW=""
+                COUNT=$(printf '%s\n' "$RAW" | tail -n +2 | tr -d ',' | grep -v '^$' | head -1)
+                TOTAL_SESSIONS_PRUNED="${COUNT:-0}"
+            else
+                TOTAL=0
+                while true; do
+                    RAW=$(dolt_sql -r csv -q "USE \`${CITY_DB}\`; SELECT id FROM issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(NOW(), INTERVAL ${SESSION_AGE_H} HOUR) LIMIT 500;") 2>/dev/null || break
+                    BATCH_IDS=$(printf '%s\n' "$RAW" | tail -n +2 | grep -v '^$')
+                    BATCH_COUNT=$(printf '%s\n' "$BATCH_IDS" | grep -c . || true)
+                    [ "$BATCH_COUNT" -gt 0 ] || break
+                    SQL_IDS=$(printf '%s\n' "$BATCH_IDS" | sed "s/.*/'&'/" | tr '\n' ',' | sed 's/,$//')
+                    dolt_sql -r csv -q "USE \`${CITY_DB}\`;
+DELETE FROM labels WHERE issue_id IN (${SQL_IDS});
+DELETE FROM dependencies WHERE issue_id IN (${SQL_IDS}) OR depends_on_issue_id IN (${SQL_IDS});
+DELETE FROM issues WHERE id IN (${SQL_IDS});
+CALL DOLT_COMMIT('-A', '-m', 'reaper: session_beads_pruned=${BATCH_COUNT} type=session age>${SESSION_AGE_H}h', '--author', 'reaper <reaper@gascity.local>');" >/dev/null \
+                        || { record_anomaly "session" "SQL cascade failed at offset $TOTAL"; break; }
+                    TOTAL=$((TOTAL + BATCH_COUNT))
+                done
+                TOTAL_SESSIONS_PRUNED=$TOTAL
+                if [ "$TOTAL_SESSIONS_PRUNED" -gt 1000 ]; then
+                    record_anomaly "session" "$TOTAL_SESSIONS_PRUNED closed session beads pruned via SQL path (threshold: 1000)"
+                fi
+            fi
+        fi
     fi
 fi
 

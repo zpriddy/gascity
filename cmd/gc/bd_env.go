@@ -280,6 +280,26 @@ func canonicalScopeDoltTarget(cityPath, scopeRoot string) (contract.DoltConnecti
 	return target, true, nil
 }
 
+// canonicalScopeDoltProjectionAuthoritative reports whether canonical
+// Dolt projection would resolve auth for the city scope: the scope
+// backend is not postgres and the scope config resolves authoritative —
+// the same ResolveScopeConfigState gate applyOrderExecCanonicalDoltEnv
+// and its managed fallback apply before calling
+// applyCanonicalDoltAuthEnv. Callers that feed ambient environments
+// into the projection use this to strip untrusted password mirrors
+// from the resolution input without breaking the strict no-op
+// pass-through for non-authoritative scopes.
+func canonicalScopeDoltProjectionAuthoritative(cityPath string) bool {
+	if scopeBackendIsPostgres(cityPath, cityPath) {
+		return false
+	}
+	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, cityPath, "")
+	if err != nil {
+		return false
+	}
+	return resolved.Kind == contract.ScopeConfigAuthoritative
+}
+
 func applyCanonicalDoltTargetEnv(env map[string]string, target contract.DoltConnectionTarget) {
 	if env == nil {
 		return
@@ -720,6 +740,35 @@ func appendBdAutoBackupOptOutEnvKeys(keys []string) []string {
 	return keys
 }
 
+// bdContributorRoutingOptOutEnvKeys disables bd's fork/contributor
+// auto-routing for gc-managed bd invocations. When a gcy-style store has
+// routing.mode=auto and routing.contributor=~/.beads-planning persisted in
+// its .beads config, upstream bd silently routes `create`/`list`/`update`
+// to that out-of-band "planning" store while `show` (prefix-routed) and gc's
+// in-process dispatch (sling/scale-check/hook pickup, which open the scope
+// store directly via openCityStoreAt) keep reading the scope store. The
+// result is a three-way split brain: a bead that `bd list --rig` shows is
+// invisible to `bd show` and unresolvable by `gc sling`. gc owns scope→store
+// resolution itself (BEADS_DIR + the rig registry), so contributor routing is
+// pure downside here. Forcing routing.mode=off via the env override (which
+// beadslib's getRoutingConfigValue / resolveRoutingConfigValue honor ahead of
+// the persisted DB value) makes every gc-managed bd subcommand operate on the
+// scope's own store — the same store sling and show already use.
+//
+// BD_ROUTING_MODE is the key bd's BD-prefixed Viper env binding consumes;
+// BEADS_ROUTING_MODE is kept as a compatibility alias only.
+var bdContributorRoutingOptOutEnvKeys = [...]string{
+	"BD_ROUTING_MODE",
+	"BEADS_ROUTING_MODE",
+}
+
+func appendBdContributorRoutingOptOutEnvKeys(keys []string) []string {
+	for _, key := range bdContributorRoutingOptOutEnvKeys {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 var (
 	beadsExecCommandRunnerWithEnv             = beads.ExecCommandRunnerWithEnv
 	processEnvSnapshotExcludingNativeDoltOpen = beads.ProcessEnvSnapshotExcludingNativeDoltOpen
@@ -731,6 +780,7 @@ var recoverManagedBDCommand = func(cityPath string) error {
 	setProjectedDoltEnvEmpty(overrides)
 	applyBdCLIRemoteSyncOptOut(overrides)
 	applyBdAutoBackupOptOut(overrides)
+	applyBdContributorRoutingOptOut(overrides)
 	environ := mergeRuntimeEnv(processEnvSnapshotExcludingNativeDoltOpen(), overrides)
 	environ = append(environ, providerLifecycleDoltPathEnv(cityPath)...)
 	if gcBin := resolveProviderLifecycleGCBinary(); gcBin != "" {
@@ -1397,6 +1447,12 @@ func bdRuntimeEnvWithError(cityPath string) (map[string]string, error) {
 	// stall bd create / gc mail send for the full 2m subprocess timeout on
 	// large datasets.
 	env["BD_EXPORT_AUTO"] = "false"
+	// Disable bd's fork/contributor auto-routing. Without this, a store with
+	// routing.mode=auto + routing.contributor (gcy's ~/.beads-planning) sends
+	// bd create/list/update to that out-of-band store while gc's in-process
+	// dispatch (sling) and bd show read the scope store — a three-way split
+	// brain. See bdContributorRoutingOptOutEnvKeys.
+	applyBdContributorRoutingOptOut(env)
 	applyBdCLIRemoteSyncOptOut(env)
 	// Suppress bd's PersistentPostRun auto-backup (the "backup_export" Dolt
 	// remote). Like BD_EXPORT_AUTO above, the env var is the bulletproof
@@ -1405,10 +1461,6 @@ func bdRuntimeEnvWithError(cityPath string) (map[string]string, error) {
 	// stuck-looping backup_export sync wedged the whole town on 2026-06-08
 	// (ga-0eq); managed backups run through mol-dog-backup, not this path.
 	applyBdAutoBackupOptOut(env)
-	// Opt-in: route bd through the pooling db-proxy (no-op unless [beads] proxied
-	// and bd supports it). Covers agent AND controller bd calls (rig env builds
-	// on this base).
-	applyProxiedPoolEnv(env, cityPath)
 	if !cityUsesBdStoreContract(cityPath) {
 		return env, nil
 	}
@@ -1461,6 +1513,7 @@ func cityRuntimeProcessEnvWithError(cityPath string) ([]string, error) {
 	var projectionErr error
 	if cityUsesBdStoreContract(cityPath) {
 		source := map[string]string{"BEADS_DOLT_AUTO_START": "0"}
+		applyBdContributorRoutingOptOut(source)
 		applyBdCLIRemoteSyncOptOut(source)
 		applyBdAutoBackupOptOut(source)
 		if cityUsesMySQLBackend(cityPath) {
@@ -1485,9 +1538,6 @@ func cityRuntimeProcessEnvWithError(cityPath string) ([]string, error) {
 			}
 		}
 	}
-	// Opt-in: carry the proxied/pool env to the gc-beads-bd provider script and
-	// any bd it forks (no-op unless [beads] proxied and bd supports it).
-	applyProxiedPoolEnv(overrides, cityPath)
 	return mergeRuntimeEnv(processEnvSnapshotExcludingNativeDoltOpen(), overrides), projectionErr
 }
 
@@ -1510,6 +1560,20 @@ func applyBdAutoBackupOptOut(env map[string]string) {
 	}
 	for _, key := range bdAutoBackupOptOutEnvKeys {
 		env[key] = "false"
+	}
+}
+
+// applyBdContributorRoutingOptOut forces bd's fork/contributor auto-routing
+// off for gc-managed bd invocations. It overrides any ambient or per-scope
+// routing.mode=auto config so a gcy-style store cannot siphon create/list/
+// update to ~/.beads-planning while sling/show read the scope store — the
+// three-way split brain documented on bdContributorRoutingOptOutEnvKeys.
+func applyBdContributorRoutingOptOut(env map[string]string) {
+	if env == nil {
+		return
+	}
+	for _, key := range bdContributorRoutingOptOutEnvKeys {
+		env[key] = "off"
 	}
 }
 
@@ -1571,6 +1635,7 @@ func overlayEnvEntries(environ []string, overrides map[string]string) []string {
 		out = removeEnvKey(out, key)
 		out = append(out, key+"="+overrides[key])
 	}
+	out = preserveHostedBeadsCredentialEnv(out, environ, overrides)
 	return out
 }
 
@@ -1613,6 +1678,7 @@ func mergeRuntimeEnv(environ []string, overrides map[string]string) []string {
 	}
 	keys = appendBdCLIRemoteSyncOptOutEnvKeys(keys)
 	keys = appendBdAutoBackupOptOutEnvKeys(keys)
+	keys = appendBdContributorRoutingOptOutEnvKeys(keys)
 	if len(overrides) > 0 {
 		for key := range overrides {
 			if !containsString(keys, key) {
@@ -1632,6 +1698,45 @@ func mergeRuntimeEnv(environ []string, overrides map[string]string) []string {
 	sort.Strings(overrideKeys)
 	for _, key := range overrideKeys {
 		out = append(out, key+"="+overrides[key])
+	}
+	out = preserveHostedBeadsCredentialEnv(out, environ, overrides)
+	return out
+}
+
+// hostedBeadsCredentialPassthroughKeys are env vars the bd provider needs to
+// authenticate to a hosted beads-gateway: the credential command and the inputs
+// its helper (e.g. eia-helper) reads. Several contain execenv.IsSensitiveKey
+// markers (CREDENTIAL / TOKEN) and would otherwise be stripped by
+// FilterInherited, but they carry command/URL/path references — not secret
+// values (the orchestrator key itself stays in a file mount) — so they are
+// preserved explicitly for gc-spawned bd subprocesses.
+var hostedBeadsCredentialPassthroughKeys = []string{
+	"BEADS_DOLT_CREDENTIAL_COMMAND",
+	"BEADS_DOLT_SERVER_TLS",
+	"ORCHESTRATOR_KEY_FILE",
+	"EIA_AUDIENCE",
+	"EIA_SCOPES",
+	"STS_MACHINE_URL",
+	"STS_TOKEN_URL",
+}
+
+// preserveHostedBeadsCredentialEnv re-adds the hosted-gateway credential env
+// from the original (pre-filter) environ, unless an override already set the
+// key. Without this, FilterInherited drops the credential command (and the
+// STS token URL) and gc-spawned bd cannot reach a hosted beads-gateway.
+func preserveHostedBeadsCredentialEnv(out, environ []string, overrides map[string]string) []string {
+	for _, key := range hostedBeadsCredentialPassthroughKeys {
+		if _, ok := overrides[key]; ok {
+			continue
+		}
+		prefix := key + "="
+		for _, entry := range environ {
+			if strings.HasPrefix(entry, prefix) {
+				out = removeEnvKey(out, key)
+				out = append(out, entry)
+				break
+			}
+		}
 	}
 	return out
 }

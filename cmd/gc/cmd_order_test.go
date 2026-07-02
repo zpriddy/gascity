@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/formulatest"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/orders"
 )
 
@@ -368,6 +370,7 @@ schedule = "*/5 * * * *"
 func TestScanAllOrdersRemoteImportedFlatPackOrders(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := t.TempDir()
 	source := "https://github.com/example/orders-pack.git"
@@ -632,7 +635,7 @@ func TestOrderCheckWithStoresResolverRejectsReservedOrderEnvKey(t *testing.T) {
 		aa,
 		time.Date(2026, 2, 27, 12, 0, 0, 0, time.UTC),
 		nil,
-		func(orders.Order) ([]beads.Store, error) { return nil, nil },
+		func(orders.Order) ([]beads.OrdersStore, error) { return nil, nil },
 		&stdout,
 		&stderr,
 	)
@@ -762,11 +765,11 @@ func TestOrderCheckWithStoresResolverUsesRigStore(t *testing.T) {
 		Interval: "24h",
 		Formula:  "mol-digest",
 	}}
-	resolver := func(a orders.Order) ([]beads.Store, error) {
+	resolver := func(a orders.Order) ([]beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return []beads.Store{rigStore}, nil
+			return []beads.OrdersStore{{Store: rigStore}}, nil
 		}
-		return []beads.Store{cityStore}, nil
+		return []beads.OrdersStore{{Store: cityStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -796,11 +799,11 @@ func TestOrderCheckWithStoresResolverUsesLegacyCityStore(t *testing.T) {
 		Interval: "24h",
 		Formula:  "mol-digest",
 	}}
-	resolver := func(a orders.Order) ([]beads.Store, error) {
+	resolver := func(a orders.Order) ([]beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return []beads.Store{rigStore, cityStore}, nil
+			return []beads.OrdersStore{{Store: rigStore}, {Store: cityStore}}, nil
 		}
-		return []beads.Store{cityStore}, nil
+		return []beads.OrdersStore{{Store: cityStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -830,8 +833,8 @@ func TestOrderCheckConditionUsesCityScope(t *testing.T) {
 		Pool:    "workflows.pr-review-router",
 		Source:  filepath.Join(orderDir, "pr-review-router.toml"),
 	}}
-	resolver := func(orders.Order) ([]beads.Store, error) {
-		return []beads.Store{beads.NewMemStore()}, nil
+	resolver := func(orders.Order) ([]beads.OrdersStore, error) {
+		return []beads.OrdersStore{{Store: beads.NewMemStore()}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -860,11 +863,11 @@ func TestOrderCheckWithStoresResolverFailsWhenLegacyEventCursorReadFails(t *test
 		On:      events.BeadClosed,
 		Formula: "mol-watch",
 	}}
-	resolver := func(a orders.Order) ([]beads.Store, error) {
+	resolver := func(a orders.Order) ([]beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return []beads.Store{rigStore, legacyStore}, nil
+			return []beads.OrdersStore{{Store: rigStore}, {Store: legacyStore}}, nil
 		}
-		return []beads.Store{rigStore}, nil
+		return []beads.OrdersStore{{Store: rigStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -891,11 +894,11 @@ func TestOrderCheckWithStoresResolverFailsWhenLegacyLastRunReadFails(t *testing.
 		Interval: "24h",
 		Formula:  "mol-digest",
 	}}
-	resolver := func(a orders.Order) ([]beads.Store, error) {
+	resolver := func(a orders.Order) ([]beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return []beads.Store{rigStore, legacyStore}, nil
+			return []beads.OrdersStore{{Store: rigStore}, {Store: legacyStore}}, nil
 		}
-		return []beads.Store{rigStore}, nil
+		return []beads.OrdersStore{{Store: rigStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -918,7 +921,7 @@ func TestOrderRun(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -935,6 +938,89 @@ func TestOrderRun(t *testing.T) {
 	}
 }
 
+// orderRunGraphApplySpy is a graph-apply-capable store that records whether
+// ApplyGraphPlan was invoked. Unlike graphApplySpyStore it creates real beads
+// in the embedded MemStore so the manual order-run path can label the wisp root
+// and record its tracking bead after instantiation. It implements
+// beads.GraphApplyStore.
+type orderRunGraphApplySpy struct {
+	*beads.MemStore
+	applied bool
+}
+
+func (s *orderRunGraphApplySpy) ApplyGraphPlan(_ context.Context, plan *beads.GraphApplyPlan) (*beads.GraphApplyResult, error) {
+	s.applied = true
+	ids := make(map[string]string, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		created, err := s.Create(beads.Bead{
+			Title:    node.Title,
+			Type:     node.Type,
+			Labels:   node.Labels,
+			Metadata: node.Metadata,
+		})
+		if err != nil {
+			return nil, err
+		}
+		ids[node.Key] = created.ID
+	}
+	return &beads.GraphApplyResult{IDs: ids}, nil
+}
+
+// TestOrderRunUsesGraphApplyThroughOrdersStore pins the fix for the manual
+// `gc order run` graph-apply regression: openOrderStoreForOrder hands
+// doOrderRunWithJSON a beads.OrdersStore wrapper, and typed wrappers do not
+// promote optional capabilities, so passing the wrapper straight into
+// molecule.Instantiate hides the underlying GraphApplyStore and silently falls
+// back to sequential creation. The path must unwrap to store.Store at the
+// generic molecule/graph-routing boundary so graph apply is used when enabled,
+// matching the controller dispatch path.
+func TestOrderRunUsesGraphApplyThroughOrdersStore(t *testing.T) {
+	aa := []orders.Order{
+		{Name: "digest", Formula: "mol-digest", Trigger: "cooldown", Interval: "24h", Pool: "dog", FormulaLayer: sharedTestFormulaDir},
+	}
+
+	prevGraphApply := molecule.IsGraphApplyEnabled()
+	molecule.SetGraphApplyEnabled(true)
+	t.Cleanup(func() { molecule.SetGraphApplyEnabled(prevGraphApply) })
+
+	spy := &orderRunGraphApplySpy{MemStore: beads.NewMemStore()}
+
+	var stdout, stderr bytes.Buffer
+	code := doOrderRun(aa, "digest", "", "/city", beads.OrdersStore{Store: spy}, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !spy.applied {
+		t.Fatal("ApplyGraphPlan was not invoked — graph apply capability lost through the beads.OrdersStore wrapper")
+	}
+}
+
+func TestOrderRunFormulaRecordsTrackingBead(t *testing.T) {
+	aa := []orders.Order{
+		{Name: "digest", Formula: "mol-digest", Trigger: "cooldown", Interval: "24h", Pool: "dog", FormulaLayer: sharedTestFormulaDir},
+	}
+	store := beads.NewMemStore()
+
+	var stdout, stderr bytes.Buffer
+	if code := doOrderRun(aa, "digest", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	tracking, err := store.ListByLabel(labelOrderTracking, 0, beads.IncludeClosed, beads.WithBothTiers)
+	if err != nil {
+		t.Fatalf("store.ListByLabel(%s): %v", labelOrderTracking, err)
+	}
+	if len(tracking) != 1 {
+		t.Fatalf("order-tracking beads = %d, want 1 (%#v)", len(tracking), tracking)
+	}
+	if !beadLabelsContain(tracking[0].Labels, "order-run:digest") {
+		t.Fatalf("tracking bead labels = %v, want order-run:digest", tracking[0].Labels)
+	}
+	if tracking[0].Status != "closed" {
+		t.Fatalf("tracking bead status = %q, want closed", tracking[0].Status)
+	}
+}
+
 func TestOrderRunJSONFormulaSummary(t *testing.T) {
 	aa := []orders.Order{
 		{Name: "digest", Formula: "mol-digest", Trigger: "cooldown", Interval: "24h", Pool: "dog", FormulaLayer: sharedTestFormulaDir},
@@ -943,7 +1029,7 @@ func TestOrderRunJSONFormulaSummary(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRunWithJSON(aa, "digest", "", "/city", store, nil, true, &stdout, &stderr)
+	code := doOrderRunWithJSON(aa, "digest", "", "/city", beads.OrdersStore{Store: store}, nil, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRunWithJSON = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -957,7 +1043,7 @@ func TestOrderRunJSONFormulaSummary(t *testing.T) {
 
 func TestOrderRunHonorsFormulaV2DisabledCity(t *testing.T) {
 	t.Cleanup(func() {
-		applyFeatureFlags(&config.City{Daemon: config.DaemonConfig{FormulaV2: true}})
+		applyFeatureFlags(&config.City{Daemon: config.DaemonConfig{FormulaV2: boolPtr(true)}})
 	})
 
 	cityDir := t.TempDir()
@@ -981,8 +1067,13 @@ formula = "graph-work"
 formula_compiler = ">=2.0.0"
 
 [[steps]]
+id = "prepare"
+title = "Prepare workflow"
+
+[[steps]]
 id = "step"
 title = "Do work"
+depends_on = ["prepare"]
 `
 	if err := os.WriteFile(filepath.Join(formulaDir, "graph-work.toml"), []byte(graphFormula), 0o644); err != nil {
 		t.Fatal(err)
@@ -994,7 +1085,7 @@ title = "Do work"
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "blocked", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "blocked", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRun = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
 	}
@@ -1016,7 +1107,7 @@ func TestOrderRunJSONRejectsExecWithoutRunning(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRunWithJSON(aa, "release-exec", "", "/city", beads.NewMemStore(), nil, true, &stdout, &stderr)
+	code := doOrderRunWithJSON(aa, "release-exec", "", "/city", beads.OrdersStore{Store: beads.NewMemStore()}, nil, true, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRunWithJSON exec = %d, want 1", code)
 	}
@@ -1051,7 +1142,7 @@ name = "test-city"
 	}}
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "release-exec", "", cityDir, store, eventLog, &stdout, &stderr)
+	code := doOrderRun(aa, "release-exec", "", cityDir, beads.OrdersStore{Store: store}, eventLog, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1185,7 +1276,7 @@ prefix = "fe"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdOrderSweepTracking(time.Nanosecond, false, false, []string{"rig-digest:rig:frontend"}, &stdout, &stderr)
+	code := cmdOrderSweepTrackingWithOptions(time.Nanosecond, false, false, false, []string{"rig-digest:rig:frontend"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdOrderSweepTracking = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1251,7 +1342,7 @@ prefix = "fe"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdOrderSweepTracking(time.Nanosecond, false, false, []string{"cleanup"}, &stdout, &stderr)
+	code := cmdOrderSweepTrackingWithOptions(time.Nanosecond, false, false, false, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdOrderSweepTracking = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1315,7 +1406,7 @@ prefix = "ct"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdOrderSweepTracking(time.Nanosecond, false, false, nil, &stdout, &stderr)
+	code := cmdOrderSweepTrackingWithOptions(time.Nanosecond, false, false, false, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdOrderSweepTracking = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1389,7 +1480,7 @@ delete_after_close = "1ns"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdOrderSweepTracking(time.Hour, false, false, nil, &stdout, &stderr)
+	code := cmdOrderSweepTrackingWithOptions(time.Hour, false, false, false, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdOrderSweepTracking = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1472,7 +1563,7 @@ delete_after_close = "1ns"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdOrderSweepTracking(time.Hour, true, false, nil, &stdout, &stderr)
+	code := cmdOrderSweepTrackingWithOptions(time.Hour, true, false, false, nil, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("cmdOrderSweepTracking = 0, want failure")
 	}
@@ -1488,6 +1579,132 @@ delete_after_close = "1ns"
 		if _, err := reopened.Get(id); err != nil {
 			t.Fatalf("%s should be preserved after invalid command: %v", id, err)
 		}
+	}
+}
+
+func TestCmdOrderSweepTrackingTargetedCityOrderSkipsUnrelatedRigStore(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	t.Setenv("GC_CITY_ROOT", cityDir)
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	t.Chdir(cityDir)
+
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `[workspace]
+name = "test-city"
+prefix = "ct"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "fe"
+`)
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(city): %v", err)
+	}
+	stale, err := store.Create(beads.Bead{
+		Title:     "order:cleanup",
+		Labels:    []string{"order-run:cleanup", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(stale): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdOrderSweepTrackingWithOptions(time.Nanosecond, false, false, false, []string{"cleanup"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdOrderSweepTracking = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	reopened, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(city reopen): %v", err)
+	}
+	got, err := reopened.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(stale): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("city stale tracking status after targeted sweep = %q, want closed", got.Status)
+	}
+	if strings.Contains(stderr.String(), "opening rig \"frontend\" order store") {
+		t.Fatalf("stderr = %q, want targeted city sweep to skip unrelated rig store", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "closed 1 stale order-tracking bead") {
+		t.Fatalf("stdout = %q, want one closed tracking bead", stdout.String())
+	}
+}
+
+func TestCmdOrderSweepTrackingDryRunReportsWithoutClosing(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	t.Setenv("GC_CITY_ROOT", cityDir)
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	t.Chdir(cityDir)
+
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `[workspace]
+name = "test-city"
+prefix = "ct"
+`)
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(city): %v", err)
+	}
+	stale, err := store.Create(beads.Bead{
+		Title:     "order:cleanup",
+		Labels:    []string{"order-run:cleanup", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(stale): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdOrderSweepTrackingWithOptions(time.Nanosecond, false, true, false, []string{"cleanup"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdOrderSweepTrackingWithOptions = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	reopened, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(city reopen): %v", err)
+	}
+	got, err := reopened.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(stale): %v", err)
+	}
+	if got.Status != "open" {
+		t.Fatalf("stale tracking status after dry-run = %q, want open", got.Status)
+	}
+	if !strings.Contains(stdout.String(), "would close 1 stale order-tracking bead") {
+		t.Fatalf("stdout = %q, want dry-run tracking candidate", stdout.String())
 	}
 }
 
@@ -1524,7 +1741,7 @@ prefix = "fe"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdOrderSweepTracking(time.Nanosecond, false, false, []string{"rig-digest:rig:frontend"}, &stdout, &stderr)
+	code := cmdOrderSweepTrackingWithOptions(time.Nanosecond, false, false, false, []string{"rig-digest:rig:frontend"}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("cmdOrderSweepTracking = 0, want failure; stdout: %s stderr: %s", stdout.String(), stderr.String())
 	}
@@ -1547,7 +1764,7 @@ func TestOrderRunEventFormulaLatestSeqErrorDoesNotInstantiate(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "release-watch", "", "/city", store, events.NewFailFake(), &stdout, &stderr)
+	code := doOrderRun(aa, "release-watch", "", "/city", beads.OrdersStore{Store: store}, events.NewFailFake(), &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRun = %d, want 1 when event cursor cannot be read; stdout: %s", code, stdout.String())
 	}
@@ -1582,7 +1799,7 @@ func TestOrderRunResolvesPackBindingForPool(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1635,7 +1852,7 @@ description = "Do the cleanup."
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "dog-cleanup", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "dog-cleanup", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1697,7 +1914,7 @@ description = "Do the cleanup."
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "legacy-cleanup", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "legacy-cleanup", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
 	}
@@ -1730,7 +1947,7 @@ func TestOrderRunNonPoolDoesNotSetRouteMetadata(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "cleanup", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "cleanup", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1762,7 +1979,7 @@ func TestOrderRunResolvesImportedPackPoolAgainstCityShadow(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1786,7 +2003,7 @@ func TestOrderRunResolvesImportedPackPoolAgainstSiblingImportCollision(t *testin
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1819,7 +2036,7 @@ name = "dog"
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1848,7 +2065,7 @@ func TestOrderRunRejectsAmbiguousPackPool(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRun = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
 	}
@@ -1913,7 +2130,7 @@ func TestOrderRunNoPool(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "cleanup", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "cleanup", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1967,7 +2184,7 @@ description = "Target: {{target_id}}, workspace: {{workspace}}"
 
 	store := beads.NewMemStore()
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "digest", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "digest", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRun = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
 	}
@@ -2021,7 +2238,7 @@ title = "Do work"
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "acceptance-patrol", "", cityDir, store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "acceptance-patrol", "", cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2030,37 +2247,34 @@ title = "Do work"
 		t.Fatalf("store.ListOpen(): %v", err)
 	}
 
+	foundRoot := false
 	foundWorker := false
-	foundControl := false
 	for _, bead := range all {
 		switch bead.Title {
-		case "Do work":
-			if bead.Assignee != "quinn" {
-				t.Fatalf("worker assignee = %q, want quinn", bead.Assignee)
+		case "graph-work":
+			if bead.Assignee != "" {
+				t.Fatalf("workflow root assignee = %q, want empty routed pool queue", bead.Assignee)
+			}
+			if bead.Metadata["gc.kind"] != "workflow" {
+				t.Fatalf("workflow root gc.kind = %q, want workflow", bead.Metadata["gc.kind"])
 			}
 			if bead.Metadata["gc.routed_to"] != "quinn" {
-				t.Fatalf("worker gc.routed_to = %q, want quinn", bead.Metadata["gc.routed_to"])
+				t.Fatalf("workflow root gc.routed_to = %q, want quinn", bead.Metadata["gc.routed_to"])
+			}
+			foundRoot = true
+		case "Do work":
+			if bead.Assignee != "" {
+				t.Fatalf("worker assignee = %q, want empty child under routed workflow root", bead.Assignee)
 			}
 			foundWorker = true
-		case "Finalize workflow":
-			if bead.Assignee != config.ControlDispatcherAgentName {
-				t.Fatalf("finalizer assignee = %q, want %q", bead.Assignee, config.ControlDispatcherAgentName)
-			}
-			if bead.Metadata["gc.routed_to"] != "" {
-				t.Fatalf("finalizer gc.routed_to = %q, want empty for concrete control dispatcher assignee", bead.Metadata["gc.routed_to"])
-			}
-			if bead.Metadata[graphExecutionRouteMetaKey] != "quinn" {
-				t.Fatalf("finalizer execution route = %q, want quinn", bead.Metadata[graphExecutionRouteMetaKey])
-			}
-			foundControl = true
 		}
 	}
 
-	if !foundWorker {
-		t.Fatal("missing routed worker step")
+	if !foundRoot {
+		t.Fatal("missing routed workflow root")
 	}
-	if !foundControl {
-		t.Fatal("missing routed workflow finalizer")
+	if !foundWorker {
+		t.Fatal("missing workflow child step")
 	}
 }
 
@@ -2087,12 +2301,12 @@ description = "Inspect convoy {{convoy_id}}"
 	}
 	store := beads.NewMemStore()
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "convoy-patrol", "", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "convoy-patrol", "", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRun = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "requires a targeted graph.v2 invocation") {
-		t.Fatalf("stderr = %q, want targeted graph.v2 invocation error", stderr.String())
+	if !strings.Contains(stderr.String(), "requires a targeted formulas v2 invocation") {
+		t.Fatalf("stderr = %q, want targeted formulas v2 invocation error", stderr.String())
 	}
 	results, err := store.ListByLabel("order-run:convoy-patrol", 0, beads.IncludeClosed)
 	if err != nil {
@@ -2105,7 +2319,7 @@ description = "Inspect convoy {{convoy_id}}"
 
 func TestOrderRunNotFound(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(nil, "nonexistent", "", "/city", nil, nil, &stdout, &stderr)
+	code := doOrderRun(nil, "nonexistent", "", "/city", beads.OrdersStore{}, nil, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRun = %d, want 1", code)
 	}
@@ -2509,7 +2723,7 @@ dolt.auto-start: false
 	a := orders.Order{Name: "pg-env", Trigger: "event", On: events.BeadClosed, Exec: "true"}
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRunExecTracked(a, cityDir, nil, store, eventLog, &stdout, &stderr)
+	code := doOrderRunExecTracked(a, cityDir, nil, orders.NewStore(beads.OrdersStore{Store: store}), eventLog, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("doOrderRunExecTracked = 0, want env failure; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -2523,6 +2737,59 @@ dolt.auto-start: false
 	}
 	if slicesContain(all[0].Labels, "exec-failed") {
 		t.Fatalf("tracking bead labels = %v, want no exec-failed for env-build failure", all[0].Labels)
+	}
+}
+
+func TestOrderRunExecTrackedRecordsCooldownForNonEventRigOrder(t *testing.T) {
+	// Regression for #3570: a manual `gc order run <name> --rig <rig>` of a
+	// cooldown-triggered exec order must record a rig-scoped cooldown tracking
+	// bead. Without it, `gc order check --rig` always reports "never run" and
+	// the order re-fires every tick (process exhaustion).
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `[workspace]
+name = "test-city"
+prefix = "ct"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "fe"
+`)
+	cfg, err := loadCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	a := orders.Order{
+		Name:     "poll",
+		Rig:      "frontend",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "true",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doOrderRunExecTracked(a, cityDir, cfg, orders.NewStore(beads.OrdersStore{Store: store}), nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doOrderRunExecTracked = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	all := trackingBeads(t, store, "order-run:poll:rig:frontend")
+	if len(all) != 1 {
+		t.Fatalf("rig-scoped tracking bead count = %d, want 1 (labels must be scoped so gc order check finds the run)", len(all))
+	}
+	if all[0].Title != "order:poll:rig:frontend" {
+		t.Fatalf("tracking bead title = %q, want order:poll:rig:frontend", all[0].Title)
+	}
+	if !slicesContain(all[0].Labels, "exec") {
+		t.Fatalf("tracking bead labels = %v, want exec", all[0].Labels)
 	}
 }
 
@@ -2578,7 +2845,7 @@ func TestOrderHistory(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	code := doOrderHistory("", "", aa, store, &stdout)
+	code := doOrderHistory("", "", aa, beads.OrdersStore{Store: store}, &stdout)
 	if code != 0 {
 		t.Fatalf("doOrderHistory = %d, want 0", code)
 	}
@@ -2613,8 +2880,8 @@ func TestOrderHistoryJSON(t *testing.T) {
 		return []byte(`[]`), nil
 	})
 	aa := []orders.Order{{Name: "digest", Formula: "mol-digest"}}
-	resolver := func(orders.Order) ([]beads.Store, error) {
-		return []beads.Store{store}, nil
+	resolver := func(orders.Order) ([]beads.OrdersStore, error) {
+		return []beads.OrdersStore{{Store: store}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2653,7 +2920,7 @@ func TestOrderHistoryNamed(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	code := doOrderHistory("digest", "", aa, store, &stdout)
+	code := doOrderHistory("digest", "", aa, beads.OrdersStore{Store: store}, &stdout)
 	if code != 0 {
 		t.Fatalf("doOrderHistory = %d, want 0", code)
 	}
@@ -2680,7 +2947,7 @@ func TestOrderHistoryEmpty(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	code := doOrderHistory("", "", aa, store, &stdout)
+	code := doOrderHistory("", "", aa, beads.OrdersStore{Store: store}, &stdout)
 	if code != 0 {
 		t.Fatalf("doOrderHistory = %d, want 0", code)
 	}
@@ -2705,11 +2972,11 @@ func TestOrderHistoryWithStoreResolverUsesRigStore(t *testing.T) {
 		Rig:     "frontend",
 		Formula: "mol-digest",
 	}}
-	resolver := func(a orders.Order) (beads.Store, error) {
+	resolver := func(a orders.Order) (beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return rigStore, nil
+			return beads.OrdersStore{Store: rigStore}, nil
 		}
-		return cityStore, nil
+		return beads.OrdersStore{Store: cityStore}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2745,11 +3012,11 @@ func TestOrderHistoryWithStoresResolverSkipsUnreadableLegacyStore(t *testing.T) 
 		Rig:     "frontend",
 		Formula: "mol-digest",
 	}}
-	resolver := func(a orders.Order) ([]beads.Store, error) {
+	resolver := func(a orders.Order) ([]beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return []beads.Store{rigStore, legacyStore}, nil
+			return []beads.OrdersStore{{Store: rigStore}, {Store: legacyStore}}, nil
 		}
-		return []beads.Store{rigStore}, nil
+		return []beads.OrdersStore{{Store: rigStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2783,11 +3050,11 @@ func TestOrderHistoryWithStoresResolverFailsUnreadablePrimaryStore(t *testing.T)
 		Rig:     "frontend",
 		Formula: "mol-digest",
 	}}
-	resolver := func(a orders.Order) ([]beads.Store, error) {
+	resolver := func(a orders.Order) ([]beads.OrdersStore, error) {
 		if a.Rig == "frontend" {
-			return []beads.Store{rigStore, legacyStore}, nil
+			return []beads.OrdersStore{{Store: rigStore}, {Store: legacyStore}}, nil
 		}
-		return []beads.Store{legacyStore}, nil
+		return []beads.OrdersStore{{Store: legacyStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2834,8 +3101,8 @@ func TestOrderHistoryWithStoresResolverDeduplicatesSameBackingStore(t *testing.T
 		Rig:     "frontend",
 		Formula: "mol-digest",
 	}}
-	resolver := func(orders.Order) ([]beads.Store, error) {
-		return []beads.Store{store, store}, nil
+	resolver := func(orders.Order) ([]beads.OrdersStore, error) {
+		return []beads.OrdersStore{{Store: store}, {Store: store}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2878,8 +3145,8 @@ func TestOrderHistoryWithStoresResolverSortsMergedStoresByRecency(t *testing.T) 
 		Rig:     "frontend",
 		Formula: "mol-digest",
 	}}
-	resolver := func(orders.Order) ([]beads.Store, error) {
-		return []beads.Store{rigStore, legacyStore}, nil
+	resolver := func(orders.Order) ([]beads.OrdersStore, error) {
+		return []beads.OrdersStore{{Store: rigStore}, {Store: legacyStore}}, nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -3021,7 +3288,7 @@ func TestOrderRunRigQualifiesPool(t *testing.T) {
 	store := beads.NewMemStore()
 
 	var stdout, stderr bytes.Buffer
-	code := doOrderRun(aa, "db-health", "demo-repo", "/city", store, nil, &stdout, &stderr)
+	code := doOrderRun(aa, "db-health", "demo-repo", "/city", beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}

@@ -26,17 +26,23 @@ const (
 	BeadUpdated             = "bead.updated"
 	BeadWorktreeReaped      = "bead.worktree.reaped"
 	BeadWorktreeReapSkipped = "bead.worktree.reap_skipped"
-	MailSent                = "mail.sent"
-	MailRead                = "mail.read"
-	MailArchived            = "mail.archived"
-	MailMarkedRead          = "mail.marked_read"
-	MailMarkedUnread        = "mail.marked_unread"
-	MailReplied             = "mail.replied"
-	MailDeleted             = "mail.deleted"
-	SessionDraining         = "session.draining"
-	SessionUndrained        = "session.undrained"
-	SessionQuarantined      = "session.quarantined"
-	SessionIdleKilled       = "session.idle_killed"
+	// BeadClaimRejected fires when a worker attempts to claim a work bead that
+	// is already live-claimed by a different worker — the claim is rejected as
+	// an idempotent no-op rather than fanning out a second concurrent claim.
+	// Turns the otherwise-silent lost-claim race (RCA gc-typpc: one bead, four
+	// concurrent polecat claims) into an observable signal. ADR-0009.
+	BeadClaimRejected  = "bead.claim_rejected"
+	MailSent           = "mail.sent"
+	MailRead           = "mail.read"
+	MailArchived       = "mail.archived"
+	MailMarkedRead     = "mail.marked_read"
+	MailMarkedUnread   = "mail.marked_unread"
+	MailReplied        = "mail.replied"
+	MailDeleted        = "mail.deleted"
+	SessionDraining    = "session.draining"
+	SessionUndrained   = "session.undrained"
+	SessionQuarantined = "session.quarantined"
+	SessionIdleKilled  = "session.idle_killed"
 	// SessionMaxAgeKilled fires when the controller preemptively restarts a
 	// long-running session because its wall-clock age exceeded the agent's
 	// max_session_age threshold. Motivating case: provider SDKs that cache
@@ -83,6 +89,12 @@ const (
 	ConvoyClosed            = "convoy.closed"
 	ControllerStarted       = "controller.started"
 	ControllerStopped       = "controller.stopped"
+	// SupervisorStarted fires once per supervisor startup, after the
+	// instance lock is acquired. Its payload classifies how the previous
+	// supervisor instance exited (clean, crash, or unknown), derived from
+	// the clean-shutdown handoff token the STOPPING path leaves behind,
+	// so flap alerts can distinguish a crash loop from deploy restarts.
+	SupervisorStarted = "supervisor.started"
 	// SupervisorShutdownRequested fires when the supervisor's main loop
 	// observes a shutdown trigger (signal or socket stop) and is about to
 	// cancel the supervisor context. Carries attribution so operators can
@@ -116,6 +128,17 @@ const (
 	ProjectIdentityStamped          = "project.identity.stamped"
 	SupervisorFSPressureSkippedTick = "supervisor.fs_pressure.skipped_tick"
 
+	// MoleculeResolved fires once at the molecule-autoclose Go close site
+	// when a molecule root transitions to closed. It carries the
+	// state-transition record (issue, from/to status, close reason) joined
+	// to the resolving session, resolved from the root's stamped metadata
+	// (gc.session_name / gc.session_id / gc.work_dir). It is additive: the
+	// existing bead.closed emission is unchanged. A manual non-molecule
+	// `bd close` produces bead.closed but NOT molecule.resolved, so this
+	// event attributes molecule-resolution closes only — a root hand-closed
+	// directly has no resolving session and degrades to empty session fields.
+	MoleculeResolved = "molecule.resolved"
+
 	// External messaging events.
 	ExtMsgBound          = "extmsg.bound"
 	ExtMsgUnbound        = "extmsg.unbound"
@@ -124,6 +147,12 @@ const (
 	ExtMsgAdapterRemoved = "extmsg.adapter_removed"
 	ExtMsgInbound        = "extmsg.inbound"
 	ExtMsgOutbound       = "extmsg.outbound"
+
+	// ExtMsgOutboundChannelMismatch fires when a session attempts to publish
+	// to a conversation that is bound to a different session. The publish is
+	// rejected; this event turns that otherwise-silent cross-wire into an
+	// observable signal (RCA gc-5aie6: per-PL Slack channel cross-wiring).
+	ExtMsgOutboundChannelMismatch = "extmsg.outbound_channel_mismatch"
 
 	// EventsRotated is the forensic anchor written as the first event in
 	// a freshly-rotated active log. Its payload carries the prior
@@ -159,6 +188,11 @@ const (
 	// session count. One alert per episode; AlertSent is cleared on green so
 	// the next episode fires independently. (ADR-0013 A1 M3a)
 	ProviderHealthGateAlert = "provider.health_gate_alert"
+
+	// Emergency events are dolt-independent escalation records written to
+	// .gc/emergency and mirrored into the city event log.
+	EmergencySignaled = "emergency.signaled"
+	EmergencyAcked    = "emergency.acked"
 )
 
 // KnownEventTypes lists every event-type constant this package defines.
@@ -176,6 +210,7 @@ var KnownEventTypes = []string{
 	SessionColdStartTimeout,
 	BeadCreated, BeadClosed, BeadDeleted, BeadUpdated,
 	BeadWorktreeReaped, BeadWorktreeReapSkipped,
+	BeadClaimRejected,
 	MailSent, MailRead, MailArchived, MailMarkedRead, MailMarkedUnread,
 	MailReplied, MailDeleted,
 	ConvoyCreated, ConvoyClosed,
@@ -187,14 +222,17 @@ var KnownEventTypes = []string{
 	CityCreated, CityUnregisterRequested,
 	OrderFired, OrderCompleted, OrderFailed,
 	ProviderSwapped, WorkerOperation, ProjectIdentityStamped, SupervisorFSPressureSkippedTick,
-	SupervisorShutdownRequested, SupervisorRequest,
+	MoleculeResolved,
+	SupervisorStarted, SupervisorShutdownRequested, SupervisorRequest,
 	ExtMsgBound, ExtMsgUnbound, ExtMsgGroupCreated,
 	ExtMsgAdapterAdded, ExtMsgAdapterRemoved,
 	ExtMsgInbound, ExtMsgOutbound,
+	ExtMsgOutboundChannelMismatch,
 	EventsRotated,
 	StoreMaintenanceDone, StoreMaintenanceFailed,
 	StoreDiskWarn, StoreDiskCritical,
 	PostgresCredentialResolved,
+	EmergencySignaled, EmergencyAcked,
 	// ProviderHealthGateAlert is intentionally omitted from KnownEventTypes.
 	// The event is emitted by the reconciler but its typed SSE payload is not
 	// yet registered in internal/api (the payload registration lives in a
@@ -203,14 +241,24 @@ var KnownEventTypes = []string{
 }
 
 // Event is a single recorded occurrence in the system.
+//
+// RunID/SessionID are opaque correlation ids stamped at the record site (run
+// root via the bead metadata run-chain; session bead id), used by downstream
+// consumers to join an event to its run/session. They are additive and
+// omitempty: old records lack them and unmarshal as "". They are NOT derived
+// from Payload — the redacted export forwards them as typed primitives, never by
+// decoding the free-form payload.
 type Event struct {
-	Seq     uint64          `json:"seq"`
-	Type    string          `json:"type"`
-	Ts      time.Time       `json:"ts"`
-	Actor   string          `json:"actor"`
-	Subject string          `json:"subject,omitempty"`
-	Message string          `json:"message,omitempty"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Seq       uint64          `json:"seq"`
+	Type      string          `json:"type"`
+	Ts        time.Time       `json:"ts"`
+	Actor     string          `json:"actor"`
+	Subject   string          `json:"subject,omitempty"`
+	Message   string          `json:"message,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	RunID     string          `json:"run_id,omitempty"`
+	SessionID string          `json:"session_id,omitempty"`
+	StepID    string          `json:"step_id,omitempty"`
 }
 
 // Recorder records events. Safe for concurrent use. Best-effort.

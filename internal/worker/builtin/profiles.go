@@ -52,13 +52,26 @@ type BuiltinProviderSpec struct {
 	ResumeStyle            string
 	ResumeCommand          string
 	SessionIDFlag          string
-	PermissionModes        map[string]string
-	OptionDefaults         map[string]string
-	OptionsSchema          []BuiltinProviderOption
-	PrintArgs              []string
-	TitleModel             string
-	ACPCommand             string
-	ACPArgs                []string
+	// ForkFlag is the CLI flag that forks a resumed conversation into a new
+	// branch. Combined with ResumeFlag + SessionIDFlag it yields the fork-launch
+	// form (resume a parent brain, fork off it, bind gc's own session id). Empty
+	// for providers with no fork verb (currently every provider except claude).
+	ForkFlag        string
+	PermissionModes map[string]string
+	OptionDefaults  map[string]string
+	OptionsSchema   []BuiltinProviderOption
+	PrintArgs       []string
+	TitleModel      string
+	ACPCommand      string
+	ACPArgs         []string
+	// Upstream serving-env binding (Phase C — the Upstream axis): the env-var
+	// NAMES this harness reads for the model-serving base URL and credential, so
+	// an abstract [upstreams.<name>] renders onto the right names for this CLI.
+	// Empty = no built-in binding (the operator declares one, or uses the raw env
+	// escape hatch). Kept as plain strings (this package cannot import config).
+	UpstreamBaseURLEnv   string
+	UpstreamAPIKeyEnv    string
+	UpstreamAuthTokenEnv string
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -82,13 +95,19 @@ const (
 
 var builtinProviderOrder = []string{
 	"claude", "codex", "gemini", "grok", "kimi", "kiro", "cursor", "copilot",
-	"amp", "opencode", "groq", "cerebras", "auggie", "pi", "omp", "antigravity",
+	"amp", "opencode", "mimocode", "groq", "cerebras", "auggie", "pi", "omp",
+	"antigravity",
 }
 
 var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 	"claude": {
 		DisplayName: "Claude Code",
 		Command:     "claude",
+		// Anthropic serving-env binding (Claude Code reads these for a custom
+		// endpoint + credential).
+		UpstreamBaseURLEnv:   "ANTHROPIC_BASE_URL",
+		UpstreamAPIKeyEnv:    "ANTHROPIC_API_KEY",
+		UpstreamAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
 		OptionDefaults: map[string]string{
 			"permission_mode": "unrestricted",
 			"effort":          "max",
@@ -103,7 +122,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		InstructionsFile:       "CLAUDE.md",
 		ResumeFlag:             "--resume",
 		ResumeStyle:            "flag",
-		SessionIDFlag:          "--session-id",
+		ForkFlag:               "--fork-session",
 		PrintArgs:              []string{"-p"},
 		TitleModel:             "haiku",
 		PermissionModes: map[string]string{
@@ -147,7 +166,9 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 					{Value: "fable-5", Label: "Fable 5", FlagArgs: []string{"--model", "claude-fable-5"}, FlagAliases: [][]string{{"-m", "claude-fable-5"}}},
 					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
 					{Value: "opus-4-7", Label: "Opus 4.7", FlagArgs: []string{"--model", "claude-opus-4-7"}, FlagAliases: [][]string{{"-m", "claude-opus-4-7"}}},
-					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
+					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-5"}, FlagAliases: [][]string{{"-m", "claude-sonnet-5"}}},
+					{Value: "sonnet-5", Label: "Sonnet 5", FlagArgs: []string{"--model", "claude-sonnet-5"}, FlagAliases: [][]string{{"-m", "claude-sonnet-5"}}},
+					{Value: "sonnet-4-6", Label: "Sonnet 4.6", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
 					{Value: "haiku", Label: "Haiku", FlagArgs: []string{"--model", "claude-haiku-4-5-20251001"}, FlagAliases: [][]string{{"-m", "claude-haiku-4-5-20251001"}}},
 					{Value: "claude-opus-latest", Label: "Opus (proxy)", FlagArgs: []string{"--model", "claude-opus-latest"}, FlagAliases: [][]string{{"-m", "claude-opus-latest"}}},
 					{Value: "claude-opus-latest[1m]", Label: "Opus (proxy, 1M)", FlagArgs: []string{"--model", "claude-opus-latest[1m]"}, FlagAliases: [][]string{{"-m", "claude-opus-latest[1m]"}}},
@@ -159,6 +180,10 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 	"codex": {
 		DisplayName: "Codex CLI",
 		Command:     "codex",
+		// OpenAI serving-env binding (Codex reads these for a custom endpoint +
+		// API key). Codex auth is the API key; no separate auth-token var.
+		UpstreamBaseURLEnv: "OPENAI_BASE_URL",
+		UpstreamAPIKeyEnv:  "OPENAI_API_KEY",
 		OptionDefaults: map[string]string{
 			"permission_mode": "unrestricted",
 			"model":           "gpt-5.5",
@@ -167,7 +192,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		PromptMode:        "arg",
 		ReadyPromptPrefix: "\u203a ",
 		ReadyDelayMs:      3000,
-		ProcessNames:      []string{"codex"},
+		ProcessNames:      []string{"codex", "codex-raw"},
 		SupportsHooks:     true,
 		InstructionsFile:  "AGENTS.md",
 		ResumeFlag:        "resume",
@@ -199,6 +224,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 					{Value: "", Label: "Default"},
 					{Value: "gpt-5.5", Label: "GPT-5.5", FlagArgs: []string{"--model", "gpt-5.5"}, FlagAliases: [][]string{{"-m", "gpt-5.5"}}},
 					{Value: "gpt-5-4", Label: "GPT-5.4", FlagArgs: []string{"--model", "gpt-5-4"}, FlagAliases: [][]string{{"-m", "gpt-5-4"}}},
+					{Value: "gpt-5.3-codex", Label: "GPT-5.3 Codex", FlagArgs: []string{"--model", "gpt-5.3-codex"}, FlagAliases: [][]string{{"-m", "gpt-5.3-codex"}}},
 					{Value: "gpt-5.3-codex-spark", Label: "GPT-5.3 Codex Spark", FlagArgs: []string{"--model", "gpt-5.3-codex-spark"}, FlagAliases: [][]string{{"-m", "gpt-5.3-codex-spark"}}},
 					{Value: "o3", Label: "o3", FlagArgs: []string{"--model", "o3"}, FlagAliases: [][]string{{"-m", "o3"}}},
 					{Value: "o4-mini", Label: "o4-mini", FlagArgs: []string{"--model", "o4-mini"}, FlagAliases: [][]string{{"-m", "o4-mini"}}},
@@ -231,6 +257,10 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 	"gemini": {
 		DisplayName: "Gemini CLI",
 		Command:     "gemini",
+		// Gemini API key path (GEMINI_API_KEY canonical; GOOGLE_API_KEY is
+		// Vertex-only). GOOGLE_GEMINI_BASE_URL overrides the endpoint.
+		UpstreamBaseURLEnv: "GOOGLE_GEMINI_BASE_URL",
+		UpstreamAPIKeyEnv:  "GEMINI_API_KEY",
 		OptionDefaults: map[string]string{
 			"permission_mode": "unrestricted",
 		},
@@ -278,6 +308,9 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 	"grok": {
 		DisplayName: "Grok Build",
 		Command:     "grok",
+		// xAI Grok Build: XAI_API_KEY for headless (login is the default). No
+		// documented base-URL override env (per-model base_url in config.toml).
+		UpstreamAPIKeyEnv: "XAI_API_KEY",
 		OptionDefaults: map[string]string{
 			"permission_mode": "unrestricted",
 			"model":           "grok-composer-2.5-fast",
@@ -352,8 +385,12 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		},
 	},
 	"kimi": {
-		DisplayName:          "Kimi Code CLI",
-		Command:              "kimi",
+		DisplayName: "Kimi Code CLI",
+		Command:     "kimi",
+		// Moonshot Kimi CLI: KIMI_API_KEY / KIMI_BASE_URL (NOT MOONSHOT_API_KEY,
+		// which is the raw Moonshot SDK var, nor OPENAI_* which is openai-type only).
+		UpstreamBaseURLEnv:   "KIMI_BASE_URL",
+		UpstreamAPIKeyEnv:    "KIMI_API_KEY",
 		Args:                 []string{"--yolo", "--no-thinking"},
 		PromptMode:           "none",
 		ReadyDelayMs:         5000,
@@ -381,12 +418,15 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		},
 	},
 	"kiro": {
-		DisplayName:  "Kiro",
-		Command:      "kiro-cli",
-		Args:         []string{"chat", "--no-interactive", "--agent", "gascity", "--trust-all-tools"},
-		PromptMode:   "arg",
-		ReadyDelayMs: 5000,
-		ProcessNames: []string{"kiro-cli", "kiro", "node"},
+		DisplayName: "Kiro",
+		Command:     "kiro-cli",
+		// AWS Kiro: KIRO_API_KEY for headless (ksk_…; login is the default). No
+		// documented serving base-URL override env.
+		UpstreamAPIKeyEnv: "KIRO_API_KEY",
+		Args:              []string{"chat", "--no-interactive", "--agent", "gascity", "--trust-all-tools"},
+		PromptMode:        "arg",
+		ReadyDelayMs:      5000,
+		ProcessNames:      []string{"kiro-cli", "kiro", "node"},
 		// kiro launches with --trust-all-tools and never shows trust/permission
 		// dialogs, so skip the 7-dialog startup polling (~56s/call, run twice).
 		AcceptStartupDialogs: boolPtr(false),
@@ -396,8 +436,11 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		ACPArgs:              []string{"acp", "--agent", "gascity"},
 	},
 	"cursor": {
-		DisplayName:       "Cursor Agent",
-		Command:           "cursor-agent",
+		DisplayName: "Cursor Agent",
+		Command:     "cursor-agent",
+		// Cursor: CURSOR_API_KEY for headless (login is the default). Serving is
+		// Cursor's own backend — no base-URL override env.
+		UpstreamAPIKeyEnv: "CURSOR_API_KEY",
 		Args:              []string{"-f"},
 		PromptMode:        "arg",
 		ReadyPromptPrefix: "\u2192 ",
@@ -423,7 +466,13 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 	"copilot": {
 		DisplayName: "GitHub Copilot",
 		Command:     "copilot",
-		Args:        []string{"--yolo"},
+		// Custom model serving (COPILOT_PROVIDER_BASE_URL/_API_KEY; a custom
+		// upstream may also need COPILOT_PROVIDER_TYPE/COPILOT_MODEL via raw env).
+		// auth_token = the GitHub-account bearer for the default GitHub-hosted path.
+		UpstreamBaseURLEnv:   "COPILOT_PROVIDER_BASE_URL",
+		UpstreamAPIKeyEnv:    "COPILOT_PROVIDER_API_KEY",
+		UpstreamAuthTokenEnv: "COPILOT_GITHUB_TOKEN",
+		Args:                 []string{"--yolo"},
 		// PromptMode "none" delivers the prompt via tmux send-keys after the
 		// ready prefix is detected (Step 6 in doStartSession), instead of
 		// appending to argv. Required for copilot CLI 1.0.x which rejects
@@ -450,14 +499,18 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// without requiring provider hooks; the remaining work is
 		// event-driven coordination (session-start priming,
 		// pre-compaction handoff).
-		DisplayName:      "Sourcegraph AMP",
-		Command:          "amp",
-		Args:             []string{"--dangerously-allow-all", "--no-ide"},
-		PromptMode:       "arg",
-		ProcessNames:     []string{"amp"},
-		InstructionsFile: "AGENTS.md",
-		ResumeFlag:       "threads continue",
-		ResumeStyle:      "subcommand",
+		DisplayName: "Sourcegraph AMP",
+		Command:     "amp",
+		// Amp connected mode: AMP_API_KEY credential, AMP_URL server/base-URL
+		// override (verified in the compiled CLI). Login is the interactive default.
+		UpstreamBaseURLEnv: "AMP_URL",
+		UpstreamAPIKeyEnv:  "AMP_API_KEY",
+		Args:               []string{"--dangerously-allow-all", "--no-ide"},
+		PromptMode:         "arg",
+		ProcessNames:       []string{"amp"},
+		InstructionsFile:   "AGENTS.md",
+		ResumeFlag:         "threads continue",
+		ResumeStyle:        "subcommand",
 	},
 	"opencode": {
 		DisplayName:      "OpenCode",
@@ -484,6 +537,45 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 					{Value: "opencode/deepseek-v4-flash-free", Label: "DeepSeek V4 Flash Free", FlagArgs: []string{"--model", "opencode/deepseek-v4-flash-free"}, FlagAliases: [][]string{{"-m", "opencode/deepseek-v4-flash-free"}}},
 					{Value: "opencode/nemotron-3-super-free", Label: "Nemotron 3 Super Free", FlagArgs: []string{"--model", "opencode/nemotron-3-super-free"}, FlagAliases: [][]string{{"-m", "opencode/nemotron-3-super-free"}}},
 					{Value: "opencode/big-pickle", Label: "Big Pickle", FlagArgs: []string{"--model", "opencode/big-pickle"}, FlagAliases: [][]string{{"-m", "opencode/big-pickle"}}},
+				},
+			},
+		},
+	},
+	"mimocode": {
+		// MiMo Code (Xiaomi's `mimo` CLI) is an OpenCode fork. Permission
+		// defaults are already permissive for bash/edit; only the
+		// question/plan interaction gates block headless runs, so
+		// --never-ask-questions is the only default arg needed. The flag is
+		// not taken by the `mimo acp` subcommand, so sessions default to the
+		// CLI transport (config.ProviderSessionCreateTransport) and ACP stays
+		// explicit opt-in until `mimo acp` has equivalent non-interactive
+		// conformance coverage. No mimocode.json is staged — staging one
+		// would clobber user config.
+		DisplayName:      "MiMo Code",
+		Command:          "mimo",
+		Args:             []string{"--never-ask-questions"},
+		PromptMode:       "flag",
+		PromptFlag:       "--prompt",
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"mimo", ".mimocode", "node", "bun"},
+		SupportsACP:      true,
+		SupportsHooks:    true,
+		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "--session",
+		ResumeStyle:      "flag",
+		ACPArgs:          []string{"acp"},
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "mimo/mimo-auto", Label: "MiMo Auto (free)", FlagArgs: []string{"--model", "mimo/mimo-auto"}, FlagAliases: [][]string{{"-m", "mimo/mimo-auto"}}},
+					{Value: "xiaomi/mimo-v2.5-pro", Label: "MiMo V2.5 Pro", FlagArgs: []string{"--model", "xiaomi/mimo-v2.5-pro"}, FlagAliases: [][]string{{"-m", "xiaomi/mimo-v2.5-pro"}}},
+					{Value: "xiaomi/mimo-v2.5", Label: "MiMo V2.5", FlagArgs: []string{"--model", "xiaomi/mimo-v2.5"}, FlagAliases: [][]string{{"-m", "xiaomi/mimo-v2.5"}}},
+					{Value: "xiaomi-token-plan-sgp/mimo-v2.5-pro", Label: "MiMo V2.5 Pro (Token Plan SGP)", FlagArgs: []string{"--model", "xiaomi-token-plan-sgp/mimo-v2.5-pro"}, FlagAliases: [][]string{{"-m", "xiaomi-token-plan-sgp/mimo-v2.5-pro"}}},
+					{Value: "xiaomi-token-plan-sgp/mimo-v2.5", Label: "MiMo V2.5 (Token Plan SGP)", FlagArgs: []string{"--model", "xiaomi-token-plan-sgp/mimo-v2.5"}, FlagAliases: [][]string{{"-m", "xiaomi-token-plan-sgp/mimo-v2.5"}}},
 				},
 			},
 		},
@@ -680,6 +772,8 @@ func CanonicalProfileIdentity(profile string) (ProfileIdentity, bool) {
 		return newProfileIdentity(profile, "kimi"), true
 	case "opencode/tmux-cli":
 		return newProfileIdentity(profile, "opencode"), true
+	case "mimocode/tmux-cli":
+		return newProfileIdentity(profile, "mimocode"), true
 	case "pi/tmux-cli":
 		return newProfileIdentity(profile, "pi"), true
 	case "antigravity/tmux-cli":

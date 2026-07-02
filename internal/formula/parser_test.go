@@ -230,6 +230,52 @@ description_file = "../prompts/operator.md"
 	}
 }
 
+// TestParseTOMLAtResolvesDescriptionFileRelativeToSourcePath pins that
+// ParseTOMLAt anchors a relative description_file to the supplied source path's
+// directory even though the draft bytes were never written there — so authoring
+// and validation paths can preflight a draft against its eventual on-disk
+// location. The strict graph.v2 contract still fails fast when the target is
+// missing at that anchor.
+func TestParseTOMLAtResolvesDescriptionFileRelativeToSourcePath(t *testing.T) {
+	dir := t.TempDir()
+	cityFormulas := filepath.Join(dir, "formulas")
+	cityPrompts := filepath.Join(dir, "prompts")
+	for _, d := range []string{cityFormulas, cityPrompts} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cityPrompts, "work.md"), []byte("anchored prompt body\n"), 0o644); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	const draftTemplate = `formula = "anchored"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "work"
+title = "Work"
+description_file = %q
+`
+	// srcPath sits in the city formulas dir, but no file is written there; the
+	// relative "../prompts/work.md" must still resolve against that directory.
+	srcPath := filepath.Join(cityFormulas, "anchored.toml")
+
+	parsed, err := NewParser(cityFormulas).ParseTOMLAt([]byte(fmt.Sprintf(draftTemplate, "../prompts/work.md")), srcPath)
+	if err != nil {
+		t.Fatalf("ParseTOMLAt: %v", err)
+	}
+	if got := parsed.Steps[0].Description; got != "anchored prompt body\n" {
+		t.Fatalf("step description = %q, want anchored prompt body", got)
+	}
+
+	if _, err := NewParser(cityFormulas).ParseTOMLAt([]byte(fmt.Sprintf(draftTemplate, "../prompts/missing.md")), srcPath); err == nil {
+		t.Fatal("ParseTOMLAt should fail for a missing strict graph.v2 description_file")
+	}
+}
+
 func TestLoadByNameDescriptionFileKeepsFormulaLocalAssetsPath(t *testing.T) {
 	tmp := t.TempDir()
 	coreFormulas := filepath.Join(tmp, "core", "formulas")
@@ -2540,6 +2586,158 @@ func TestParseJSON_RalphLegacyAliasStillWorks(t *testing.T) {
 	}
 }
 
+func TestParseTOML_RemovedTallyRejected(t *testing.T) {
+	tomlData := `
+formula = "mol-tally-removed"
+version = 1
+type = "workflow"
+
+[[steps]]
+id = "ask"
+title = "Ask voters"
+
+[steps.on_complete]
+for_each = "output.voters"
+bond = "mol-voter"
+
+[steps.tally]
+vote_field = "answer"
+mode = "majority"
+`
+
+	p := NewParser()
+	_, err := p.ParseTOML([]byte(tomlData))
+	if err == nil {
+		t.Fatal("ParseTOML succeeded, want loud rejection of removed [steps.tally]")
+	}
+	if !strings.Contains(err.Error(), "steps.tally was removed from the SDK; aggregate votes in your pack instead") {
+		t.Fatalf("ParseTOML error = %v, want removed-tally rejection", err)
+	}
+}
+
+func TestParseTOML_RemovedTallyRejectedInChildren(t *testing.T) {
+	tomlData := `
+formula = "mol-tally-removed-child"
+version = 1
+type = "workflow"
+
+[[steps]]
+id = "parent"
+title = "Parent"
+
+[[steps.children]]
+id = "ask"
+title = "Ask voters"
+
+[steps.children.tally]
+mode = "unanimous"
+`
+
+	p := NewParser()
+	_, err := p.ParseTOML([]byte(tomlData))
+	if err == nil {
+		t.Fatal("ParseTOML succeeded, want loud rejection of removed [steps.children.tally]")
+	}
+	if !strings.Contains(err.Error(), "steps.tally was removed from the SDK; aggregate votes in your pack instead") {
+		t.Fatalf("ParseTOML error = %v, want removed-tally rejection", err)
+	}
+}
+
+func TestParseTOML_RemovedTallyRejectedInLoopBody(t *testing.T) {
+	tomlData := `
+formula = "mol-tally-removed-loop"
+version = 1
+type = "workflow"
+
+[[steps]]
+id = "vote-loop"
+title = "Vote loop"
+
+[steps.loop]
+count = 2
+
+[[steps.loop.body]]
+id = "ask"
+title = "Ask voters"
+
+[steps.loop.body.tally]
+mode = "majority"
+`
+
+	p := NewParser()
+	_, err := p.ParseTOML([]byte(tomlData))
+	if err == nil {
+		t.Fatal("ParseTOML succeeded, want loud rejection of removed [steps.loop.body.tally]")
+	}
+	if !strings.Contains(err.Error(), "steps.tally was removed from the SDK; aggregate votes in your pack instead") {
+		t.Fatalf("ParseTOML error = %v, want removed-tally rejection", err)
+	}
+}
+
+func TestParseJSON_RemovedTallyRejected(t *testing.T) {
+	jsonData := `{
+  "formula": "mol-tally-removed",
+  "version": 1,
+  "type": "workflow",
+  "steps": [
+    {
+      "id": "ask",
+      "title": "Ask voters",
+      "on_complete": {
+        "for_each": "output.voters",
+        "bond": "mol-voter"
+      },
+      "tally": {
+        "vote_field": "answer",
+        "mode": "majority"
+      }
+    }
+  ]
+}`
+
+	p := NewParser()
+	_, err := p.Parse([]byte(jsonData))
+	if err == nil {
+		t.Fatal("Parse succeeded, want loud rejection of removed \"tally\" step field")
+	}
+	if !strings.Contains(err.Error(), "steps.tally was removed from the SDK; aggregate votes in your pack instead") {
+		t.Fatalf("Parse error = %v, want removed-tally rejection", err)
+	}
+}
+
+func TestParseJSON_RemovedTallyRejectedInChildren(t *testing.T) {
+	jsonData := `{
+  "formula": "mol-tally-removed-child",
+  "version": 1,
+  "type": "workflow",
+  "steps": [
+    {
+      "id": "parent",
+      "title": "Parent",
+      "children": [
+        {
+          "id": "ask",
+          "title": "Ask voters",
+          "tally": {
+            "vote_field": "answer",
+            "mode": "majority"
+          }
+        }
+      ]
+    }
+  ]
+}`
+
+	p := NewParser()
+	_, err := p.Parse([]byte(jsonData))
+	if err == nil {
+		t.Fatal("Parse succeeded, want loud rejection of removed nested \"tally\" step field")
+	}
+	if !strings.Contains(err.Error(), "steps.tally was removed from the SDK; aggregate votes in your pack instead") {
+		t.Fatalf("Parse error = %v, want removed-tally rejection", err)
+	}
+}
+
 func TestParseTOML_CheckAndRalphMixedRejected(t *testing.T) {
 	tomlData := `
 formula = "mol-check-mixed"
@@ -3376,5 +3574,36 @@ func TestParse_InMemory_NoContentHash(t *testing.T) {
 
 	if f.ContentHash != "" {
 		t.Errorf("ContentHash should be empty for in-memory parse, got %q", f.ContentHash)
+	}
+}
+
+func TestParseTOML_LoopCountStringRejectsTemplateVar(t *testing.T) {
+	formulaTOML := `
+formula = "loop-count-string"
+
+[[steps]]
+id = "loop"
+title = "Loop"
+
+[steps.loop]
+count = "{{cups}}"
+
+[[steps.loop.body]]
+id = "work"
+title = "Do work"
+`
+	p := NewParser()
+	_, err := p.ParseTOML([]byte(formulaTOML))
+	if err == nil {
+		t.Fatal("expected error for string loop.count, got nil")
+	}
+	if !strings.Contains(err.Error(), "integer literal") {
+		t.Errorf("error missing 'integer literal': %v", err)
+	}
+	if !strings.Contains(err.Error(), "range") {
+		t.Errorf("error missing 'range': %v", err)
+	}
+	if !strings.Contains(err.Error(), "1..{n}") {
+		t.Errorf("error missing '1..{n}' (single-brace form, guards against double-brace regression): %v", err)
 	}
 }

@@ -14,8 +14,10 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
 )
 
@@ -287,7 +289,12 @@ func doHandoffAuto(store beads.Store, rec events.Recorder, sessionAddress string
 	return 0
 }
 
-func createHandoffMail(store beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer) (beads.Bead, bool) {
+// createHandoffMail produces a handoff message through the mail.Provider domain
+// seam. The handoff command speaks mail.Message; the message-bead serialization
+// (Type="message", thread label, extra labels, sender-route metadata) is
+// confined inside beadmail.Provider.SendHandoff. The returned mail.Message
+// carries the assigned ID for the caller's confirmation output.
+func createHandoffMail(store beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer) (mail.Message, bool) {
 	subject := defaultSubject
 	if len(args) > 0 {
 		subject = args[0]
@@ -296,37 +303,33 @@ func createHandoffMail(store beads.Store, rec events.Recorder, senderAddress, re
 	if len(args) > 1 {
 		message = args[1]
 	}
-	metadata, err := mailSenderRouteMetadata(store, senderAddress)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc handoff: resolving sender route: %v\n", err) //nolint:errcheck // best-effort stderr
-		return beads.Bead{}, false
-	}
-	senderDisplay := mailSenderDisplayFromMetadata(senderAddress, metadata)
 
-	labels := []string{"thread:" + handoffThreadID()}
-	labels = append(labels, extraLabels...)
-	b, err := store.Create(beads.Bead{
-		Title:       subject,
-		Description: message,
-		Type:        "message",
-		Assignee:    recipientAddress,
-		From:        senderDisplay,
-		Labels:      labels,
-		Metadata:    metadata,
-		Ephemeral:   true,
+	// Handoff intentionally constructs the concrete bead-backed provider rather
+	// than resolving the configured mail provider (GC_MAIL / city.toml): handoff
+	// needs the thread label and handoff-specific extra-labels that SendHandoff
+	// expresses, which aren't part of the generic provider surface. This
+	// preserves the prior direct-store.Create behavior exactly (no regression).
+	provider := beadmail.New(store)
+	msg, err := provider.SendHandoff(mail.HandoffIntent{
+		From:        senderAddress,
+		To:          recipientAddress,
+		Subject:     subject,
+		Body:        message,
+		ThreadID:    handoffThreadID(),
+		ExtraLabels: extraLabels,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: creating mail: %v\n", err) //nolint:errcheck // best-effort stderr
-		return beads.Bead{}, false
+		return mail.Message{}, false
 	}
 	rec.Record(events.Event{
 		Type:    events.MailSent,
-		Actor:   senderDisplay,
-		Subject: b.ID,
+		Actor:   msg.From,
+		Subject: msg.ID,
 		Message: recipientAddress,
 		Payload: mailEventPayload(nil),
 	})
-	return b, true
+	return msg, true
 }
 
 func sessionRestartableByController(store beads.Store, sessionName string) (bool, error) {
@@ -371,7 +374,7 @@ func clearRestartRequest(store beads.Store, dops drainOps, sessionName string) e
 		errs = append(errs, fmt.Errorf("resolving session %q: %w", sessionName, err))
 		return errors.Join(errs...)
 	}
-	if err := store.SetMetadataBatch(id, map[string]string{
+	if err := sessionFrontDoor(store).ApplyPatch(id, map[string]string{
 		"restart_requested":          "",
 		"continuation_reset_pending": "",
 	}); err != nil {
@@ -414,6 +417,10 @@ func doHandoffRemote(store beads.Store, rec events.Recorder, sp runtime.Provider
 		fmt.Fprintf(stdout, "Handoff: sent mail %s to %s (session not running; will be delivered on next start)\n", b.ID, targetAddress) //nolint:errcheck // best-effort stdout
 		return 0
 	}
+	// Resolve the agent identity before the kill, while the session bead is
+	// still live. The metric label uses the agent identity (not the sanitized
+	// runtime session name) so handoff stops join the start/crash/kill counters.
+	agentIdentity := sessionAgentMetricIdentityByName(store, sessionName)
 	if err := workerKillSessionTargetWithConfig("", store, sp, nil, sessionName); err != nil {
 		fmt.Fprintf(stderr, "gc handoff: killing %s: %v\n", targetAddress, err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -432,6 +439,7 @@ func doHandoffRemote(store beads.Store, rec events.Recorder, sp runtime.Provider
 		Message: "handoff",
 		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "handoff"),
 	})
+	telemetry.RecordAgentStop(context.Background(), sessionName, agentIdentity, "handoff", nil)
 
 	fmt.Fprintf(stdout, "Handoff: sent mail %s to %s, killed session (reconciler will restart)\n", b.ID, targetAddress) //nolint:errcheck // best-effort stdout
 	return 0

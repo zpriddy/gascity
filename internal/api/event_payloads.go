@@ -14,6 +14,10 @@ import (
 	// so the import exists solely to fire the registration before the registry-
 	// coverage tests run.
 	_ "github.com/gastownhall/gascity/internal/pgauth"
+
+	// Blank import: emergency's init() registers emergency.Record as the payload
+	// type for EmergencySignaled and EmergencyAcked events.
+	_ "github.com/gastownhall/gascity/internal/emergency"
 )
 
 // API-layer event payload types. Every API emitter takes one of these
@@ -125,6 +129,18 @@ type RequestFailedPayload struct {
 
 // IsEventPayload marks RequestFailedPayload as an events.Payload variant.
 func (RequestFailedPayload) IsEventPayload() {}
+
+// SupervisorStartedPayload classifies how the previous supervisor
+// instance exited, recorded once per supervisor startup. The cause is
+// derived from the clean-shutdown handoff token the previous instance's
+// STOPPING path leaves behind (and which every startup consumes), so
+// flap alerts can distinguish a crash loop from deploy restarts.
+type SupervisorStartedPayload struct {
+	PreviousExit string `json:"previous_exit" enum:"clean,crash,unknown" doc:"How the previous supervisor instance exited: clean (it completed its STOPPING path and left the shutdown handoff token), crash (a prior instance ran but left no token), or unknown (no evidence of a prior instance)."`
+}
+
+// IsEventPayload marks SupervisorStartedPayload as an events.Payload variant.
+func (SupervisorStartedPayload) IsEventPayload() {}
 
 // SupervisorShutdownPayload attributes a supervisor shutdown trigger so
 // operators can diagnose why the supervisor exited without scraping
@@ -280,6 +296,36 @@ func SessionLifecyclePayloadJSON(sessionID, template, reason string) json.RawMes
 	return b
 }
 
+// MoleculeResolvedPayload is the typed payload for molecule.resolved events.
+// It records a molecule root's state transition at its auto-close site and
+// joins it to the resolving session resolved from the root's stamped
+// metadata. This is the attribution backbone the honesty-gate A/B program
+// consumes to correlate a resolved molecule with the session, model, and
+// cost that produced it. Session fields are empty when the root was closed
+// before any reconcile stamped its identity (graceful degradation, not an
+// error).
+type MoleculeResolvedPayload struct {
+	IssueID     string    `json:"issue_id" doc:"Molecule root bead ID that resolved."`
+	FromStatus  string    `json:"from_status" doc:"Root status captured before the close mutated it."`
+	ToStatus    string    `json:"to_status" doc:"Terminal status after resolution. Always \"closed\"."`
+	Actor       string    `json:"actor" doc:"Identity that triggered the close (eventActor)."`
+	SessionName string    `json:"session_name,omitempty" doc:"Resolving session name from gc.session_name. Empty if unstamped."`
+	SessionID   string    `json:"session_id,omitempty" doc:"Resolving session ID from gc.session_id. Empty if unstamped."`
+	WorkDir     string    `json:"work_dir,omitempty" doc:"Resolving session work dir from gc.work_dir. Empty if unstamped."`
+	CloseReason string    `json:"close_reason,omitempty" doc:"close_reason stamped on the root."`
+	Ts          time.Time `json:"ts" doc:"Resolution timestamp (UTC)."`
+}
+
+// IsEventPayload marks MoleculeResolvedPayload as an events.Payload variant.
+func (MoleculeResolvedPayload) IsEventPayload() {}
+
+// MoleculeResolvedPayloadJSON builds the JSON wire form of a
+// MoleculeResolvedPayload for attachment to an events.Event.Payload field.
+func MoleculeResolvedPayloadJSON(p MoleculeResolvedPayload) json.RawMessage {
+	b, _ := json.Marshal(p)
+	return b
+}
+
 // WorkerOperationEventPayload is the typed payload projected for
 // worker.operation events on the supervisor event stream.
 //
@@ -402,6 +448,16 @@ type WorkerOperationEventPayload struct {
 	// Wired: TODO — pricing.Registry exists (PR #1272); finish-time
 	// wiring to compute cost from token counts is pending.
 	CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty" doc:"Estimated invocation cost in USD (best-effort, currently always absent; see #1255 for pricing seam)."`
+	// RunID is the run-root identifier this operation belongs to, resolved
+	// per-operation from the work/session bead metadata chain (workflow_id ||
+	// molecule_id || gc.root_bead_id-or-self || bead id || session id for
+	// manual chat). Wired: YES — resolved at finish() via beadmeta.ResolveRunID.
+	RunID string `json:"run_id,omitempty" doc:"Run-root identifier for rolling this operation up to a workflow/molecule/chat run (best-effort)."`
+	// Unpriced is a tri-state flag: absent = pricing not evaluated, true =
+	// tokens observed but no price resolved (CostUSDEstimate not authoritative),
+	// false = priced. Wired: TODO — set alongside CostUSDEstimate by the pricing
+	// tier; currently always absent.
+	Unpriced *bool `json:"unpriced,omitempty" doc:"True when tokens were observed but no price resolved (best-effort tri-state; absent = not evaluated)."`
 }
 
 // IsEventPayload marks WorkerOperationEventPayload as an events.Payload variant.
@@ -507,6 +563,7 @@ func init() {
 	events.RegisterPayload(events.ConvoyClosed, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStarted, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStopped, events.NoPayload{})
+	events.RegisterPayload(events.SupervisorStarted, SupervisorStartedPayload{})
 	events.RegisterPayload(events.SupervisorShutdownRequested, SupervisorShutdownPayload{})
 	events.RegisterPayload(events.SupervisorRequest, SupervisorRequestPayload{})
 	events.RegisterPayload(events.CitySuspended, events.NoPayload{})
@@ -529,6 +586,7 @@ func init() {
 	events.RegisterPayload(events.ProviderSwapped, events.NoPayload{})
 	events.RegisterPayload(events.WorkerOperation, WorkerOperationEventPayload{})
 	events.RegisterPayload(events.ProjectIdentityStamped, ProjectIdentityStampedPayload{})
+	events.RegisterPayload(events.MoleculeResolved, MoleculeResolvedPayload{})
 
 	// gc.store.maintenance.* — supervisor StoreMaintenanceLoop outcomes.
 	events.RegisterPayload(events.StoreMaintenanceDone, events.StoreMaintenanceDonePayload{})

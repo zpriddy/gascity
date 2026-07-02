@@ -25,8 +25,10 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	"github.com/gastownhall/gascity/internal/emergency"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/packman"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/supervisor"
@@ -285,7 +287,7 @@ func resetSessionCircuitBreakerState(store beads.Store, sessionID string, identi
 	if cb == nil {
 		cb = defaultSessionCircuitBreaker()
 	}
-	if err := loadPersistedSessionCircuitResetGeneration(store, sessionID, identity, cb); err != nil {
+	if err := loadPersistedSessionCircuitResetGeneration(sessionFrontDoor(store), sessionID, identity, cb); err != nil {
 		return err
 	}
 	initialSnapshot := cb.snapshotIdentity(identity)
@@ -306,7 +308,7 @@ func resetSessionCircuitBreakerState(store beads.Store, sessionID string, identi
 
 func resetAndClearSessionCircuitBreakerState(store beads.Store, sessionID string, identity string, cb *sessionCircuitBreaker, restoreSnapshot sessionCircuitBreakerIdentitySnapshot) error {
 	resetGeneration := cb.Reset(identity)
-	if err := clearPersistedSessionCircuitBreakerMetadata(store, sessionID, resetGeneration); err != nil {
+	if err := clearPersistedSessionCircuitBreakerMetadata(sessionFrontDoor(store), sessionID, resetGeneration); err != nil {
 		cb.restoreIdentity(identity, restoreSnapshot)
 		// Restore the pre-reset snapshot rather than the just-reset one so a
 		// durable clear failure cannot strand the breaker CLOSED in memory.
@@ -896,6 +898,15 @@ func tryReloadConfig(tomlPath, lockedWorkspaceName, cityRoot string) (*reloadRes
 	if err := ensureLegacyNamedPacksCached(cityRoot); err != nil {
 		return nil, fmt.Errorf("fetching packs: %w", err)
 	}
+	// Re-materialize any bundled pack synthetic caches that were written by a
+	// different binary version. The config loader's strict content-hash check
+	// rejects caches whose hash was produced by a binary whose embedded pack
+	// content differs from the running controller (e.g., after "gc import install"
+	// runs with a newer on-disk binary). EnsureBundledPacksCurrent repairs stale
+	// caches from the running binary's embedded packs before the loader validates.
+	if err := packman.EnsureBundledPacksCurrent(cityRoot); err != nil {
+		return nil, fmt.Errorf("refreshing bundled pack caches: %w", err)
+	}
 
 	if err := ensureBuiltinPacksForConfigLoad(fsys.OSFS{}, tomlPath, resolveLoadCityConfigWarningWriter()); err != nil {
 		return nil, err
@@ -940,6 +951,9 @@ func tryReloadConfig(tomlPath, lockedWorkspaceName, cityRoot string) (*reloadRes
 	if err := workspacesvc.ValidateRuntimeSupport(newCfg.Services); err != nil {
 		return failWithWarnings(fmt.Errorf("validating services: %w", err))
 	}
+	if err := validatePackRuntimeRegistrations(newCfg); err != nil {
+		return failWithWarnings(fmt.Errorf("validating pack runtimes: %w", err))
+	}
 	newName := loadedCityName(newCfg, filepath.Dir(tomlPath))
 	if newName != lockedWorkspaceName {
 		return failWithWarnings(fmt.Errorf("workspace.name changed from %q to %q (restart controller to apply)", lockedWorkspaceName, newName))
@@ -958,7 +972,7 @@ func gracefulStopAll(
 	timeout time.Duration,
 	rec events.Recorder,
 	cfg *config.City,
-	store beads.Store,
+	store beads.SessionStore,
 	stdout, stderr io.Writer,
 ) {
 	gracefulStopAllWithForceSignal(names, sp, timeout, rec, cfg, store, stdout, stderr, nil)
@@ -970,16 +984,16 @@ func gracefulStopAllWithForceSignal(
 	timeout time.Duration,
 	rec events.Recorder,
 	cfg *config.City,
-	store beads.Store,
+	store beads.SessionStore,
 	stdout, stderr io.Writer,
 	forceStopRequested func() bool,
 ) {
 	if timeout <= 0 || len(names) == 0 || stopForceRequested(forceStopRequested) {
 		// Immediate kill (no grace period).
-		stopTargetsBounded(stopTargetsForNames(names, cfg, store, stderr), cfg, store, sp, rec, "gc", stdout, stderr)
+		stopTargetsBounded(stopTargetsForNames(names, cfg, store.Store, stderr), cfg, store.Store, sp, rec, "gc", stdout, stderr)
 		return
 	}
-	targets := stopTargetsForNames(names, cfg, store, stderr)
+	targets := stopTargetsForNames(names, cfg, store.Store, stderr)
 	targetByName := make(map[string]stopTarget, len(targets))
 	for _, target := range targets {
 		targetByName[target.name] = target
@@ -991,7 +1005,7 @@ func gracefulStopAllWithForceSignal(
 	// The configured timeout is the post-dispatch grace window; dispatch
 	// latency is intentionally outside that budget so every interrupted
 	// session still gets the full graceful-exit wait once nudged.
-	sent := interruptTargetsBoundedWithForceSignal(targets, cfg, store, sp, stderr, forceStopRequested)
+	sent := interruptTargetsBoundedWithForceSignal(targets, cfg, store.Store, sp, stderr, forceStopRequested)
 	fmt.Fprintf(stdout, "Sent interrupt to %d/%d agent(s), waiting %s...\n", //nolint:errcheck // best-effort stdout
 		sent, len(names), timeout)
 
@@ -1053,7 +1067,7 @@ func gracefulStopAllWithForceSignal(
 			// variable, which is the session_name. ResolveSessionID
 			// canonicalizes session_name → bead ID for any consumer.
 			sessionID := name
-			var template string
+			var template, agentIdentity string
 			if target, ok := targetByName[name]; ok {
 				if target.subject != "" {
 					subject = target.subject
@@ -1062,19 +1076,21 @@ func gracefulStopAllWithForceSignal(
 					sessionID = target.sessionID
 				}
 				template = target.template
-				if cityStopSessionMarked(store, target.sessionID) {
-					markCityStopSessionAsAsleep(store, target.sessionID, stderr)
+				agentIdentity = target.agentName
+				if cityStopSessionMarked(store.Store, target.sessionID) {
+					markCityStopSessionAsAsleep(sessionFrontDoor(store.Store), target.sessionID, stderr)
 				}
 			}
 			rec.Record(events.Event{
 				Type: events.SessionStopped, Actor: "gc", Subject: subject,
 				Payload: api.SessionLifecyclePayloadJSON(sessionID, template, "exited gracefully"),
 			})
+			telemetry.RecordAgentStop(context.Background(), name, firstNonEmptyGCString(agentIdentity, template), "graceful-exit", nil)
 			continue
 		}
 		survivors = append(survivors, name)
 	}
-	stopTargetsBounded(filterStopTargets(targets, survivors), cfg, store, sp, rec, "gc", stdout, stderr)
+	stopTargetsBounded(filterStopTargets(targets, survivors), cfg, store.Store, sp, rec, "gc", stdout, stderr)
 }
 
 func stopForceRequested(forceStopRequested func() bool) bool {
@@ -1313,8 +1329,10 @@ func runController(
 	cs.pokeCh = pokeCh
 	cs.configDirty = configDirty
 	cs.services = cr.svc
+	cs.emergencyCh = make(chan emergency.Record, 64)
 	cr.setControllerState(cs)
 	cs.startBeadEventWatcher(ctx)
+	cs.startEmergencyEventRelay(ctx)
 	cs.startMaintenanceLoop(ctx)
 
 	// Start API server if configured. Standalone city mode wraps the
@@ -1335,6 +1353,12 @@ func runController(
 		// handler return 501 for create/unregister routes.
 		apiMux := api.NewSupervisorMux(&singleCityStateResolver{state: cs}, nil, readOnly, "controller", commit, time.Now())
 		apiMux.WithAnyHostAllowed()
+		// Gate city-config mutations on a signed write grant when configured.
+		// Fail closed at boot if write-auth is required but no key is set.
+		if err := api.InstallWriteAuth(apiMux, cfg.API.WriteAuthVerifyKey, cfg.API.WriteAuthRequired); err != nil {
+			fmt.Fprintf(stderr, "api: write-auth: %v\n", err) //nolint:errcheck
+			return 1
+		}
 		addr := net.JoinHostPort(bind, strconv.Itoa(cfg.API.Port))
 		apiLis, apiErr := net.Listen("tcp", addr)
 		if apiErr != nil {

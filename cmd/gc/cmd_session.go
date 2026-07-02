@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
+	"github.com/gastownhall/gascity/internal/telemetry"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/spf13/cobra"
@@ -111,6 +112,7 @@ func newSessionNewCmd(stdout, stderr io.Writer) *cobra.Command {
 	var titleHint string
 	var noAttach bool
 	var jsonOutput bool
+	var waitTimeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "new <template>",
 		Short: "Create a new chat session from an agent template",
@@ -131,7 +133,7 @@ session_name. --alias still sets the public command and mail alias.`,
   gc session new helper --no-attach`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdSessionNew(args, alias, title, titleHint, noAttach, jsonOutput, stdout, stderr) != 0 {
+			if cmdSessionNew(args, alias, title, titleHint, noAttach, jsonOutput, waitTimeout, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -142,15 +144,26 @@ session_name. --alias still sets the public command and mail alias.`,
 	cmd.Flags().StringVar(&titleHint, "title-hint", "", "text to auto-generate a session title from")
 	cmd.Flags().BoolVar(&noAttach, "no-attach", false, "create session without attaching")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", defaultSessionNewWaitTimeout, "max time to wait for the reconciler to start the session before attaching")
 	return cmd
 }
+
+// defaultSessionNewWaitTimeout bounds how long "gc session new" waits for the
+// reconciler to start the session before attaching. The session is created
+// asynchronously, so this only bounds the attach step; a fresh-wake session on
+// a busy controller can take longer than the previous 30s. Override per
+// invocation with --wait-timeout.
+const defaultSessionNewWaitTimeout = 120 * time.Second
 
 // cmdSessionNew is the CLI entry point for "gc session new".
 //
 // Phase 2: creates a session bead and pokes the controller. The reconciler
 // handles process lifecycle (start). If the controller is not running,
 // falls back to direct process start via the session manager.
-func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, jsonOutput bool, stdout, stderr io.Writer) int {
+func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, jsonOutput bool, waitTimeout time.Duration, stdout, stderr io.Writer) int {
+	if waitTimeout <= 0 {
+		waitTimeout = defaultSessionNewWaitTimeout
+	}
 	templateName := args[0]
 	if jsonOutput && !noAttach {
 		fmt.Fprintln(stderr, "gc session new: --json requires --no-attach because attaching is interactive") //nolint:errcheck // best-effort stderr
@@ -225,7 +238,8 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	}
 
 	// Store the canonical qualified name so the reconciler can match it
-	// via findAgentByTemplate (which compares against QualifiedName()).
+	// via findAgentByTemplate (which resolves canonical, V1 dir+name, and
+	// legacy bound identities).
 	canonicalTemplate := found.QualifiedName()
 	configuredOwner := sessionNewAliasOwner(cfg, &found)
 	reservationIDs := []string{alias, explicitName}
@@ -319,7 +333,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 				return 1
 			}
 
-			titleDone := maybeAutoTitle(store, info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
+			titleDone := maybeAutoTitle(sessionFrontDoor(store), info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
 			defer func() { <-titleDone }() // ensure title goroutine completes on all exit paths
 
 			// Poke again after bead creation to trigger immediate reconciler tick.
@@ -353,7 +367,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 
 			// Wait for the reconciler to start the session before attaching.
 			fmt.Fprintln(stdout, "Waiting for session to start...") //nolint:errcheck // best-effort stdout
-			if waitErr := waitForSession(sp, info.SessionName, 30*time.Second, store, info.ID, stderr); waitErr != nil {
+			if waitErr := waitForSession(sp, info.SessionName, waitTimeout, sessionFrontDoor(store), info.ID, stderr); waitErr != nil {
 				fmt.Fprintf(stderr, "gc session new: %v\n", waitErr) //nolint:errcheck // best-effort stderr
 				return 1
 			}
@@ -433,7 +447,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 		return 1
 	}
 
-	titleDone := maybeAutoTitle(store, info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
+	titleDone := maybeAutoTitle(sessionFrontDoor(store), info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
 	defer func() { <-titleDone }() // ensure title goroutine completes on all exit paths
 
 	if jsonOutput {
@@ -504,8 +518,8 @@ func newSessionStoredMCPMetadata(
 // channel that is closed when background title generation completes.
 // Short-lived CLI paths (e.g. --no-attach) should block on it before
 // exiting to ensure the model-refined title is persisted.
-func maybeAutoTitle(store beads.Store, beadID, userTitle, titleHint string, provider *config.ResolvedProvider, workDir string, stderr io.Writer) <-chan struct{} {
-	return api.MaybeGenerateTitleAsync(store, beadID, userTitle, titleHint, provider, workDir, func(format string, args ...any) {
+func maybeAutoTitle(sessFront *session.InfoStore, beadID, userTitle, titleHint string, provider *config.ResolvedProvider, workDir string, stderr io.Writer) <-chan struct{} {
+	return api.MaybeGenerateTitleAsync(sessFront.Store().Store, beadID, userTitle, titleHint, provider, workDir, func(format string, args ...any) {
 		fmt.Fprintf(stderr, "session %s: "+format+"\n", append([]any{beadID}, args...)...) //nolint:errcheck // best-effort stderr
 	})
 }
@@ -644,7 +658,7 @@ func sessionNewAliasOwner(cfg *config.City, agent *config.Agent) string {
 // waitForSession polls the provider until the session is running or timeout.
 // If a bead store is provided, it checks for early failure (bead transitioned
 // to "closed" state) and logs progress every 5 seconds.
-func waitForSession(sp runtime.Provider, sessionName string, timeout time.Duration, store beads.Store, beadID string, stderr io.Writer) error {
+func waitForSession(sp runtime.Provider, sessionName string, timeout time.Duration, sessFront *session.InfoStore, beadID string, stderr io.Writer) error {
 	deadline := time.Now().Add(timeout)
 	lastProgress := time.Now()
 	for time.Now().Before(deadline) {
@@ -652,8 +666,8 @@ func waitForSession(sp runtime.Provider, sessionName string, timeout time.Durati
 			return nil
 		}
 		// Check for early failure: bead closed or stuck in creating.
-		if store != nil && beadID != "" {
-			if b, err := store.Get(beadID); err == nil {
+		if sessFront != nil && beadID != "" {
+			if b, err := sessFront.Store().Get(beadID); err == nil {
 				if b.Status == "closed" {
 					return fmt.Errorf("session %q failed to start (bead %s closed)", sessionName, beadID)
 				}
@@ -764,7 +778,7 @@ func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool,
 	}
 
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tAGE\tLAST ACTIVE") //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tWORKDIR\tAGE\tLAST ACTIVE") //nolint:errcheck // best-effort stdout
 	for _, s := range cr.Body {
 		state := s.State
 		if state == "" {
@@ -776,9 +790,10 @@ func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool,
 		}
 		target := sessionViewTarget(s)
 		title := sessionViewTitle(s)
+		workDir := sessionViewWorkDir(s)
 		age := sessionViewAge(s.CreatedAt)
 		lastActive := sessionViewLastActive(s.LastActive)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, age, lastActive) //nolint:errcheck // best-effort stdout
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, workDir, age, lastActive) //nolint:errcheck // best-effort stdout
 	}
 	_ = w.Flush() //nolint:errcheck // best-effort stdout
 
@@ -810,6 +825,10 @@ func sessionViewTitle(s SessionView) string {
 		return title[:27] + "..."
 	}
 	return title
+}
+
+func sessionViewWorkDir(s SessionView) string {
+	return sessionListDisplayValue(s.WorkDir)
 }
 
 // sessionViewAge formats a CreatedAt RFC3339 string the same way the
@@ -951,7 +970,7 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 	cachedSP := &attachmentCachingProvider{Provider: sp, cache: attachedSet}
 
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tAGE\tLAST ACTIVE\tLAST NUDGE") //nolint:errcheck // best-effort stdout
+	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tWORKDIR\tAGE\tLAST ACTIVE\tLAST NUDGE") //nolint:errcheck // best-effort stdout
 	for _, s := range sessions {
 		state := string(s.State)
 		if s.State == "" {
@@ -960,6 +979,7 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 		reason := sessionReason(s, beadIndex, cfg, cachedSP, poolDesired, readyWaitSet)
 		target := sessionListTarget(s)
 		title := sessionListTitle(s)
+		workDir := sessionListWorkDir(s)
 		age := formatDuration(time.Since(s.CreatedAt))
 		lastActive := "-"
 		if !s.LastActive.IsZero() {
@@ -969,7 +989,7 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 		if !s.LastNudgeDeliveredAt.IsZero() {
 			lastNudge = formatDuration(time.Since(s.LastNudgeDeliveredAt)) + " ago"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, age, lastActive, lastNudge) //nolint:errcheck // best-effort stdout
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, workDir, age, lastActive, lastNudge) //nolint:errcheck // best-effort stdout
 	}
 	_ = w.Flush() //nolint:errcheck // best-effort stdout
 	return 0
@@ -1143,6 +1163,18 @@ func sessionListTitle(s session.Info) string {
 	return title
 }
 
+func sessionListWorkDir(s session.Info) string {
+	return sessionListDisplayValue(s.WorkDir)
+}
+
+func sessionListDisplayValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
 // attachmentCachingProvider wraps a runtime.Provider and caches IsAttached
 // results to avoid redundant tmux subprocess calls. wakeReasons calls
 // IsAttached per session, but cmdSessionList already queried it.
@@ -1173,6 +1205,13 @@ func (p *attachmentCachingProvider) SleepCapability(name string) runtime.Session
 		return scp.SleepCapability(name)
 	}
 	return runtime.SessionSleepCapabilityDisabled
+}
+
+func (p *attachmentCachingProvider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
+	if rp, ok := p.Provider.(runtime.RelaunchProvider); ok {
+		return rp.Relaunch(ctx, name, cfg)
+	}
+	return runtime.ErrRelaunchUnsupported
 }
 
 func (p *attachmentCachingProvider) Pending(name string) (*runtime.PendingInteraction, error) {
@@ -1589,7 +1628,7 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 			// Controller is running — metadata-only suspend.
 			// Set held_until far in the future so the reconciler drains/stops the session.
 			heldUntil := time.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
-			if err := store.SetMetadataBatch(sessionID, map[string]string{
+			if err := sessionFrontDoor(store).ApplyPatch(sessionID, map[string]string{
 				"held_until":   heldUntil,
 				"sleep_intent": "user-hold",
 				"state":        "suspended",
@@ -2167,6 +2206,10 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 	return cmd
 }
 
+// sessionKillPokeController is a mutable global test seam over pokeController.
+// Tests that swap it MUST NOT call t.Parallel().
+var sessionKillPokeController = pokeController
+
 // cmdSessionKill is the CLI entry point for "gc session kill".
 func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
@@ -2222,6 +2265,31 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		fmt.Fprintf(stderr, "gc session kill: warning: session %s runtime was already inactive; cleared named-session circuit breaker\n", sessionID) //nolint:errcheck // best-effort stderr
 	}
 
+	// Sync the bead to asleep so a later `gc session wake` / reconcile starts
+	// a fresh runtime instead of short-circuiting on the stale live state the
+	// kill leaves behind (#3629). Written here at the CLI layer rather than in
+	// Manager.Kill so the drain-ack async-stop path (verifiedStop ->
+	// handle.Kill -> Manager.Kill) keeps owning its own lifecycle state.
+	if beadErr == nil {
+		now := time.Now().UTC()
+		patch := session.SleepPatch(now, "killed")
+		patch["synced_at"] = now.Format(time.RFC3339)
+		if err := store.SetMetadataBatch(sessionID, patch); err != nil {
+			fmt.Fprintf(stderr, "gc session kill: warning: syncing session %s to asleep: %v\n", sessionID, err) //nolint:errcheck // best-effort stderr
+		}
+	}
+
+	// Poke the controller after the asleep sync so the reconciler observes the
+	// killed state immediately instead of waiting a full patrol interval to
+	// revive an always-named session (#3812), the same poke-after-state-write
+	// approach the drain-ack path uses (doRuntimeDrainAck). Best-effort and
+	// unconditional: a poke failure (e.g. no controller running) is non-fatal,
+	// and a spurious poke when the asleep sync was skipped is harmless — the
+	// reconciler observes unchanged state and continues.
+	if err := sessionKillPokeController(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc session kill: warning: poke failed: %v\n", err) //nolint:errcheck // best-effort stderr
+	}
+
 	// Use the resolved session ID as the canonical Subject for event
 	// consumers. This ensures a stable key regardless of how the user
 	// specified the target (session ID or alias).
@@ -2233,6 +2301,7 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		Message: "killed",
 		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "killed"),
 	})
+	recordSessionKillStop(bead, beadErr, cfg)
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
 			Action:    "kill",
@@ -2245,6 +2314,24 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 	}
 	fmt.Fprintf(stdout, "Session %s killed.\n", sessionID) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+// recordSessionKillStop records gc.agent.stops.total for a manual
+// "gc session kill", beside the SessionStopped emission. The metric reason is
+// "killed" to match the adjacent SessionStopped event payload so operators can
+// distinguish a manual kill from an ordinary stop. Skip-on-unknown: when the
+// session bead failed to load (or carries no bounded session name) nothing is
+// recorded — an unknown identity must not become a garbage metric label.
+// Purely observational: it never influences control flow or the exit code.
+func recordSessionKillStop(bead beads.Bead, beadErr error, cfg *config.City) {
+	if beadErr != nil {
+		return
+	}
+	sessionName := strings.TrimSpace(bead.Metadata["session_name"])
+	if sessionName == "" {
+		return
+	}
+	telemetry.RecordAgentStop(context.Background(), sessionName, sessionAgentMetricIdentity(bead, cfg), "killed", nil)
 }
 
 func sessionKillRuntimeAlreadyInactive(bead beads.Bead, sp runtime.Provider) bool {

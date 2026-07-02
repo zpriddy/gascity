@@ -99,9 +99,11 @@ func cityDoltConfigHasLifecycleFields(cfg config.DoltConfig) bool {
 	return cfg.Host != "" ||
 		cfg.Port != 0 ||
 		cfg.ArchiveLevel != nil ||
+		cfg.AutoGCEnabled != nil ||
 		cfg.MaxConnections != 0 ||
 		cfg.ReadTimeoutMillis != 0 ||
-		cfg.WriteTimeoutMillis != 0
+		cfg.WriteTimeoutMillis != 0 ||
+		cfg.DoltLockReleaseTimeout != ""
 }
 
 func registerCityDoltConfig(cityPath string, cfg config.DoltConfig) {
@@ -134,11 +136,9 @@ var (
 var (
 	initDirIfReadyEnsureBeadsProvider = ensureBeadsProvider
 	initDirIfReadyInitAndHookDir      = initAndHookDir
-	initDirIfReadyRetryDelay          = time.Second
+	initDirIfReadyWaitForManagedDolt  = waitForManagedDoltInitReady
 	initAndHookDirWaitForScopeReady   = waitForBeadsScopeReadyAfterRecovery
 )
-
-const initDirIfReadyRetryLimit = 2
 
 func isRetryableManagedDoltLifecycleError(err error) bool {
 	if err == nil {
@@ -187,42 +187,21 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	} else {
 		clearCityDoltConfig(cityPath)
 	}
-	// Skip local Dolt startup only when canonical or compatibility topology
-	// says the city endpoint is external. Managed-local cities may not have a
-	// published runtime port yet on first startup, so this guard must not depend
-	// on runtime-state resolution.
-	// Also skip when the city uses a shared Dolt server (dolt.shared-server: true
-	// with dolt.auto-start: false) — the shared server is managed externally.
 	skipLocalDolt := false
-	if cityUsesManagedDoltBeadsLifecycle(cityPath) {
+	switch {
+	case isExternalDolt(cityPath):
+		// An externally-pinned dolt endpoint (city_canonical / explicit, e.g. a
+		// hosted beads-gateway) is not a gc-managed local lifecycle: connect to
+		// the external server, never spawn or adopt a local managed Dolt for it.
+		skipLocalDolt = true
+	case cityUsesManagedDoltBeadsLifecycle(cityPath):
 		owned, err := managedDoltLifecycleOwned(cityPath)
 		if err != nil {
 			return err
 		}
 		skipLocalDolt = !owned
-	} else if cityUsesDoltliteBeadsBackend(cityPath) {
+	case cityUsesDoltliteBeadsBackend(cityPath):
 		skipLocalDolt = true
-	}
-	if !skipLocalDolt && cityUsesSharedDoltServer(cityPath) {
-		skipLocalDolt = true
-	}
-	// When using a shared dolt server, inject the port into the process
-	// environment so ALL downstream code (Go store opens, bd subprocess
-	// calls, shell scripts) resolves the correct port without needing
-	// managed runtime state files.
-	if skipLocalDolt && cityUsesSharedDoltServer(cityPath) {
-		port := resolveSharedDoltServerPort()
-		if port != "" {
-			os.Setenv("BEADS_DOLT_SERVER_PORT", port)
-			os.Setenv("GC_DOLT_PORT", port)
-		} else {
-			// Shared-server cities require an external Dolt server; gc must
-			// not silently fall back to spawning a local dolt. Fail loudly so
-			// the operator fixes the config or starts the shared server,
-			// rather than ending up with a per-city dolt the city was
-			// explicitly configured to avoid.
-			return fmt.Errorf("shared Dolt server is required (dolt.shared-server: true) but the port cannot be resolved: set BEADS_DOLT_SERVER_PORT, write ~/.beads/shared-server/dolt-server.port, or ensure ~/.beads/shared-server/dolt-config.yaml has listener.port set; then start the shared server (e.g. `dolt sql-server --config ~/.beads/shared-server/dolt-config.yaml`)")
-		}
 	}
 	if !skipLocalDolt {
 		if err := ensureBeadsProvider(cityPath); err != nil {
@@ -267,17 +246,7 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 // skipped init — the caller should tell the user it's deferred to gc start.
 func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 	provider := beadsProvider(cityPath)
-	// MySQL-backed cities cascade to new rigs by running bd init --backend=mysql
-	// against the rig dir, then writing canonical metadata pointing at the
-	// city's database. The dolt-managed paths below are skipped entirely —
-	// mysql cities have no managed runtime to coordinate with.
-	if cityUsesMySQLBackend(cityPath) {
-		if err := initDirIfReadyManagedMysql(cityPath, dir, prefix); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	if cityUsesBdStoreContract(cityPath) {
+	if cityUsesManagedDoltBeadsLifecycle(cityPath) {
 		if gcDoltSkip() {
 			// Defer to controller/startup without forcing a new dolt_database:
 			// preserve existing metadata identity when present.
@@ -291,6 +260,16 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 			return false, err
 		}
 		if !owned {
+			// An unverified external (hosted) endpoint has no guaranteed
+			// credentials at init time. Write the canonical scope files and
+			// defer the live bd init to gc start, which carries the credential
+			// command; init never requires a live connection (R5).
+			if cityExternalDoltEndpointUnverified(cityPath) {
+				if err := seedDeferredManagedBeadsErr(cityPath, dir, prefix, ""); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
 			if err := initDirIfReadyInitAndHookDir(cityPath, dir, prefix); err != nil {
 				return false, err
 			}
@@ -327,31 +306,14 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 	return false, nil
 }
 
-func initDirIfReadyManagedDolt(cityPath, dir, prefix, provider string) error {
-	var err error
-	for attempt := 1; attempt <= initDirIfReadyRetryLimit; attempt++ {
-		if err = initDirIfReadyEnsureBeadsProvider(cityPath); err != nil {
-			err = fmt.Errorf("bead store: %w", err)
-		} else if err = initDirIfReadyInitAndHookDir(cityPath, dir, prefix); err == nil {
-			return nil
-		}
-		if attempt == initDirIfReadyRetryLimit || !shouldRetryInitDirIfReady(cityPath, provider, err) {
-			return err
-		}
-		time.Sleep(initDirIfReadyRetryDelay)
+func initDirIfReadyManagedDolt(cityPath, dir, prefix, _ string) error {
+	if err := initDirIfReadyEnsureBeadsProvider(cityPath); err != nil {
+		return fmt.Errorf("bead store: %w", err)
 	}
-	return err
-}
-
-func shouldRetryInitDirIfReady(cityPath, provider string, err error) bool {
-	if !providerUsesBdStoreContract(provider) || !cityUsesManagedDoltBeadsLifecycle(cityPath) {
-		return false
+	if err := initDirIfReadyWaitForManagedDolt(cityPath, managedDoltInitReadyTimeout); err != nil {
+		return err
 	}
-	owned, ownershipErr := managedDoltLifecycleOwned(cityPath)
-	if ownershipErr != nil || !owned {
-		return false
-	}
-	return isRetryableManagedDoltLifecycleError(err)
+	return initDirIfReadyInitAndHookDir(cityPath, dir, prefix)
 }
 
 func desiredScopeDoltConfigStateForInit(cityPath, dir, prefix string) (contract.ConfigState, bool, error) {
@@ -524,54 +486,22 @@ func normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase s
 		// Preserve legacy probe metadata during startup normalization so old
 		// scopes can still boot and migrate deliberately. New init paths still
 		// reject this reserved name when it is not already pinned in metadata.
-		if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase); err != nil {
-			return err
-		}
-	} else if err := enforceCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase); err != nil {
-		return err
+		return ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase)
 	}
-	// Opt-in proxied-server overlay (no-op/revert when the city does not opt in
-	// or bd lacks support). cfg load failure falls back to server mode (safe).
-	cfg, _ := loadCityConfig(cityPath, io.Discard)
-	return applyProxiedServerScopeOverlay(fsys.OSFS{}, cityPath, dir, proxiedServerScopeActive(cfg))
+	return enforceCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase)
 }
 
 // initAndHookDir is the atomic unit of bead store initialization:
-// init the directory, then install event hooks. The ordering matters
-// because init (bd init) may recreate .beads/ and wipe existing hooks.
+// init the directory, then remove any stale gc-managed bead event hooks.
+// The ordering matters because init (bd init) may recreate .beads/ and
+// wipe existing hooks. installBeadHooks only removes gc-stamped hooks and
+// is always safe to run regardless of event_hooks config.
 func initAndHookDir(cityPath, dir, prefix string) error {
-	// Honor [beads] event_hooks=false: skip installing the bd write hooks
-	// (on_create/on_update/on_close). Those hooks fork a full `gc event emit`
-	// per bead write — a real CPU/connection-churn source under load — and a
-	// city that opts out of them must not have them silently reinstalled on
-	// every reconcile. Default (unset) stays true. Load failure → default true.
-	installHooks := true
-	if cfg, err := loadCityConfig(cityPath, io.Discard); err == nil {
-		installHooks = cfg.Beads.EventHooksEnabled()
-	}
-	// Check MySQL first: scopeUsesPostgresBackendForInit calls
-	// contract.LoadMetadataState, which rejects unknown backends including
-	// "mysql" with an error. The mysql check is a cheap direct read that
-	// tolerates any backend value.
-	//
-	// Rigs without their own metadata.json inherit the city's MySQL backend
-	// — gc has no managed dolt runtime to spawn for them, so we just install
-	// hooks and exit.
-	if scopeUsesMySQLBackendForInit(dir) || cityUsesMySQLBackend(cityPath) {
-		if installHooks {
-			if err := installBeadHooks(dir, cityPath); err != nil {
-				return fmt.Errorf("install hooks at %s: %w", dir, err)
-			}
-		}
-		return nil
-	}
 	if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, dir); err != nil {
 		return err
 	} else if usesPostgres {
-		if installHooks {
-			if err := installBeadHooks(dir, cityPath); err != nil {
-				return fmt.Errorf("install hooks at %s: %w", dir, err)
-			}
+		if err := installBeadHooks(dir, cityPath); err != nil {
+			return fmt.Errorf("install hooks at %s: %w", dir, err)
 		}
 		return nil
 	}
@@ -607,10 +537,8 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		}
 	}
 	// Non-fatal: hooks are convenience (event forwarding), not critical.
-	if installHooks {
-		if err := installBeadHooks(dir, cityPath); err != nil {
-			return fmt.Errorf("install hooks at %s: %w", dir, err)
-		}
+	if err := installBeadHooks(dir, cityPath); err != nil {
+		return fmt.Errorf("install hooks at %s: %w", dir, err)
 	}
 	return nil
 }
@@ -637,13 +565,6 @@ func scopeUsesPostgresBackendForInit(cityPath, dir string) (bool, error) {
 	}
 	_, usesPostgres, err := postgresMetadataForScope(cityPath, dir)
 	return usesPostgres, err
-}
-
-// scopeUsesMySQLBackendForInit returns true when the scope's metadata.json
-// declares backend: mysql. Direct read (mirrors cityUsesMySQLBackend) so the
-// init path can branch without pulling in postgres-style scope inheritance.
-func scopeUsesMySQLBackendForInit(dir string) bool {
-	return cityUsesMySQLBackend(dir)
 }
 
 func allowLegacyDoltMetadataRepair(fs fsys.FS, path string, err error) bool {
@@ -686,6 +607,14 @@ func allowLegacyDoltMetadataRepair(fs fsys.FS, path string, err error) bool {
 // the helper is safe to call from new sites without re-checking.
 var verifyManagedDoltDatabaseExistsAfterInit = func(cityPath, dir, dbName string) error {
 	if !cityUsesBdStoreContract(cityPath) {
+		return nil
+	}
+	if isExternalDolt(cityPath) {
+		// External/hosted dolt endpoint (e.g. a per-tenant beads-gateway): the
+		// managed-local catalog is irrelevant, and the gateway denies the
+		// SHOW DATABASES catalog listing this guard relies on (it scopes each
+		// connection to its own provisioner-created project DB). Reachability of
+		// that DB is already proven by bd init's own connection.
 		return nil
 	}
 	port := currentResolvableManagedDoltPort(cityPath)
@@ -779,17 +708,11 @@ func resolveRigPaths(cityPath string, rigs []config.Rig) {
 // For exec providers, fires "start". For file providers, always available.
 // Acquires a per-city semaphore to prevent concurrent start operations
 // from causing spawn storms.
-// No-op when the city uses a shared Dolt server (gc does not own the lifecycle).
 func ensureBeadsProvider(cityPath string) error {
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return nil
 	}
-	if cityUsesSharedDoltServer(cityPath) {
-		return nil
-	}
-	// MySQL-backed bd cities have no managed-dolt service to start. bd talks
-	// directly to the external MySQL server using params from metadata.json.
-	if cityUsesMySQLBackend(cityPath) {
+	if cityUsesDoltliteBeadsBackend(cityPath) {
 		return nil
 	}
 	provider := beadsProvider(cityPath)
@@ -835,23 +758,12 @@ func ensureBeadsProvider(cityPath string) error {
 // shutdownBeadsProvider stops the bead store's backing service.
 // Called by gc stop after agents have been terminated.
 // For exec providers, fires "stop". For file providers, always available.
-// Skips stop when the city uses a shared Dolt server (dolt.shared-server: true).
 func shutdownBeadsProvider(cityPath string) error {
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return clearManagedDoltRuntimeStateUnlessPostgres(cityPath)
 	}
-	// When the city uses a shared Dolt server, gc does not own the server
-	// lifecycle. Skip the stop operation but clear any stale gc-managed
-	// runtime state that may have been left by a prior non-shared run.
-	if cityUsesSharedDoltServer(cityPath) {
-		return clearManagedDoltRuntimeStateIfOwned(cityPath)
-	}
-	// MySQL-backed bd cities have no managed-dolt service to stop. There is
-	// also no gc-owned runtime state to clear (managedDoltLifecycleOwned
-	// returns false for mysql, so clearManagedDoltRuntimeStateIfOwned is a
-	// no-op anyway — call it for symmetry with shared-dolt path).
-	if cityUsesMySQLBackend(cityPath) {
-		return clearManagedDoltRuntimeStateIfOwned(cityPath)
+	if cityUsesDoltliteBeadsBackend(cityPath) {
+		return clearManagedDoltRuntimeStateUnlessPostgres(cityPath)
 	}
 	provider := beadsProvider(cityPath)
 	if strings.HasPrefix(provider, "exec:") {
@@ -896,13 +808,6 @@ func initBeadsForDir(cityPath, dir, prefix, doltDatabase string) error {
 		}
 		return nil
 	}
-	// MySQL-backed bd cities are initialized by the user via
-	// `bd init --backend=mysql`. gc must NOT re-run bd init here — doing so
-	// with default (dolt) backend would bulldoze the existing mysql
-	// metadata.json and break the city. Treat as already-initialized.
-	if cityUsesMySQLBackend(cityPath) {
-		return nil
-	}
 	provider := beadsProvider(cityPath)
 	if provider == "file" {
 		return initFileStoreForDir(cityPath, dir)
@@ -945,14 +850,6 @@ func initBeadsForDir(cityPath, dir, prefix, doltDatabase string) error {
 				overrides["GC_PACK_STATE_DIR"] = citylayout.PackStateDir(cityPath, "dolt")
 				if err := applyCanonicalScopeInitDoltEnv(overrides, cityPath, dir); err != nil {
 					return err
-				}
-			}
-			// Propagate shared server port to bd subprocess so it connects
-			// to the shared dolt server instead of trying auto-start.
-			if cityUsesSharedDoltServer(cityPath) {
-				if port := resolveSharedDoltServerPort(); port != "" {
-					overrides["BEADS_DOLT_SERVER_PORT"] = port
-					overrides["GC_DOLT_PORT"] = port
 				}
 			}
 			env := overlayEnvEntries(baseEnv, overrides)
@@ -1149,10 +1046,7 @@ func healthBeadsProvider(cityPath string) error {
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return nil
 	}
-	// MySQL-backed bd cities have no gc-managed health probe — bd talks
-	// directly to the external MySQL server. Treat as healthy here; bd will
-	// surface MySQL connectivity errors at first use.
-	if cityUsesMySQLBackend(cityPath) {
+	if cityUsesDoltliteBeadsBackend(cityPath) {
 		return nil
 	}
 	provider := beadsProvider(cityPath)
@@ -1289,24 +1183,6 @@ func isExternalDolt(cityPath string) bool {
 	return err == nil && ok && target.External
 }
 
-// cityUsesSharedDoltServer returns true when the city's .beads/config.yaml
-// declares dolt.shared-server: true (and dolt.auto-start: false). This means
-// the city relies on an externally-managed shared Dolt server (typically at
-// ~/.beads/shared-server/) rather than a gc-managed per-city instance. When
-// true, gc must not start or stop a local Dolt server for this city.
-func cityUsesSharedDoltServer(cityPath string) bool {
-	cfgPath := filepath.Join(cityPath, ".beads", "config.yaml")
-	shared, err := contract.ReadSharedServerEnabled(fsys.OSFS{}, cfgPath)
-	if err != nil || !shared {
-		return false
-	}
-	autoStartDisabled, err := contract.ReadAutoStartDisabled(fsys.OSFS{}, cfgPath)
-	if err != nil {
-		return false
-	}
-	return autoStartDisabled
-}
-
 // doltHostForCity returns the effective Dolt host for a city.
 // Canonical or compat-configured targets win over ambient env so child
 // processes stay aligned with the resolved city endpoint. Env-only host
@@ -1383,23 +1259,9 @@ type doltRuntimeState struct {
 // .beads/dolt-server.port is a compatibility mirror for raw bd, not a GC
 // control-plane input.
 func currentDoltPort(cityPath string) string {
-	// MySQL-backed bd cities have no managed-dolt port at all. Skip the
-	// resolution dance and remove any stale compatibility port file.
-	if cityUsesMySQLBackend(cityPath) {
-		removeDoltPortFile(cityPath)
-		return ""
-	}
 	if port := currentResolvableManagedDoltPort(cityPath); port != "" {
 		writeDoltPortFile(cityPath, port, "", io.Discard)
 		return port
-	}
-	// When the city uses a shared Dolt server, resolve the shared server
-	// port and write it to the compatibility port file so bd can find it.
-	if cityUsesSharedDoltServer(cityPath) {
-		if port := resolveSharedDoltServerPort(); port != "" {
-			writeDoltPortFile(cityPath, port, "", io.Discard)
-			return port
-		}
 	}
 	removeDoltPortFile(cityPath)
 	return ""
@@ -1509,17 +1371,24 @@ func writeDoltPortFile(dir, port, scopeLabel string, warn io.Writer) {
 		}
 		fmt.Fprintf(warn, "WARN: %s .beads/dolt-server.port rewrite %s → %s (managed city port)\n", label, existing, trimmedPort) //nolint:errcheck // best-effort stderr
 	}
-	if err := ensureBeadsDir(fsys.OSFS{}, filepath.Dir(portFile)); err != nil {
+	writePath, err := resolveDoltPortFileWritePath(fsys.OSFS{}, portFile)
+	if err != nil {
 		return
 	}
-	_ = fsys.WriteFileAtomic(fsys.OSFS{}, portFile, []byte(trimmedPort+"\n"), 0o644)
+	if err := ensureBeadsDir(fsys.OSFS{}, filepath.Dir(writePath)); err != nil {
+		return
+	}
+	_ = fsys.WriteFileAtomic(fsys.OSFS{}, writePath, []byte(trimmedPort+"\n"), 0o644)
 }
 
 func removeDoltPortFile(dir string) {
 	if dir == "" {
 		return
 	}
-	_ = os.Remove(filepath.Join(dir, ".beads", "dolt-server.port"))
+	// Resolve through any operator symlink so cleanup clears the target and
+	// preserves the link, mirroring writeDoltPortFile's symlink-preserving
+	// write path (ga-lurp5d). Best-effort: ignore the resolve/remove error.
+	_ = removeResolvedDoltPortFile(fsys.OSFS{}, dir)
 }
 
 func removeScopeLocalDoltServerArtifacts(dir string) error {
@@ -1563,10 +1432,6 @@ func ensureCanonicalScopeMetadata(fs fsys.FS, scopeRoot, doltDatabase string, pr
 				return err
 			}
 		} else if ok && existing.Backend == "postgres" {
-			return nil
-		} else if ok && existing.Backend == "mysql" {
-			// MySQL-backed scopes manage their own metadata via bd. Do not
-			// rewrite to dolt-shaped canonical form.
 			return nil
 		}
 		if existing, ok, err := contract.ReadDoltDatabase(fs, path); err != nil {
@@ -1662,11 +1527,14 @@ func normalizeCanonicalBdScopeFiles(cityPath string, cfg *config.City, warns ...
 	if scopeUsesManagedBdStoreContract(cityPath, cityPath) {
 		if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cityPath); err != nil {
 			return fmt.Errorf("classifying city backend: %w", err)
-		} else if !usesPostgres && !scopeUsesMySQLBackendForInit(cityPath) {
-			if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cityPath, defaultScopeDoltDatabase(cityPath, cityPath, config.EffectiveHQPrefix(cfg))); err != nil {
+		} else if !usesPostgres {
+			doltDatabase := defaultScopeDoltDatabase(cityPath, cityPath, config.EffectiveHQPrefix(cfg))
+			if cityUsesDoltliteBeadsBackend(cityPath) {
+				if err := ensureCanonicalDoltliteScopeMetadataForInit(fsys.OSFS{}, cityPath, doltDatabase); err != nil {
+					return fmt.Errorf("canonicalizing city doltlite metadata: %w", err)
+				}
+			} else if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cityPath, doltDatabase); err != nil {
 				return fmt.Errorf("canonicalizing city metadata: %w", err)
-			} else if err := applyProxiedServerScopeOverlay(fsys.OSFS{}, cityPath, cityPath, proxiedServerScopeActive(cfg)); err != nil {
-				return fmt.Errorf("applying proxied overlay to city: %w", err)
 			}
 		}
 	}
@@ -1676,11 +1544,14 @@ func normalizeCanonicalBdScopeFiles(cityPath string, cfg *config.City, warns ...
 		}
 		if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cfg.Rigs[i].Path); err != nil {
 			return fmt.Errorf("classifying rig %q backend: %w", cfg.Rigs[i].Name, err)
-		} else if !usesPostgres && !scopeUsesMySQLBackendForInit(cfg.Rigs[i].Path) {
-			if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cfg.Rigs[i].Path, defaultScopeDoltDatabase(cityPath, cfg.Rigs[i].Path, cfg.Rigs[i].EffectivePrefix())); err != nil {
+		} else if !usesPostgres {
+			doltDatabase := defaultScopeDoltDatabase(cityPath, cfg.Rigs[i].Path, cfg.Rigs[i].EffectivePrefix())
+			if cityUsesDoltliteBeadsBackend(cityPath) {
+				if err := ensureCanonicalDoltliteScopeMetadataForInit(fsys.OSFS{}, cfg.Rigs[i].Path, doltDatabase); err != nil {
+					return fmt.Errorf("canonicalizing rig %q doltlite metadata: %w", cfg.Rigs[i].Name, err)
+				}
+			} else if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, cfg.Rigs[i].Path, doltDatabase); err != nil {
 				return fmt.Errorf("canonicalizing rig %q metadata: %w", cfg.Rigs[i].Name, err)
-			} else if err := applyProxiedServerScopeOverlay(fsys.OSFS{}, cityPath, cfg.Rigs[i].Path, proxiedServerScopeActive(cfg)); err != nil {
-				return fmt.Errorf("applying proxied overlay to rig %q: %w", cfg.Rigs[i].Name, err)
 			}
 		}
 	}
@@ -1702,14 +1573,12 @@ func syncConfiguredDoltPortFiles(cityPath string, cityDolt config.DoltConfig, ci
 	resolveRigPaths(cityPath, rigs)
 	cityUsesBd := scopeUsesManagedBdStoreContract(cityPath, cityPath)
 	cityUsesPostgres := false
-	cityUsesMySQL := false
 	if cityUsesBd {
 		usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, cityPath)
 		if err != nil {
 			return fmt.Errorf("classifying city backend: %w", err)
 		}
 		cityUsesPostgres = usesPostgres
-		cityUsesMySQL = scopeUsesMySQLBackendForInit(cityPath)
 	}
 	anyRigUsesBd := false
 	for _, rig := range rigs {
@@ -1736,12 +1605,10 @@ func syncConfiguredDoltPortFiles(cityPath string, cityDolt config.DoltConfig, ci
 		managedPort = currentDoltPort(cityPath)
 	}
 	if cityUsesBd {
-		if !cityUsesMySQL {
-			if err := normalizeScopeDoltConfig(cityPath, cityState); err != nil {
-				return err
-			}
+		if err := normalizeScopeDoltConfig(cityPath, cityState); err != nil {
+			return err
 		}
-		if !cityUsesPostgres && !cityUsesMySQL {
+		if !cityUsesPostgres {
 			if managedPort != "" {
 				writeDoltPortFile(cityPath, managedPort, "city", warn)
 			} else {
@@ -1758,11 +1625,6 @@ func syncConfiguredDoltPortFiles(cityPath string, cityDolt config.DoltConfig, ci
 			continue
 		}
 		if !rigUsesManagedBdStoreContract(cityPath, rig) {
-			removeDoltPortFile(rig.Path)
-			continue
-		}
-		// Skip dolt config/port management for mysql-backed rigs.
-		if scopeUsesMySQLBackendForInit(rig.Path) {
 			removeDoltPortFile(rig.Path)
 			continue
 		}
@@ -2138,9 +2000,11 @@ func providerLifecycleProcessEnvFromBase(cityPath, provider string, env []string
 		"GC_DOLT_LOCK_FILE",
 		"GC_DOLT_CONFIG_FILE",
 		"GC_DOLT_ARCHIVE_LEVEL",
+		"GC_DOLT_AUTO_GC_ENABLED",
 		"GC_DOLT_MAX_CONNECTIONS",
 		"GC_DOLT_READ_TIMEOUT_MILLIS",
 		"GC_DOLT_WRITE_TIMEOUT_MILLIS",
+		"GC_DOLT_LOCK_RELEASE_TIMEOUT_MS",
 	} {
 		env = removeEnvKey(env, key)
 	}
@@ -2171,6 +2035,9 @@ func providerLifecycleProcessEnvFromBase(cityPath, provider string, env []string
 		if dc.ArchiveLevel != nil {
 			env = append(env, fmt.Sprintf("GC_DOLT_ARCHIVE_LEVEL=%d", *dc.ArchiveLevel))
 		}
+		if dc.AutoGCEnabled != nil {
+			env = append(env, fmt.Sprintf("GC_DOLT_AUTO_GC_ENABLED=%t", *dc.AutoGCEnabled))
+		}
 		if dc.MaxConnections > 0 {
 			env = append(env, fmt.Sprintf("GC_DOLT_MAX_CONNECTIONS=%d", dc.MaxConnections))
 		}
@@ -2179,6 +2046,11 @@ func providerLifecycleProcessEnvFromBase(cityPath, provider string, env []string
 		}
 		if dc.WriteTimeoutMillis > 0 {
 			env = append(env, fmt.Sprintf("GC_DOLT_WRITE_TIMEOUT_MILLIS=%d", dc.WriteTimeoutMillis))
+		}
+		// An explicit "0s" is meaningful (probe once, no wait), so gate on
+		// field presence rather than a non-zero duration.
+		if dc.DoltLockReleaseTimeout != "" {
+			env = append(env, fmt.Sprintf("GC_DOLT_LOCK_RELEASE_TIMEOUT_MS=%d", dc.DoltLockReleaseTimeoutDuration().Milliseconds()))
 		}
 	}
 	// `gc start` runs in the user's shell, which doesn't see vars set
@@ -2250,12 +2122,16 @@ func acquireProviderSemaphoreForOp(cityPath, op string) (func(), error) {
 }
 
 // providerOpTimeout returns the context timeout for a given lifecycle
-// operation. The "start" and "recover" operations get a longer timeout
-// because dolt server startup can take 30+ seconds for large data dirs.
-// All other operations use 30s.
+// operation. The "start", "recover", and "init" operations get a longer
+// timeout: dolt server startup can take 30+ seconds for large data dirs, and
+// initializing a rig's bead store can likewise exceed 30s when it creates or
+// migrates a database on a busy shared dolt server. Under the old 30s budget,
+// init of an existing-but-unmigrated rig DB during a config reload was
+// SIGKILLed, leaving the supervisor "keeping old config" so newly configured
+// rigs never came online. All other operations use 30s.
 var providerOpTimeout = func(op string) time.Duration {
 	switch op {
-	case "start", "recover":
+	case "start", "recover", "init":
 		return 120 * time.Second
 	default:
 		return 30 * time.Second

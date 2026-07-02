@@ -2783,7 +2783,7 @@ func TestCloseBeadClearsPendingCreateClaimEvenWhenCloseFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if closeFailedCreateBead(store, b.ID, now, ioDiscard{}) {
+	if closeFailedCreateBead(sessionFrontDoor(store), b.ID, now, ioDiscard{}) {
 		t.Fatal("closeFailedCreateBead returned true, want false when Close fails")
 	}
 	got, err := store.Get(b.ID)
@@ -3040,7 +3040,7 @@ func TestSyncSessionBeads_StalePoolSnapshotReusesVisibleOwner(t *testing.T) {
 	sp := runtime.NewFake()
 	template := "pack/worker"
 
-	owner, err := createPoolSessionBead(store, template, clk.Now(), poolSessionCreateIdentity{})
+	owner, err := createPoolSessionBead(sessionFrontDoor(store), template, clk.Now(), poolSessionCreateIdentity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3305,7 +3305,7 @@ func TestSyncDesiredPoolSlotsUsesDesiredSlotBeforeSortedBackfill(t *testing.T) {
 		"session-b": {TemplateName: template, InstanceName: "pack/worker-2", PoolSlot: 2},
 	}
 
-	syncDesiredPoolSlots(store, desired, open, index, cfg, now, io.Discard)
+	syncDesiredPoolSlots(sessionFrontDoor(store), desired, open, index, cfg, now, io.Discard)
 
 	gotFirst, err := store.Get(first.ID)
 	if err != nil {
@@ -3362,7 +3362,7 @@ func TestSyncDesiredPoolSlotsDoesNotPersistSyntheticBackfillSlot(t *testing.T) {
 		},
 	}
 
-	syncDesiredPoolSlots(store, desired, open, index, cfg, now, io.Discard)
+	syncDesiredPoolSlots(sessionFrontDoor(store), desired, open, index, cfg, now, io.Discard)
 
 	got, err := store.Get(bead.ID)
 	if err != nil {
@@ -4081,7 +4081,7 @@ func TestCreatePoolSessionBead_MetadataFailureLeavesReachablePlaceholder(t *test
 	store := &failingPoolSessionNameStore{MemStore: beads.NewMemStore()}
 	template := "pack/worker"
 
-	if _, err := createPoolSessionBead(store, template, time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC), poolSessionCreateIdentity{}); err == nil {
+	if _, err := createPoolSessionBead(sessionFrontDoor(store), template, time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC), poolSessionCreateIdentity{}); err == nil {
 		t.Fatal("createPoolSessionBead returned nil error, want session_name metadata failure")
 	}
 
@@ -4430,6 +4430,61 @@ func TestCloseBeadReleasesWorkAssignedBySessionName(t *testing.T) {
 	}
 	if gotWork.Status != "open" {
 		t.Errorf("work status = %q, want open", gotWork.Status)
+	}
+}
+
+func TestCloseBeadClearsSessionAffinityOnRelease(t *testing.T) {
+	store := beads.NewMemStore()
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "worker-gm-dead",
+			"template":     "worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	work, err := store.Create(beads.Bead{
+		Title:    "shared-drain work",
+		Assignee: "worker-gm-dead",
+		Metadata: map[string]string{
+			"gc.routed_to":          "worker",
+			"gc.continuation_group": "main",
+			"gc.session_affinity":   "require",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: strPtr("in_progress")}); err != nil {
+		t.Fatalf("set work in_progress: %v", err)
+	}
+
+	if !closeBead(store, sessionBead.ID, "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "" || gotWork.Status != "open" {
+		t.Fatalf("work = assignee %q status %q, want unassigned/open", gotWork.Assignee, gotWork.Status)
+	}
+	if got := strings.TrimSpace(gotWork.Metadata["gc.session_affinity"]); got != "" {
+		t.Errorf("gc.session_affinity = %q, want cleared after closed-session release", got)
+	}
+	if got := strings.TrimSpace(gotWork.Metadata["gc.continuation_group"]); got != "" {
+		t.Errorf("gc.continuation_group = %q, want cleared after closed-session release", got)
+	}
+	if gotWork.Metadata["gc.routed_to"] != "worker" {
+		t.Errorf("gc.routed_to = %q, want preserved as worker for pool redispatch", gotWork.Metadata["gc.routed_to"])
 	}
 }
 
@@ -7409,6 +7464,69 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadPreservesRunTargetRoute(t *testi
 	}
 }
 
+func TestUnclaimWorkAssignedToRetiredSessionBeadClearsSessionAffinity(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "worker-1",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	// In-progress work pinned to the retired session via continuation-group
+	// affinity, with no existing route so the fallback run_target applies. The
+	// detach must clear both affinity keys (or the next claim re-vacuums the
+	// reopened bead onto the dead session's group) while still seeding the
+	// fallback route: the affinity clears and the route merge must not clobber
+	// each other.
+	work, err := store.Create(beads.Bead{
+		Title:    "scoped step",
+		Status:   "in_progress",
+		Assignee: sessionBead.ID,
+		Metadata: map[string]string{
+			"gc.continuation_group": "main",
+			"gc.session_affinity":   "require",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark work in_progress: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", &stderr)
+
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Assignee != "" {
+		t.Errorf("assignee = %q, want empty", got.Assignee)
+	}
+	if got.Status != "open" {
+		t.Errorf("status = %q, want open", got.Status)
+	}
+	if v := strings.TrimSpace(got.Metadata["gc.session_affinity"]); v != "" {
+		t.Errorf("gc.session_affinity = %q, want cleared after retired-session unclaim", v)
+	}
+	if v := strings.TrimSpace(got.Metadata["gc.continuation_group"]); v != "" {
+		t.Errorf("gc.continuation_group = %q, want cleared after retired-session unclaim", v)
+	}
+	if got.Metadata["gc.run_target"] != "fallback/worker" {
+		t.Errorf("gc.run_target = %q, want fallback/worker applied alongside the affinity clear", got.Metadata["gc.run_target"])
+	}
+}
+
 // closeBead is the low-level metadata+close helper. Ownership checks live in
 // closeSessionBeadIfUnassigned, which has the full multi-store, multi-identifier
 // view of assigned work. closeBead itself must stay dumb so it doesn't
@@ -7702,7 +7820,7 @@ func TestCloseFailedCreateBeadCascadesExtmsgState(t *testing.T) {
 
 	var stderr bytes.Buffer
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
-	if !closeFailedCreateBead(store, sessionBead.ID, now, &stderr) {
+	if !closeFailedCreateBead(sessionFrontDoor(store), sessionBead.ID, now, &stderr) {
 		t.Fatalf("closeFailedCreateBead returned false; want true: stderr=%s", stderr.String())
 	}
 
@@ -7930,7 +8048,7 @@ func TestSyncSessionBeadsWithSnapshotAndRigStoresLeavesOrphanedSessionBeadOpenWh
 	var stderr bytes.Buffer
 	syncSessionBeadsWithSnapshotAndRigStores(
 		"",
-		store,
+		beads.SessionStore{Store: store},
 		map[string]beads.Store{"frontend": rigStore},
 		nil,
 		sp,

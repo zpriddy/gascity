@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/promptsafe"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -565,6 +566,13 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 }
 
 func formatWaitIdleReminder(source, message string) string {
+	// Sanitize attacker-controllable fields before interpolating into the
+	// <system-reminder> block. The deferred-nudge body is sender-supplied, so
+	// without this a sender can embed </system-reminder> sequences to break out
+	// of the reminder and inject a forged operator/system directive.
+	// See gastownhall/gascity#2195 and the ga-vs7 notification-injection incident.
+	source = promptsafe.SanitizeForSystemReminder(source)
+	message = promptsafe.SanitizeForSystemReminder(message)
 	var sb strings.Builder
 	sb.WriteString("<system-reminder>\n")
 	sb.WriteString("You have a deferred reminder that was queued until a safe boundary:\n\n")
@@ -959,21 +967,38 @@ func (m *Manager) TranscriptPath(id string, searchPaths []string) (string, error
 		return path, nil
 	}
 
+	sameWorkDirSessions, err := m.sameWorkDirSessionBeads(b, provider, workDir)
+	if err != nil {
+		return "", err
+	}
+	if len(sameWorkDirSessions) > 1 {
+		if path := ResolveCodexTranscriptBySessionOrder(searchPaths, provider, workDir, b.ID, sameWorkDirSessions); path != "" {
+			return path, nil
+		}
+		// Without a stable session key, multiple sessions sharing the same
+		// workdir cannot be mapped safely to a single transcript.
+		return "", nil
+	}
+	return workertranscript.DiscoverPath(searchPaths, provider, workDir, ""), nil
+}
+
+// sameWorkDirSessionBeads returns the session beads that share workDir with the
+// target b, restricted to the same provider family when the target's provider is
+// known. For a live target, closed historical sessions are excluded; for a
+// closed target they are kept so historical same-workdir ambiguity is preserved.
+func (m *Manager) sameWorkDirSessionBeads(b beads.Bead, provider, workDir string) ([]beads.Bead, error) {
 	all, err := m.store.List(beads.ListQuery{
 		Label:         LabelSession,
 		IncludeClosed: b.Status == "closed",
 	})
 	if err != nil {
-		return "", fmt.Errorf("listing sessions: %w", err)
+		return nil, fmt.Errorf("listing sessions: %w", err)
 	}
-	matches := 0
+	var same []beads.Bead
 	for _, other := range all {
 		if !IsSessionBeadOrRepairable(other) {
 			continue
 		}
-		// For a live target, closed historical sessions should not make the
-		// lookup ambiguous. For a closed target, historical siblings sharing
-		// the same workdir are the ambiguity we need to preserve.
 		if b.Status != "closed" && other.Status == "closed" {
 			continue
 		}
@@ -985,13 +1010,63 @@ func (m *Manager) TranscriptPath(id string, searchPaths []string) (string, error
 			continue
 		}
 		if other.Metadata["work_dir"] == workDir {
-			matches++
-			if matches > 1 {
-				// Without a stable session key, multiple sessions sharing the
-				// same workdir cannot be mapped safely to a single transcript.
-				return "", nil
-			}
+			same = append(same, other)
 		}
 	}
-	return workertranscript.DiscoverPath(searchPaths, provider, workDir, ""), nil
+	return same, nil
+}
+
+// KeyedTranscriptPath returns the transcript path only when it resolves to a
+// single session's file by a stable per-session key — never by the ambiguous
+// workdir/newest-mtime fallback. Callers that must attribute a file to exactly
+// one session (e.g. writing a session-id sidecar next to it) use this instead
+// of TranscriptPath, which additionally serves that workdir fallback for
+// history rendering.
+//
+// Coverage is whatever has both a captured per-session id and a 1:1 lookup:
+// claude/kimi/pi/antigravity (keyed-path construction) and codex (its rollout
+// filename carries the session-id suffix; the id is captured by the SessionStart
+// hook). It returns "" for gemini/opencode/mimocode, which have a session id but
+// no 1:1 by-id lookup, so only the unsafe workdir fallback would be available.
+func (m *Manager) KeyedTranscriptPath(id string, searchPaths []string) (string, error) {
+	b, _, err := m.loadSessionBead(id, true)
+	if err != nil {
+		return "", err
+	}
+	workDir := b.Metadata["work_dir"]
+	if workDir == "" {
+		return "", nil
+	}
+	provider := strings.TrimSpace(b.Metadata["provider_kind"])
+	if provider == "" {
+		provider = strings.TrimSpace(b.Metadata["provider"])
+	}
+	if len(searchPaths) == 0 {
+		searchPaths = sessionlog.DefaultSearchPaths()
+	}
+	sessionKey := strings.TrimSpace(b.Metadata["session_key"])
+	// Codex is resolved here, before the generic keyed discovery below.
+	// workertranscript.DiscoverKeyedPath resolves codex with the newest-first,
+	// no-window resolver (FindCodexSessionFileByIDNoWindow), which is correct for
+	// history rendering but would silently mis-attribute a copied or stale
+	// duplicate rollout (same session uuid + workdir, e.g. an archived copy) on
+	// this 1:1 sidecar path by taking the newest suffix match. Sidecar
+	// attribution must refuse ambiguity, so codex uses the window-bounded,
+	// ambiguity-refusing identity lookup instead: a keyed miss, an ambiguous
+	// in-window match, or a duplicate outside the window returns "" with NO
+	// newest-wins fallback rather than a misattribution. The [CreatedAt, anchor]
+	// window bounds the scan; the anchor is the latest wake, falling back to
+	// bead creation. The session_key is the rollout uuid, captured by the
+	// SessionStart hook, exactly as invocation telemetry uses it.
+	if sessionKey != "" && sessionlog.ProviderFamily(provider) == "codex" {
+		anchor := b.CreatedAt
+		if woke, err := time.Parse(time.RFC3339, strings.TrimSpace(b.Metadata["last_woke_at"])); err == nil {
+			anchor = woke
+		}
+		return sessionlog.FindCodexSessionFileByID(searchPaths, workDir, sessionKey, b.CreatedAt, anchor), nil
+	}
+	if path := workertranscript.DiscoverKeyedPath(searchPaths, provider, workDir, sessionKey); path != "" {
+		return path, nil
+	}
+	return "", nil
 }

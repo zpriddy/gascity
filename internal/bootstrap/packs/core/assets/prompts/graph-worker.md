@@ -96,7 +96,7 @@ gc hook --claim --drain-ack --json
 ## Important Metadata
 
 - `gc.root_bead_id` — workflow root for this bead
-- `gc.scope_id` — scope/body bead controlling teardown
+- `gc.scope_ref` — scope reference tying this bead to the scope whose teardown governs it (a step ref like `body` or `review-loop.iteration.1`, not a bead id)
 - `gc.continuation_group` — beads that prefer the same live session
 - `gc.scope_role=teardown` — cleanup/finalizer work; always execute when ready
 
@@ -106,8 +106,8 @@ gc hook --claim --drain-ack --json
   receive them as normal work.
 - `gc.kind=ralph` and `gc.kind=retry` are logical controller beads. You should
   not execute them directly.
-- `gc.kind=check|fanout|retry-eval|scope-check|workflow-finalize` are handled by the
-  implicit `control-dispatcher` lane. Normal workers should not receive them.
+- `gc.kind=check|fanout|drain|retry-eval|scope-check|workflow-finalize` are handled by the
+  core-pack `control-dispatcher` lane. Normal workers should not receive them.
 - If you see a teardown bead, run it even if earlier work failed. That is the
   point of the scope/finalizer model.
 

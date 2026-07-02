@@ -617,6 +617,32 @@ schema = 1
 	}
 }
 
+func TestBuiltinPackFamilyCheck_DoltliteBackendSkipsRequirement(t *testing.T) {
+	dir := t.TempDir()
+	doltDir := filepath.Join(dir, "packs", "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDir, "pack.toml"), []byte(`[pack]
+name = "dolt"
+schema = 1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewBuiltinPackFamilyCheck(&config.City{
+		Beads:    config.BeadsConfig{Provider: "bd", Backend: "doltlite"},
+		PackDirs: []string{doltDir},
+	}, dir)
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "doltlite backend") {
+		t.Fatalf("message = %q, want doltlite skip message", r.Message)
+	}
+}
+
 func TestBuiltinPackFamilyCheck_ExecGcBeadsBdOverrideStillRequiresFamily(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GC_BEADS", "exec:/tmp/gc-beads-bd")
@@ -3102,12 +3128,11 @@ func writeDoctorManagedDoltConfig(t *testing.T, cityPath string, overrides map[s
 			"max_connections":                256,
 			"back_log":                       50,
 			"max_connections_timeout_millis": 5000,
-			"read_timeout_millis":            30000,
+			"read_timeout_millis":            15000,
 			"write_timeout_millis":           300000,
 		},
 		"data_dir": filepath.Join(cityPath, ".beads", "dolt"),
 		"behavior": map[string]any{
-			"autocommit": false,
 			"auto_gc_behavior": map[string]any{
 				"enable":        true,
 				"archive_level": 0,
@@ -3419,11 +3444,10 @@ func TestDoltConfigCheck_WrongDataDir(t *testing.T) {
 	}
 }
 
-func TestDoltConfigCheck_AutoGCEnabled(t *testing.T) {
-	// With config-driven defaults (auto_gc=true), drift means enable=false.
+func TestDoltConfigCheck_AutoGCDisabledDrifts(t *testing.T) {
 	dir := setupManagedDoltCity(t)
 	writeDoctorManagedDoltConfig(t, dir, map[string]any{
-		"behavior.auto_gc_behavior.enable": false,
+		"behavior.auto_gc_behavior.enable":      false,
 		"system_variables.dolt_auto_gc_enabled": "OFF",
 	})
 	c := NewDoltConfigCheck(dir, false)
@@ -3434,57 +3458,8 @@ func TestDoltConfigCheck_AutoGCEnabled(t *testing.T) {
 	if !strings.Contains(r.Message, "auto_gc_behavior.enable") {
 		t.Errorf("message = %q, want auto_gc_behavior.enable mention", r.Message)
 	}
-}
-
-// TestDoltConfigCheck_AutoGCDisabledViaCityToml verifies the strict drift
-// detection respects city.toml [dolt] auto_gc = "disabled": when the user
-// configures auto_gc=disabled, dolt-config.yaml MUST emit enable: false /
-// "OFF", and a fixture with the default enable: true / "ON" should drift.
-func TestDoltConfigCheck_AutoGCDisabledViaCityToml(t *testing.T) {
-	dir := setupManagedDoltCity(t)
-	cityToml := "[workspace]\nname = \"gascity\"\nprefix = \"gc\"\n\n[dolt]\nauto_gc = \"disabled\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(cityToml), 0o644); err != nil {
-		t.Fatalf("WriteFile(city.toml): %v", err)
-	}
-	// Default fixture has enable: true / "ON" — that should drift now that
-	// city.toml says auto_gc=disabled.
-	writeDoctorManagedDoltConfig(t, dir, nil)
-	c := NewDoltConfigCheck(dir, false)
-	r := c.Run(&CheckContext{})
-	if r.Status != StatusWarning {
-		t.Fatalf("status = %d, want Warning when city.toml=disabled but yaml=enabled; msg = %s", r.Status, r.Message)
-	}
-	if !strings.Contains(r.Message, "auto_gc_behavior.enable") {
-		t.Errorf("message = %q, want auto_gc_behavior.enable drift mention", r.Message)
-	}
-	// Now flip the fixture to match the configured-disabled value — should pass.
-	writeDoctorManagedDoltConfig(t, dir, map[string]any{
-		"behavior.auto_gc_behavior.enable":      false,
-		"system_variables.dolt_auto_gc_enabled": "OFF",
-	})
-	r = c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK when city.toml=disabled and yaml=disabled; msg = %s", r.Status, r.Message)
-	}
-}
-
-// TestDoltConfigCheck_AutocommitConfiguredOn verifies that city.toml [dolt]
-// autocommit = "on" makes the doctor expect behavior.autocommit: true; the
-// default fixture (autocommit: false, batch) should drift.
-func TestDoltConfigCheck_AutocommitConfiguredOn(t *testing.T) {
-	dir := setupManagedDoltCity(t)
-	cityToml := "[workspace]\nname = \"gascity\"\nprefix = \"gc\"\n\n[dolt]\nautocommit = \"on\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(cityToml), 0o644); err != nil {
-		t.Fatalf("WriteFile(city.toml): %v", err)
-	}
-	writeDoctorManagedDoltConfig(t, dir, nil) // default = autocommit:false
-	c := NewDoltConfigCheck(dir, false)
-	r := c.Run(&CheckContext{})
-	if r.Status != StatusWarning {
-		t.Fatalf("status = %d, want Warning when city.toml=on but yaml=false; msg = %s", r.Status, r.Message)
-	}
-	if !strings.Contains(r.Message, "autocommit") {
-		t.Errorf("message = %q, want autocommit drift mention", r.Message)
+	if !strings.Contains(r.Message, "dolt_auto_gc_enabled") {
+		t.Errorf("message = %q, want dolt_auto_gc_enabled mention", r.Message)
 	}
 }
 

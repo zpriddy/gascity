@@ -623,6 +623,7 @@ func TestDoPrimeWithHookFormat_FormatsDefaultFallback(t *testing.T) {
 }
 
 func TestDoPrimeWithHook_DeliveredStartupPromptCodexJSONHookFormat(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	clearGCEnv(t)
 	clearInheritedBeadsEnv(t)
 	clearInheritedCityRoutingEnv(t)
@@ -688,6 +689,7 @@ prompt_template = "prompts/worker.md"
 }
 
 func TestDoPrimeWithHook_CodexJSONFormatInfersAgentFromWorkDir(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	for _, tt := range []struct {
 		name        string
 		identity    string

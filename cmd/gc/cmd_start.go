@@ -367,7 +367,7 @@ func newStartCmd(stdout, stderr io.Writer) *cobra.Command {
 	var foregroundMode bool
 	var jsonOut bool
 	cmd := &cobra.Command{
-		Use:   "start [path]",
+		Use:   "start [path|name]",
 		Short: "Start the city under the machine-wide supervisor",
 		Long: `Start the city under the machine-wide supervisor.
 
@@ -379,7 +379,8 @@ Use "gc supervisor run" for foreground operation.`,
   gc start ~/my-city
   gc start --dry-run
   gc supervisor run`,
-		Args: cobra.MaximumNArgs(1),
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeCityNames,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if jsonOut && (foregroundMode || dryRunMode) {
 				fmt.Fprintln(stderr, "gc start: --json is only supported for supervisor-managed start") //nolint:errcheck // best-effort stderr
@@ -566,12 +567,31 @@ func doStartWithNameOverrideJSON(args []string, controllerMode bool, stdout, std
 func resolveStartDir(args []string) (string, error) {
 	switch {
 	case len(args) > 0:
-		return filepath.Abs(args[0])
+		return resolveStartDirRef(args[0])
 	case cityFlag != "":
-		return filepath.Abs(cityFlag)
+		return resolveStartDirRef(cityFlag)
 	default:
 		return os.Getwd()
 	}
+}
+
+// resolveStartDirRef resolves a name-or-path start/restart reference to a
+// directory that requireBootstrappedCity can turn into a bootstrapped city. A
+// name-shaped reference is routed through the shared name resolver (the same
+// rig-aware path used by resolveCommandContext and resolveStopCityPath) so a
+// slashless local rig directory such as "frontend" resolves to its owning city
+// instead of failing as an unknown city name. Path-shaped references keep the
+// original filepath.Abs behavior, leaving city validation to
+// requireBootstrappedCity.
+func resolveStartDirRef(ref string) (string, error) {
+	if classifyCityRef(ref) == cityRefName {
+		ctx, err := resolveCityNameContext(ref, resolveContextFromPath)
+		if err != nil {
+			return "", err
+		}
+		return ctx.CityPath, nil
+	}
+	return filepath.Abs(ref)
 }
 
 func requireBootstrappedCity(dir string) (string, error) {
@@ -673,6 +693,11 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	if err := config.ValidateRigs(cfg.Rigs, config.EffectiveHQPrefix(cfg)); err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	// Reserved coordination-class prefixes are a non-fatal advisory until
+	// per-class stores activate; warn but do not block startup.
+	for _, w := range config.ReservedPrefixWarnings(cfg.Rigs, config.EffectiveHQPrefix(cfg)) {
+		fmt.Fprintf(stderr, "gc start: warning: %s\n", w) //nolint:errcheck // best-effort stderr
 	}
 	if err := config.ValidateServices(cfg.Services); err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -846,7 +871,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		oneShotStore = store
 
 		// Run adoption barrier before sync.
-		result, passed := runAdoptionBarrier(cityPath, store, sp, cfg, cityName, clock.Real{}, stderr, false)
+		result, passed := runAdoptionBarrier(cityPath, sessionFrontDoor(store), sp, cfg, cityName, clock.Real{}, stderr, false)
 		if result.Adopted > 0 {
 			fmt.Fprintf(stdout, "Adopted %d running session(s) into bead store.\n", result.Adopted) //nolint:errcheck
 		}
@@ -873,7 +898,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	ds := dsResult.State
 	cfgNames := configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 	_, sessionBeads = syncSessionBeadsWithSnapshotAndRigStores(
-		cityPath, oneShotStore, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
+		cityPath, beads.SessionStore{Store: oneShotStore}, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
 	)
 
 	open := sessionBeads.Open()
@@ -888,7 +913,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		ds = dsResult.State
 		cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 		_, sessionBeads = syncSessionBeadsWithSnapshotAndRigStores(
-			cityPath, oneShotStore, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
+			cityPath, beads.SessionStore{Store: oneShotStore}, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
 		)
 		open = sessionBeads.Open()
 	}
@@ -896,6 +921,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	dt := newDrainTracker()
 	poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, open, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	poolDesired := retainScaleCheckPartialPoolDesired(
+		cfg,
 		PoolDesiredCounts(ComputePoolDesiredStates(
 			cfg, poolWorkBeads, open, dsResult.ScaleCheckCounts)),
 		sessionBeads,
@@ -905,7 +931,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		poolDesired = make(map[string]int)
 	}
 	mergeNamedSessionDemand(poolDesired, dsResult.NamedSessionDemand, cfg)
-	awakeAssignedWorkBeads := filterAssignedWorkBeadsForSessionWake(cfg, cityPath, open, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
+	awakeAssignedWorkBeads, awakeAssignedStoreRefs := filterAssignedWorkBeadsForSessionWake(cfg, cityPath, open, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	reconcileSessionBeadsAtPathWithNamedDemand(
 		sigCtx, cityPath, open, ds, cfgNames, cfg, sp, oneShotStore,
 		nil, awakeAssignedWorkBeads, rigStores, nil, dt, nil, poolDesired,
@@ -914,6 +940,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		nil, cityName,
 		nil, clock.Real{}, recorder, cfg.Session.StartupTimeoutDuration(), 0,
 		stdout, stderr,
+		withReadyAssignedFlags(readyAssignedFlagsForBeads(dsResult.ReadyAssigned, awakeAssignedWorkBeads, awakeAssignedStoreRefs)),
 	)
 
 	// Post-reconcile sync: update bead state to reflect post-start reality.
@@ -926,7 +953,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	ds = dsResult.State
 	cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 	syncSessionBeadsWithSnapshotAndRigStores(
-		cityPath, oneShotStore, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false, sessionBeads,
+		cityPath, beads.SessionStore{Store: oneShotStore}, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false, sessionBeads,
 	)
 
 	fmt.Fprintln(stdout, "City started.") //nolint:errcheck // best-effort stdout
@@ -1100,7 +1127,7 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string, hoo
 	}
 
 	providerSet := hookProviderSet(hookProviders)
-	// workDir-based hooks: gemini, codex, antigravity, opencode, copilot, cursor, pi, omp, kimi.
+	// workDir-based hooks: gemini, codex, antigravity, opencode, mimocode, copilot, cursor, pi, omp, kimi.
 	for _, provider := range orderedWorkDirHookProviders {
 		if !providerSet[provider.name] {
 			continue
@@ -1162,6 +1189,7 @@ var orderedWorkDirHookProviders = []workDirHookProvider{
 	{name: "codex", relPaths: []string{path.Join(".codex", "hooks.json")}},
 	{name: "antigravity", relPaths: []string{path.Join(".agents", "hooks.json")}},
 	{name: "opencode", relPaths: []string{path.Join(".opencode", "plugins", "gascity.js")}},
+	{name: "mimocode", relPaths: []string{path.Join(".mimocode", "plugin", "gascity.js")}},
 	{name: "copilot", relPaths: []string{
 		path.Join(".github", "hooks", "gascity.json"),
 		path.Join(".github", "copilot-instructions.md"),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -56,7 +57,102 @@ With --claim: runs the standard startup claim protocol for one work item.
 	if flag := cmd.Flags().Lookup("hook-format"); flag != nil {
 		flag.Hidden = true
 	}
+	cmd.AddCommand(newHookRunCmd(stdout, stderr))
 	return cmd
+}
+
+func newHookRunCmd(stdout, stderr io.Writer) *cobra.Command {
+	opts := hookRunOptions{
+		Timeout:         defaultHookRunTimeout,
+		TimeoutExitCode: 124,
+	}
+	cmd := &cobra.Command{
+		Use:   "run -- <gc args...>",
+		Short: "Run a managed hook command with a hard timeout",
+		Long: `Runs a managed gc hook command in a child process with a hard timeout.
+
+This protects provider hook callbacks from wedged data-plane commands. The
+child process is the current gc executable, and <gc args...> are passed to it
+verbatim.`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(c *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				fmt.Fprintln(stderr, "gc hook run: missing gc command arguments after --") //nolint:errcheck
+				return errExit
+			}
+			return exitForCode(cmdHookRun(args, opts, c.InOrStdin(), stdout, stderr))
+		},
+	}
+	cmd.Flags().DurationVar(&opts.Timeout, "timeout", defaultHookRunTimeout, "hard timeout for the managed hook command")
+	cmd.Flags().IntVar(&opts.TimeoutExitCode, "timeout-exit-code", 124, "exit code to return when the managed hook command times out")
+	return cmd
+}
+
+const defaultHookRunTimeout = 15 * time.Second
+
+type hookRunOptions struct {
+	Timeout         time.Duration
+	TimeoutExitCode int
+}
+
+var hookRunExecutable = os.Executable
+
+func cmdHookRun(args []string, opts hookRunOptions, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "gc hook run: missing gc command arguments") //nolint:errcheck
+		return 1
+	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = defaultHookRunTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	exe, err := hookRunExecutable()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook run: resolving gc executable: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
+	// Forward the provider hook stdin so wrapped commands like
+	// `nudge drain --inject` still receive the UserPromptSubmit JSON
+	// (carrying transcript_path) they need for context-pressure injection.
+	// readHookStdin already bounds the read with an io.LimitReader and the
+	// hard timeout below bounds any block, so forwarding is safe.
+	cmd.Stdin = stdin
+	// Buffer child stdout instead of streaming it straight to the provider so
+	// a wedged command cannot leak partial injectable output before the
+	// fail-open timeout path runs. The buffer is flushed only on a clean or
+	// self-determined exit, and discarded on timeout.
+	var childOut bytes.Buffer
+	cmd.Stdout = &childOut
+	cmd.Stderr = stderr
+	cmd.WaitDelay = 2 * time.Second
+	prepareProviderOpCommand(cmd)
+
+	err = cmd.Run()
+	// A clean exit wins even if the deadline fired in the same instant: the
+	// child finished and produced complete output, so report success and flush.
+	if err == nil {
+		_, _ = stdout.Write(childOut.Bytes()) //nolint:errcheck
+		return 0
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		// Timed out: the child was killed mid-flight, so any buffered output is
+		// partial. Discard it and return the configured fail-open code.
+		fmt.Fprintf(stderr, "gc hook run: command timed out after %s\n", timeout) //nolint:errcheck
+		return opts.TimeoutExitCode
+	}
+	// The child exited on its own with a non-zero status: its output is
+	// complete, so preserve it and propagate the exit code.
+	_, _ = stdout.Write(childOut.Bytes()) //nolint:errcheck
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	fmt.Fprintf(stderr, "gc hook run: %v\n", err) //nolint:errcheck
+	return 1
 }
 
 type hookCommandOptions struct {
@@ -136,6 +232,33 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 
 	a, ok := resolveAgentIdentity(cfg, agentName, currentRigContext(cfg))
 	if !ok {
+		// Pool instances run with GC_AGENT/GC_ALIAS set to their per-instance name
+		// (e.g. "rig/polecat-adhoc-<hash>") which is not a config entry — only the
+		// pool binding (GC_TEMPLATE, e.g. "rig/polecat") is. When a pack script
+		// invokes "gc hook $GC_AGENT" the positional arg bypasses the no-args
+		// sessionTemplateContext fallback. Retry with GC_TEMPLATE so pool agents
+		// resolve correctly regardless of invocation style.
+		//
+		// Gate the retry to the runtime/session identity case: only fall back
+		// when the unresolved arg is this instance's own runtime name
+		// (GC_ALIAS/GC_AGENT/GC_SESSION_NAME). Otherwise an unrelated bad
+		// explicit target in a pool session would silently reinterpret as the
+		// template agent instead of erroring.
+		isRuntimeIdentity := agentName == strings.TrimSpace(os.Getenv("GC_ALIAS")) ||
+			agentName == strings.TrimSpace(os.Getenv("GC_AGENT")) ||
+			agentName == strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
+		if tpl := strings.TrimSpace(os.Getenv("GC_TEMPLATE")); tpl != "" && tpl != agentName && isRuntimeIdentity {
+			if ta, tok := resolveAgentIdentity(cfg, tpl, currentRigContext(cfg)); tok {
+				a, ok = ta, true
+				agentName = tpl
+				if !sessionTemplateContext {
+					sessionTemplateContext = strings.TrimSpace(os.Getenv("GC_SESSION_NAME")) != "" ||
+						strings.TrimSpace(os.Getenv("GC_SESSION_ID")) != ""
+				}
+			}
+		}
+	}
+	if !ok {
 		fmt.Fprintf(stderr, "gc hook: agent %q not found in config\n", agentName) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -214,19 +337,27 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		if rigStores := appendOneRigHookStore(nil, cityPath, cfg, &a, rig, overrides); len(rigStores) > 0 {
 			stores = append(rigStores, stores...)
 		}
+		// A rig-backed agent's own env above is ALSO rig-scoped, so without
+		// this no entry reaches the CITY store and root-only beads assigned
+		// to the agent stay invisible. Best-effort tertiary; see
+		// appendCityHookStore.
+		stores = appendCityHookStore(stores, cityPath, cfg, &a, overrides)
 	}
 
-	runner := func(command, _ string) (string, error) {
-		out, err := firstStoreWithWork(command, stores, shellWorkQueryWithEnv)
-		if err != nil && emitFailureEvent {
-			// A killed/timed-out work query strands the session with no
-			// output and no cause on the event bus; emit one so the
-			// reconciler can escalate instead of skipping it forever
-			// (issues #1496/#1497). Ordinary command errors are ignored
-			// by emitWorkQueryFailure and stay on the stderr path below.
-			emitCityWorkQueryFailure(cityPath, stderr,
-				os.Getenv("GC_SESSION_ID"), failureTemplate, command, err)
+	// emitQueryFailure surfaces a killed/timed-out work query on the event bus
+	// so the reconciler can escalate instead of silently treating the strand as
+	// "no work" (issues #1496/#1497). Ordinary command errors are ignored by
+	// emitCityWorkQueryFailure and stay on the caller's stderr path.
+	emitQueryFailure := func(command string, err error) {
+		if err == nil || !emitFailureEvent {
+			return
 		}
+		emitCityWorkQueryFailure(cityPath, stderr,
+			os.Getenv("GC_SESSION_ID"), failureTemplate, command, err)
+	}
+	runner := func(command, _ string) (string, error) {
+		out, _, err := firstStoreWithWork(command, stores, stores[0], shellWorkQueryWithEnv)
+		emitQueryFailure(command, err)
 		return out, err
 	}
 	if opts.Claim {
@@ -234,7 +365,6 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		sessionName := strings.TrimSpace(sessionForQuery)
 		alias := strings.TrimSpace(overrides["GC_ALIAS"])
 		assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
-		routeTarget := hookClaimPrimaryRouteTarget(&a)
 		claimOpts := hookClaimOptions{
 			Assignee: assignee,
 			IdentityCandidates: hookClaimIdentityCandidates(
@@ -245,14 +375,99 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 				agentForQuery,
 				resolvedAgentName,
 			),
-			RouteTargets: hookClaimRouteTargets(routeTarget, resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
+			RouteTargets: hookClaimRouteTargets(hookClaimPrimaryRouteTarget(&a), resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
 			Env:          queryEnv,
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
 		}
-		return doHookClaim(workQuery, workDir, claimOpts, hookClaimOps{Runner: runner}, stdout, stderr)
+		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
 	return doHook(workQuery, workDir, false, runner, stdout, stderr)
+}
+
+// claimHookWork claims routed work for gc hook --claim from the federated store
+// set, binding the production shell work-query runner and real claim ops. See
+// claimHookWorkWithRunner for the federation and lost-claim-race semantics.
+func claimHookWork(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
+	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, hookClaimOps{}, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
+}
+
+// claimHookWorkWithRunner is claimHookWork with the work-query runner and claim
+// ops injected for tests. It selects the first store reporting ready work,
+// re-validates it for claim-time freshness and falls back to a later store if it
+// emptied since discovery (claimStoreWithFallback), then attempts the claim
+// against that store's captured rows, against that store's dir/env.
+//
+// When a selected store still reports ready work but every claimable row is lost
+// to another claimant before the mutation, the single-store claim drains without
+// work. That would strand routed work waiting in a LATER federated store behind
+// the lost race, so this loop drops the exhausted store and reselects across the
+// remaining stores. It writes the shared drain exactly once, after every store
+// has been exhausted; the drain reason is claims_errored when any exhausted
+// store's eligible claims errored rather than merely lost the race, else no_work.
+// emitFailure surfaces a work-query timeout on the event bus when eligible.
+func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, ops hookClaimOps, run hookStoreRunner, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
+	ops.applyDefaults()
+	// primary is the agent's own store (the first entry). It is captured once
+	// here, before the loop shrinks remaining: only the primary may surface a
+	// work-query error as a fatal claim failure. Once the primary loses its
+	// claim race and is dropped, a later federated store must never inherit that
+	// emit-on-timeout semantics, so it is matched by identity, not slice index.
+	var primary hookStore
+	if len(stores) > 0 {
+		primary = stores[0]
+	}
+	remaining := stores
+	// claimsErrored aggregates the per-store signal that a store reported ready
+	// work but every eligible claim mutation errored, so the shared drain below can
+	// report claims_errored instead of laundering a write failure into no_work.
+	claimsErrored := false
+	for len(remaining) > 0 {
+		_, selected, err := firstStoreWithWork(workQuery, remaining, primary, run)
+		if err != nil {
+			emitFailure(workQuery, err)
+			fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if isZeroHookStore(selected) {
+			break // no remaining store has ready work
+		}
+		claimOutput, claimStore, err := claimStoreWithFallback(workQuery, remaining, selected, primary, run)
+		if err != nil {
+			emitFailure(workQuery, err)
+			fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if isZeroHookStore(claimStore) {
+			break // selected store emptied and no later store has ready work
+		}
+		storeOpts := claimOpts
+		storeOpts.Env = queryEnv
+		if len(claimStore.env) > 0 {
+			storeOpts.Env = claimStore.env
+		}
+		storeDir := workDir
+		if dir := strings.TrimSpace(claimStore.dir); dir != "" {
+			storeDir = dir
+		}
+		storeOps := ops
+		storeOps.Runner = func(string, string) (string, error) { return claimOutput, nil }
+		res := tryHookClaim(workQuery, storeDir, &storeOpts, &storeOps, stdout, stderr)
+		if res.terminal {
+			return res.code
+		}
+		if res.claimsErrored {
+			claimsErrored = true
+		}
+		// This store reported ready work but the claim acquired nothing — every
+		// claimable row was lost to another claimant, none matched this session, or
+		// every claimable row's claim mutation errored and was skipped. Drop it and
+		// reselect from the remaining stores so routed work in a later federated
+		// store is not stranded behind it; claimsErrored carries any write-failure
+		// signal to the shared drain.
+		remaining = removeHookStore(remaining, claimStore)
+	}
+	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, stdout, stderr)
 }
 
 func hookClaimPrimaryRouteTarget(a *config.Agent) string {
@@ -309,11 +524,18 @@ func hookQueryEnv(cityPath string, cfg *config.City, a *config.Agent) (map[strin
 // dir sets the command's working directory.
 type WorkQueryRunner func(command, dir string) (string, error)
 
-// hookWorkQueryTimeout caps the work-query subprocess. Default matches
-// the pre-bounded behavior (30s) so existing tests that legitimately
-// take >15s don't regress; the package-level var lets us lower it in
-// follow-up work after slow paths are identified and optimized.
-var hookWorkQueryTimeout = 30 * time.Second
+// hookWorkQueryTimeout caps the work-query subprocess that `gc hook` and the
+// workflow serve loop run via shellWorkQueryWithEnv. The default work-probe
+// issues ~6 sequential bd/store round-trips before the pool-demand tier that
+// finds routed work; on a multi-rig dolt city under concurrent load the probe
+// intermittently exceeded the prior 30s cap, so shellWorkQueryWithEnv killed it
+// and pool operators were starved of routed work. Raised to 60s to cover the
+// realistic loaded cost. This is independent of defaultHookRunTimeout, which
+// bounds the `gc hook run` managed-hook wrapper (around nudge drain / mail
+// check) and does not enclose this work query. The package-level var lets us
+// lower it again once the probe's round-trip count is reduced and the slow
+// per-rig `bd ready`/`gc ready` paths are optimized.
+var hookWorkQueryTimeout = 60 * time.Second
 
 // shellWorkQueryWithEnv runs a work query command via sh -c and returns
 // stdout. If env is non-nil it is used as the subprocess environment

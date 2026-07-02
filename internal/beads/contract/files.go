@@ -36,26 +36,18 @@ const (
 )
 
 // ConfigState is the canonical endpoint-bearing subset of .beads/config.yaml.
-//
-// Backend determines which connection fields are meaningful. Empty Backend
-// preserves the historical Dolt-only behavior (callers that don't set Backend
-// continue to use DoltHost/DoltPort/DoltUser). When Backend == "mysql" the
-// Dolt fields are ignored and the Mysql* fields are written/read instead
-// (yaml keys mysql.server-host, mysql.server-port, mysql.server-user,
-// mysql.database — these are the keys bd's config layer expects).
 type ConfigState struct {
 	IssuePrefix    string
-	Backend        string
 	EndpointOrigin EndpointOrigin
 	EndpointStatus EndpointStatus
 	DoltHost       string
 	DoltPort       string
 	DoltUser       string
-	Dolt           DoltConfig
-	MysqlHost      string
-	MysqlPort      string
-	MysqlUser      string
-	MysqlDatabase  string
+	// DoltMode is the beads dolt.mode value to write to config.yaml.
+	// When non-empty, EnsureCanonicalConfig writes dolt.mode to the canonical config.
+	// When empty, the existing dolt.mode value is preserved.
+	DoltMode string
+	Dolt     DoltConfig
 }
 
 // DoltConfig is the Dolt-specific subset of .beads/config.yaml that GC owns.
@@ -78,8 +70,7 @@ func (c DoltConfig) DisableEventFlushEnabled() bool {
 // returned from LoadMetadataState the populated backend-specific fields are
 // guaranteed consistent with Backend — i.e. a state with Backend == "postgres"
 // always has every Postgres field non-empty and PostgresPort already verified
-// as a TCP-port-shaped string. Backend == "mysql" requires MysqlHost,
-// MysqlPort, MysqlUser, MysqlDatabase all non-empty with port verified.
+// as a TCP-port-shaped string.
 type MetadataState struct {
 	Database         string `json:"database"`
 	Backend          string `json:"backend"`
@@ -89,10 +80,6 @@ type MetadataState struct {
 	PostgresPort     string `json:"postgres_port,omitempty"`
 	PostgresUser     string `json:"postgres_user,omitempty"`
 	PostgresDatabase string `json:"postgres_database,omitempty"`
-	MysqlHost        string `json:"mysql_host,omitempty"`
-	MysqlPort        string `json:"mysql_port,omitempty"`
-	MysqlUser        string `json:"mysql_user,omitempty"`
-	MysqlDatabase    string `json:"mysql_database,omitempty"`
 }
 
 // MetadataParseError reports a failure to parse or validate metadata.json.
@@ -134,13 +121,6 @@ var postgresBackendKeys = []string{
 	"postgres_database",
 }
 
-var mysqlBackendKeys = []string{
-	"mysql_host",
-	"mysql_port",
-	"mysql_user",
-	"mysql_database",
-}
-
 // crossBackendKeysToScrub returns the on-disk metadata keys that should be
 // removed when canonicalising for the given backend. An empty backend
 // preserves all backend-specific keys (today's behavior for unknown-shape
@@ -148,11 +128,11 @@ var mysqlBackendKeys = []string{
 func crossBackendKeysToScrub(backend string) []string {
 	switch backend {
 	case "dolt":
-		return append(append([]string{}, postgresBackendKeys...), mysqlBackendKeys...)
+		return postgresBackendKeys
+	case "doltlite":
+		return append([]string{"dolt_mode"}, postgresBackendKeys...)
 	case "postgres":
-		return append(append([]string{}, doltBackendKeys...), mysqlBackendKeys...)
-	case "mysql":
-		return append(append([]string{}, doltBackendKeys...), postgresBackendKeys...)
+		return doltBackendKeys
 	default:
 		return nil
 	}
@@ -249,24 +229,22 @@ func ReadExportAuto(fs fsys.FS, path string) (value bool, ok bool, err error) {
 	return false, false, nil
 }
 
-// ReadSharedServerEnabled reports whether dolt.shared-server is true in config.
-// When true, the city relies on an externally-managed shared Dolt server
-// rather than a gc-managed per-city instance.
-func ReadSharedServerEnabled(fs fsys.FS, path string) (bool, error) {
+// ReadDoltConfig reads the Dolt-specific GC config object from config.yaml.
+func ReadDoltConfig(fs fsys.FS, path string) (DoltConfig, bool, error) {
 	doc, err := readConfigDoc(fs, path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return DoltConfig{}, false, nil
 		}
-		if value, ok := scanConfigLineValue(fs, path, "dolt.shared-server:"); ok {
-			return value == "true", nil
+		if data, readErr := fs.ReadFile(path); readErr == nil {
+			if cfg, ok := readDoltConfigFromData(data); ok {
+				return cfg, true, nil
+			}
 		}
-		return false, err
+		return DoltConfig{}, false, err
 	}
-	if value, ok := configStringValue(mappingRoot(doc), "dolt.shared-server"); ok {
-		return value == "true", nil
-	}
-	return false, nil
+	cfg := readDoltConfigFromRoot(mappingRoot(doc))
+	return cfg, cfg.hasValues(), nil
 }
 
 // ReadEndpointStatus reads gc.endpoint_status when present.
@@ -321,24 +299,6 @@ func ScopeHasEndpointAuthority(fs fsys.FS, scopeRoot string) bool {
 		return false
 	}
 	return ConfigHasEndpointAuthority(cfg)
-}
-
-// ReadDoltConfig reads the Dolt-specific GC config object from config.yaml.
-func ReadDoltConfig(fs fsys.FS, path string) (DoltConfig, bool, error) {
-	doc, err := readConfigDoc(fs, path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return DoltConfig{}, false, nil
-		}
-		if data, readErr := fs.ReadFile(path); readErr == nil {
-			if cfg, ok := readDoltConfigFromData(data); ok {
-				return cfg, true, nil
-			}
-		}
-		return DoltConfig{}, false, err
-	}
-	cfg := readDoltConfigFromRoot(mappingRoot(doc))
-	return cfg, cfg.hasValues(), nil
 }
 
 // ReadDoltDatabase reads the pinned dolt_database from metadata.json.
@@ -400,17 +360,17 @@ func LoadMetadataState(fs fsys.FS, path string) (MetadataState, bool, error) {
 	if other, ok := mixedBackendField(state); ok {
 		return MetadataState{}, false, &MetadataParseError{
 			Path:   abs,
-			Reason: fmt.Sprintf("cannot mix backend fields in a single scope (backend=%s but %s is also set)", state.Backend, other),
+			Reason: fmt.Sprintf("cannot mix dolt and postgres fields in a single scope (backend=%s but %s is also set)", state.Backend, other),
 		}
 	}
 
 	switch state.Backend {
-	case "", "dolt", "postgres", "mysql":
+	case "", "dolt", "doltlite", "postgres":
 		// allowed
 	default:
 		return MetadataState{}, false, &MetadataParseError{
 			Path:   abs,
-			Reason: fmt.Sprintf("unsupported backend %q (supported: dolt, postgres, mysql)", state.Backend),
+			Reason: fmt.Sprintf("unsupported backend %q (supported: dolt, doltlite, postgres)", state.Backend),
 		}
 	}
 
@@ -430,34 +390,19 @@ func LoadMetadataState(fs fsys.FS, path string) (MetadataState, bool, error) {
 		}
 	}
 
-	if state.Backend == "mysql" {
-		if state.MysqlHost == "" || state.MysqlPort == "" || state.MysqlUser == "" || state.MysqlDatabase == "" {
-			return MetadataState{}, false, &MetadataParseError{
-				Path:   abs,
-				Reason: "backend=mysql requires mysql_host, mysql_port, mysql_user, mysql_database (all four must be non-empty)",
-			}
-		}
-		port, err := strconv.Atoi(state.MysqlPort)
-		if err != nil || port < 1 || port > 65535 {
-			return MetadataState{}, false, &MetadataParseError{
-				Path:   abs,
-				Reason: fmt.Sprintf("mysql_port must be a TCP port (1..65535), got %q", state.MysqlPort),
-			}
-		}
-	}
-
 	return state, true, nil
 }
 
 // mixedBackendField reports the first populated "other-backend" field name
 // (relative to state.Backend). For explicit backends, any populated field from
-// the other backends is mixed. For empty or unknown backends, mixed still
-// means more than one backend family appears.
+// the opposite backend is mixed. For empty or unknown backends, mixed still
+// means both Dolt-shaped and Postgres-shaped fields are populated.
 //
 // Field-iteration order is the JSON-key declaration order on MetadataState
-// (dolt_*, postgres_*, mysql_*). When state.Backend is empty or unknown and
-// multiple backend families appear, the first populated field across all
-// backends wins (with Dolt fields preferred per declaration order).
+// (dolt_mode, dolt_database, postgres_host, postgres_port, postgres_user,
+// postgres_database). When state.Backend is empty or unknown and both backend
+// families appear, the first populated field across both backends wins (with
+// Dolt fields preferred per declaration order).
 func mixedBackendField(state MetadataState) (string, bool) {
 	type entry struct {
 		name    string
@@ -471,29 +416,17 @@ func mixedBackendField(state MetadataState) (string, bool) {
 		{"postgres_port", state.PostgresPort, "postgres"},
 		{"postgres_user", state.PostgresUser, "postgres"},
 		{"postgres_database", state.PostgresDatabase, "postgres"},
-		{"mysql_host", state.MysqlHost, "mysql"},
-		{"mysql_port", state.MysqlPort, "mysql"},
-		{"mysql_user", state.MysqlUser, "mysql"},
-		{"mysql_database", state.MysqlDatabase, "mysql"},
 	}
-	var firstDolt, firstPostgres, firstMysql string
+	var firstDolt, firstPostgres string
 	for _, f := range fields {
 		if f.value == "" {
 			continue
 		}
-		switch f.backend {
-		case "dolt":
-			if firstDolt == "" {
-				firstDolt = f.name
-			}
-		case "postgres":
-			if firstPostgres == "" {
-				firstPostgres = f.name
-			}
-		case "mysql":
-			if firstMysql == "" {
-				firstMysql = f.name
-			}
+		if f.backend == "dolt" && firstDolt == "" {
+			firstDolt = f.name
+		}
+		if f.backend == "postgres" && firstPostgres == "" {
+			firstPostgres = f.name
 		}
 	}
 	switch state.Backend {
@@ -501,37 +434,13 @@ func mixedBackendField(state MetadataState) (string, bool) {
 		if firstDolt != "" {
 			return firstDolt, true
 		}
-		if firstMysql != "" {
-			return firstMysql, true
-		}
-	case "dolt":
-		if firstPostgres != "" {
-			return firstPostgres, true
-		}
-		if firstMysql != "" {
-			return firstMysql, true
-		}
-	case "mysql":
-		if firstDolt != "" {
-			return firstDolt, true
-		}
+	case "dolt", "doltlite":
 		if firstPostgres != "" {
 			return firstPostgres, true
 		}
 	default:
-		populated := 0
-		first := ""
-		for _, name := range []string{firstDolt, firstPostgres, firstMysql} {
-			if name == "" {
-				continue
-			}
-			if first == "" {
-				first = name
-			}
-			populated++
-		}
-		if populated > 1 {
-			return first, true
+		if firstDolt != "" && firstPostgres != "" {
+			return firstDolt, true
 		}
 	}
 	return "", false
@@ -596,44 +505,24 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 	host := strings.TrimSpace(state.DoltHost)
 	port := strings.TrimSpace(state.DoltPort)
 	user := strings.TrimSpace(state.DoltUser)
-	mysqlHost := strings.TrimSpace(state.MysqlHost)
-	mysqlPort := strings.TrimSpace(state.MysqlPort)
-	mysqlUser := strings.TrimSpace(state.MysqlUser)
-	mysqlDatabase := strings.TrimSpace(state.MysqlDatabase)
-	backend := strings.TrimSpace(state.Backend)
-
-	if backend == "mysql" {
-		// Mysql-backed scopes never carry dolt.host/port/user — bd reads
-		// connection params from mysql.* keys instead.
-		changed = deleteKeys(root, "dolt.host", "dolt.port", "dolt.user") || changed
-		if mysqlHost != "" {
-			changed = setString(root, "mysql.server-host", mysqlHost) || changed
-		}
-		if mysqlPort != "" {
-			changed = setPort(root, "mysql.server-port", mysqlPort) || changed
-		}
-		if mysqlUser != "" {
-			changed = setString(root, "mysql.server-user", mysqlUser) || changed
-		}
-		if mysqlDatabase != "" {
-			changed = setString(root, "mysql.database", mysqlDatabase) || changed
-		}
+	if host != "" {
+		changed = setString(root, "dolt.host", host) || changed
 	} else {
-		if host != "" {
-			changed = setString(root, "dolt.host", host) || changed
-		} else {
-			changed = deleteKeys(root, "dolt.host") || changed
-		}
-		if port != "" {
-			changed = setPort(root, "dolt.port", port) || changed
-		} else {
-			changed = deleteKeys(root, "dolt.port") || changed
-		}
-		if user != "" {
-			changed = setString(root, "dolt.user", user) || changed
-		} else {
-			changed = deleteKeys(root, "dolt.user") || changed
-		}
+		changed = deleteKeys(root, "dolt.host") || changed
+	}
+	if port != "" {
+		changed = setPort(root, "dolt.port", port) || changed
+	} else {
+		changed = deleteKeys(root, "dolt.port") || changed
+	}
+	if user != "" {
+		changed = setString(root, "dolt.user", user) || changed
+	} else {
+		changed = deleteKeys(root, "dolt.user") || changed
+	}
+
+	if mode := strings.TrimSpace(state.DoltMode); mode != "" {
+		changed = setString(root, "dolt.mode", mode) || changed
 	}
 
 	changed = deleteKeys(root, deprecatedConfigKeys...) || changed
@@ -672,10 +561,6 @@ func EnsureCanonicalMetadata(fs fsys.FS, path string, state MetadataState) (bool
 		"postgres_port":     strings.TrimSpace(state.PostgresPort),
 		"postgres_user":     strings.TrimSpace(state.PostgresUser),
 		"postgres_database": strings.TrimSpace(state.PostgresDatabase),
-		"mysql_host":        strings.TrimSpace(state.MysqlHost),
-		"mysql_port":        strings.TrimSpace(state.MysqlPort),
-		"mysql_user":        strings.TrimSpace(state.MysqlUser),
-		"mysql_database":    strings.TrimSpace(state.MysqlDatabase),
 	}
 	for key, want := range defaults {
 		if want == "" {
@@ -777,6 +662,9 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 	} else {
 		deletions["dolt.user"] = struct{}{}
 	}
+	if mode := strings.TrimSpace(state.DoltMode); mode != "" {
+		replacements["dolt.mode"] = "dolt.mode: " + mode
+	}
 	disableEventFlush := doltDisableEventFlushFallbackValue(data, state)
 
 	lines := strings.Split(string(data), "\n")
@@ -831,6 +719,7 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 		"dolt.host",
 		"dolt.port",
 		"dolt.user",
+		"dolt.mode",
 	}
 	for _, key := range orderedKeys {
 		want, ok := replacements[key]
@@ -1011,41 +900,27 @@ func scanNestedConfigLineValueFromData(data []byte, section string, keys ...stri
 }
 
 func readConfigStateFromData(data []byte) ConfigState {
-	state := ConfigState{
+	return ConfigState{
 		IssuePrefix:    scanConfigValueFromData(data, "issue_prefix:", "issue-prefix:"),
 		EndpointOrigin: endpointOriginValue(scanConfigValueFromData(data, "gc.endpoint_origin:")),
 		EndpointStatus: endpointStatusValue(scanConfigValueFromData(data, "gc.endpoint_status:")),
 		DoltHost:       scanConfigValueFromData(data, "dolt.host:"),
 		DoltPort:       scanConfigValueFromData(data, "dolt.port:"),
 		DoltUser:       scanConfigValueFromData(data, "dolt.user:"),
-		MysqlHost:      scanConfigValueFromData(data, "mysql.server-host:"),
-		MysqlPort:      scanConfigValueFromData(data, "mysql.server-port:"),
-		MysqlUser:      scanConfigValueFromData(data, "mysql.server-user:"),
-		MysqlDatabase:  scanConfigValueFromData(data, "mysql.database:"),
+		Dolt:           readDoltConfigFromDataOrEmpty(data),
 	}
-	if state.MysqlHost != "" || state.MysqlDatabase != "" {
-		state.Backend = "mysql"
-	}
-	return state
 }
 
 func readConfigStateFromRoot(root *yaml.Node) ConfigState {
-	state := ConfigState{
+	return ConfigState{
 		IssuePrefix:    configValue(root, "issue_prefix", "issue-prefix"),
 		EndpointOrigin: endpointOriginValue(configValue(root, "gc.endpoint_origin")),
 		EndpointStatus: endpointStatusValue(configValue(root, "gc.endpoint_status")),
 		DoltHost:       configValue(root, "dolt.host"),
 		DoltPort:       configValue(root, "dolt.port"),
 		DoltUser:       configValue(root, "dolt.user"),
-		MysqlHost:      configValue(root, "mysql.server-host"),
-		MysqlPort:      configValue(root, "mysql.server-port"),
-		MysqlUser:      configValue(root, "mysql.server-user"),
-		MysqlDatabase:  configValue(root, "mysql.database"),
+		Dolt:           readDoltConfigFromRoot(root),
 	}
-	if state.MysqlHost != "" || state.MysqlDatabase != "" {
-		state.Backend = "mysql"
-	}
-	return state
 }
 
 func readDoltConfigFromRoot(root *yaml.Node) DoltConfig {

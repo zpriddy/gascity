@@ -248,6 +248,17 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 				}
 			}
 		}
+		// Merge pack.toml upstreams (pack is base, city wins).
+		if len(pc.Upstreams) > 0 {
+			if root.Upstreams == nil {
+				root.Upstreams = make(map[string]UpstreamSpec)
+			}
+			for name, spec := range pc.Upstreams {
+				if _, exists := root.Upstreams[name]; !exists {
+					root.Upstreams[name] = spec
+				}
+			}
+		}
 		// Merge pack.toml pricing (pack is base, city wins by (provider, model) key).
 		if len(pc.Pricing) > 0 {
 			root.PackPricing = mergePricingByKey(root.PackPricing, pc.Pricing)
@@ -539,6 +550,26 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	// [[patches.agent]] blocks in city.toml can target pack-derived
 	// rig-scope agents (e.g., dir="rig" name="gastown.refinery"), not
 	// just city-scope agents.
+	//
+	// Provider-derived implicit agents are injected AFTER this block (by
+	// InjectImplicitAgents at line 593), so [[patches.agent]] entries that
+	// target a not-yet-present implicit agent are partitioned into
+	// deferredAgentPatches and applied immediately after injection.
+	// Patches that match neither an existing agent nor a future implicit
+	// identity stay in nowPatches so ApplyPatches hard-errors on typos.
+	var deferredAgentPatches []AgentPatch
+	if len(root.Patches.Agents) > 0 {
+		implicitIDs := implicitAgentIdentities(root)
+		var nowPatches []AgentPatch
+		for _, p := range root.Patches.Agents {
+			if !agentPatchMatchesExisting(root, &p) && implicitIDs[agentKey{p.Dir, p.Name}] {
+				deferredAgentPatches = append(deferredAgentPatches, p)
+			} else {
+				nowPatches = append(nowPatches, p)
+			}
+		}
+		root.Patches.Agents = nowPatches
+	}
 	if !root.Patches.IsEmpty() {
 		if err := ApplyPatches(root, root.Patches); err != nil {
 			return nil, nil, fmt.Errorf("applying patches: %w", err)
@@ -592,6 +623,15 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	// explicit agents always take precedence.
 	InjectImplicitAgents(root)
 
+	// Apply patches that targeted provider-derived implicit agents, now
+	// present after injection. A patch that still cannot be resolved is a
+	// genuine typo — surface it with the same error framing as ApplyPatches.
+	if len(deferredAgentPatches) > 0 {
+		if err := ApplyPatches(root, Patches{Agents: deferredAgentPatches}); err != nil {
+			return nil, nil, fmt.Errorf("applying patches: %w", err)
+		}
+	}
+
 	// Apply [agent_defaults] values to all agents (explicit and implicit)
 	// that don't set their own override. Deprecated [agents] aliases are
 	// normalized during parse/load before composition reaches this point.
@@ -610,6 +650,7 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 		}
 	}
 	ApplyAgentDefaults(root)
+	ApplyBeadPolicyDefaults(root)
 
 	// Canonicalize duration-or-"off" session sleep fields after all config
 	// layers have been applied so runtime consumers can trust the values.
@@ -947,6 +988,9 @@ func mergeFragment(base, fragment *City, fragMeta toml.MetaData, fragPath string
 	// Providers: deep-merge per-field.
 	mergeProviders(base, fragment, fragMeta, fragPath, prov)
 
+	// Upstreams: additive merge with collision warnings.
+	mergeUpstreams(base, fragment, fragPath, prov)
+
 	// Workspace: per-field merge.
 	mergeWorkspace(base, fragment, fragMeta, fragPath, prov)
 
@@ -978,11 +1022,9 @@ func mergeFragment(base, fragment *City, fragMeta toml.MetaData, fragPath string
 	}
 	if fragMeta.IsDefined("daemon") {
 		formulaV2 := base.Daemon.FormulaV2
-		formulaV2Set := base.Daemon.formulaV2Set
 		base.Daemon = fragment.Daemon
 		if !fragMeta.IsDefined("daemon", "formula_v2") && !fragMeta.IsDefined("daemon", "graph_workflows") {
 			base.Daemon.FormulaV2 = formulaV2
-			base.Daemon.formulaV2Set = formulaV2Set
 		}
 	}
 	if fragMeta.IsDefined("session") {
@@ -994,8 +1036,14 @@ func mergeFragment(base, fragment *City, fragMeta toml.MetaData, fragPath string
 	if fragMeta.IsDefined("events") {
 		base.Events = fragment.Events
 	}
+	if fragMeta.IsDefined("usage") {
+		base.Usage = fragment.Usage
+	}
 	if fragMeta.IsDefined("orders") {
 		base.Orders = fragment.Orders
+	}
+	if fragMeta.IsDefined("extmsg", "default_route") {
+		base.ExtMsg.DefaultRoutes = append(base.ExtMsg.DefaultRoutes, fragment.ExtMsg.DefaultRoutes...)
 	}
 	if fragMeta.IsDefined("api") {
 		base.API = fragment.API
@@ -1066,6 +1114,28 @@ func mergePacks(base, fragment *City, fragPath string, prov *Provenance) {
 				fmt.Sprintf("pack %q redefined by %q", name, fragPath))
 		}
 		base.Packs[name] = src
+	}
+}
+
+// mergeUpstreams additively merges fragment upstream presets into base.
+// New upstream names are added. Duplicate names replace the base entry and
+// generate a collision warning. Upstreams are city-level config (declared in
+// city.toml or a city fragment), so fragment composition is the only layering
+// path they take; a [upstreams.<name>] block in a fragment must reach the
+// composed City so later session resolution can find it.
+func mergeUpstreams(base, fragment *City, fragPath string, prov *Provenance) {
+	if len(fragment.Upstreams) == 0 {
+		return
+	}
+	if base.Upstreams == nil {
+		base.Upstreams = make(map[string]UpstreamSpec)
+	}
+	for name, spec := range fragment.Upstreams {
+		if _, exists := base.Upstreams[name]; exists {
+			prov.Warnings = append(prov.Warnings,
+				fmt.Sprintf("upstream %q redefined by %q", name, fragPath))
+		}
+		base.Upstreams[name] = spec
 	}
 }
 
@@ -1187,6 +1257,39 @@ func deepMergeProvider(base, frag ProviderSpec, name string, fragMeta toml.MetaD
 			cloned[k] = v
 		}
 		result.Env = cloned
+	}
+
+	// upstream_env (the harness serving-env binding) merges per sub-field so a
+	// fragment can override a single env-var name without dropping the others.
+	// Each defined sub-field overrides the base and warns on a redefine, matching
+	// the scalar provider-field behavior above.
+	if fragMeta.IsDefined("providers", name, "upstream_env") {
+		bindingFields := []scalarField{
+			{
+				"base_url",
+				func() bool { return base.UpstreamEnv.BaseURL != "" },
+				func() { result.UpstreamEnv.BaseURL = frag.UpstreamEnv.BaseURL },
+			},
+			{
+				"api_key",
+				func() bool { return base.UpstreamEnv.APIKey != "" },
+				func() { result.UpstreamEnv.APIKey = frag.UpstreamEnv.APIKey },
+			},
+			{
+				"auth_token",
+				func() bool { return base.UpstreamEnv.AuthToken != "" },
+				func() { result.UpstreamEnv.AuthToken = frag.UpstreamEnv.AuthToken },
+			},
+		}
+		for _, bf := range bindingFields {
+			if fragMeta.IsDefined("providers", name, "upstream_env", bf.key) {
+				if bf.hasBase() {
+					prov.Warnings = append(prov.Warnings,
+						fmt.Sprintf("provider %q.upstream_env.%s redefined by %q", name, bf.key, fragPath))
+				}
+				bf.apply()
+			}
+		}
 	}
 
 	return result
@@ -1475,12 +1578,12 @@ func LoadPackGraphDirsForDoctor(fs fsys.FS, cityTomlPath string) ([]string, erro
 }
 
 func loadImportPackGraphDirsForDoctor(fs fsys.FS, imp Import, declDir, cityRoot string, cache *packLoadCache) ([]string, error) {
-	impDir, err := resolveImportPackRef(imp.Source, declDir, cityRoot)
+	impDir, err := resolveImportPackRef(imp.Source, imp.Version, declDir, cityRoot)
 	if err != nil {
 		return nil, err
 	}
 	topoPath := filepath.Join(impDir, packFile)
-	_, _, _, _, topoDirs, _, _, err := loadPackWithCacheOptions(
+	_, _, _, _, _, topoDirs, _, _, err := loadPackWithCacheOptions(
 		fs, topoPath, impDir, cityRoot, "", nil, cache, LoadOptions{allowLegacyOrderLayouts: true})
 	if err != nil {
 		return nil, err
@@ -1655,7 +1758,7 @@ func resolvedPackNames(includes []string, imports map[string]Import, sysFS fsys.
 	}
 
 	visitImport = func(ref, declDir string, transitive bool) {
-		dir, err := resolveImportPackRef(ref, declDir, cityRoot)
+		dir, err := resolveImportPackRef(ref, "", declDir, cityRoot)
 		if err != nil {
 			return
 		}
@@ -1669,6 +1772,17 @@ func resolvedPackNames(includes []string, imports map[string]Import, sysFS fsys.
 		visitImport(imp.Source, cityRoot, imp.ImportIsTransitive())
 	}
 	return names
+}
+
+// PackDirByName returns the composed pack directory whose pack.toml
+// declares the given name, or "" when no such pack composed.
+func (c *City) PackDirByName(name string) string {
+	for _, dir := range c.PackDirs {
+		if readPackNameFromDir(dir) == name {
+			return dir
+		}
+	}
+	return ""
 }
 
 // ReachablePackNames reports every pack name reachable from the config's
@@ -1714,4 +1828,20 @@ func readPackNameFromDir(dir string) string {
 		return ""
 	}
 	return pc.Pack.Name
+}
+
+// agentPatchMatchesExisting reports whether patch targets an agent already
+// present in cfg.Agents, using the same matching logic as applyAgentPatch.
+func agentPatchMatchesExisting(cfg *City, patch *AgentPatch) bool {
+	target := qualifiedNameFromPatch(patch.Dir, patch.Name)
+	for i := range cfg.Agents {
+		a := &cfg.Agents[i]
+		if AgentMatchesIdentity(a, target) {
+			return true
+		}
+		if a.Dir == patch.Dir && a.Name == patch.Name {
+			return true
+		}
+	}
+	return false
 }

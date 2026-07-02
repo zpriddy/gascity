@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/formula"
 )
@@ -28,6 +29,11 @@ type Options struct {
 	// titles, descriptions, and notes. Formula defaults are applied first;
 	// these values take precedence.
 	Vars map[string]string
+
+	// ExternalDeps wires recipe steps to already-existing bead IDs.
+	// These deps are embedded at create time so readiness and assignment are
+	// correct before the recipe becomes visible to workers.
+	ExternalDeps []ExternalDep
 
 	// ParentID attaches the molecule to an existing bead. When set, the
 	// root bead's ParentID is set to this value.
@@ -64,20 +70,24 @@ const (
 
 	// DeferredAssigneeMetadataKey stores an assignee withheld during speculative
 	// molecule creation. Activating the molecule restores the value as Assignee.
-	DeferredAssigneeMetadataKey = "gc.deferred_assignee"
+	DeferredAssigneeMetadataKey = beadmeta.DeferredAssigneeMetadataKey
 
 	// DeferredRoutedToMetadataKey stores gc.routed_to withheld during
 	// speculative molecule creation.
-	DeferredRoutedToMetadataKey = "gc.deferred_routed_to"
+	DeferredRoutedToMetadataKey = beadmeta.DeferredRoutedToMetadataKey
 
 	// DeferredExecutionRoutedToMetadataKey stores gc.execution_routed_to withheld
 	// during speculative molecule creation.
-	DeferredExecutionRoutedToMetadataKey = "gc.deferred_execution_routed_to"
+	DeferredExecutionRoutedToMetadataKey = beadmeta.DeferredExecutionRoutedToMetadataKey
 
 	// DeferredTypeMetadataKey stores the bead type withheld during speculative
 	// molecule creation. Speculative actionable work is created as a ready-
 	// excluded type and restored on activation.
-	DeferredTypeMetadataKey = "gc.deferred_type"
+	DeferredTypeMetadataKey = beadmeta.DeferredTypeMetadataKey
+
+	// InstantiatingMetadataKey marks graph workflows that are visible in the
+	// store while sequential fallback is still wiring their dependency graph.
+	InstantiatingMetadataKey = beadmeta.InstantiatingMetadataKey
 )
 
 // FragmentOptions configures instantiation of a rootless recipe fragment into
@@ -239,11 +249,11 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 		return nil, fmt.Errorf("attach bead %s: %w", attachBeadID, err)
 	}
 
-	rootBeadID := parentBead.Metadata["gc.root_bead_id"]
+	rootBeadID := parentBead.Metadata[beadmeta.RootBeadIDMetadataKey]
 	if rootBeadID == "" {
 		rootBeadID = attachBeadID
 	}
-	rootStoreRef := parentBead.Metadata["gc.root_store_ref"]
+	rootStoreRef := parentBead.Metadata[beadmeta.RootStoreRefMetadataKey]
 
 	// Idempotency: check for existing sub-DAG with the same key.
 	// This runs before epoch fencing so that crash-retries with stale epochs
@@ -260,7 +270,7 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 	// Only checked for new attaches (not duplicates, which return above).
 	if opts.ExpectedEpoch > 0 {
 		currentEpoch := 0
-		if raw := parentBead.Metadata["gc.control_epoch"]; raw != "" {
+		if raw := parentBead.Metadata[beadmeta.ControlEpochMetadataKey]; raw != "" {
 			currentEpoch, _ = strconv.Atoi(raw)
 		}
 		if currentEpoch != opts.ExpectedEpoch {
@@ -276,9 +286,9 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 		if recipe.Steps[i].Metadata == nil {
 			recipe.Steps[i].Metadata = make(map[string]string)
 		}
-		recipe.Steps[i].Metadata["gc.root_bead_id"] = rootBeadID
+		recipe.Steps[i].Metadata[beadmeta.RootBeadIDMetadataKey] = rootBeadID
 		if rootStoreRef != "" {
-			recipe.Steps[i].Metadata["gc.root_store_ref"] = rootStoreRef
+			recipe.Steps[i].Metadata[beadmeta.RootStoreRefMetadataKey] = rootStoreRef
 		}
 	}
 
@@ -287,7 +297,7 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 		if recipe.Steps[0].Metadata == nil {
 			recipe.Steps[0].Metadata = make(map[string]string)
 		}
-		recipe.Steps[0].Metadata["gc.idempotency_key"] = opts.IdempotencyKey
+		recipe.Steps[0].Metadata[beadmeta.IdempotencyKeyMetadataKey] = opts.IdempotencyKey
 	}
 
 	result, err := Instantiate(ctx, store, recipe, Options{
@@ -308,7 +318,7 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 	// Increment epoch after successful attach.
 	if opts.ExpectedEpoch > 0 {
 		nextEpoch := strconv.Itoa(opts.ExpectedEpoch + 1)
-		if err := store.SetMetadata(attachBeadID, "gc.control_epoch", nextEpoch); err != nil {
+		if err := store.SetMetadata(attachBeadID, beadmeta.ControlEpochMetadataKey, nextEpoch); err != nil {
 			return nil, fmt.Errorf("incrementing epoch on %s: %w", attachBeadID, err)
 		}
 	}
@@ -326,8 +336,8 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 func findExistingAttach(store beads.Store, recipe *formula.Recipe, rootBeadID, attachBeadID, key string, expectedEpoch int) (*AttachResult, error) {
 	all, err := store.List(beads.ListQuery{
 		Metadata: map[string]string{
-			"gc.idempotency_key": key,
-			"gc.root_bead_id":    rootBeadID,
+			beadmeta.IdempotencyKeyMetadataKey: key,
+			beadmeta.RootBeadIDMetadataKey:     rootBeadID,
 		},
 		TierMode: beads.TierBoth,
 	})
@@ -335,10 +345,10 @@ func findExistingAttach(store beads.Store, recipe *formula.Recipe, rootBeadID, a
 		return nil, err
 	}
 	for _, b := range all {
-		if b.Metadata["gc.idempotency_key"] != key {
+		if b.Metadata[beadmeta.IdempotencyKeyMetadataKey] != key {
 			continue
 		}
-		if b.Metadata["gc.root_bead_id"] != rootBeadID {
+		if b.Metadata[beadmeta.RootBeadIDMetadataKey] != rootBeadID {
 			continue
 		}
 		if b.Metadata["molecule_failed"] == "true" {
@@ -386,12 +396,12 @@ func advanceAttachEpochIfNeeded(store beads.Store, attachBeadID string, expected
 	if err != nil {
 		return err
 	}
-	currentEpoch, _ := strconv.Atoi(strings.TrimSpace(attachBead.Metadata["gc.control_epoch"]))
+	currentEpoch, _ := strconv.Atoi(strings.TrimSpace(attachBead.Metadata[beadmeta.ControlEpochMetadataKey]))
 	if currentEpoch != expectedEpoch {
 		return nil
 	}
 	nextEpoch := expectedEpoch + 1
-	return store.SetMetadata(attachBeadID, "gc.control_epoch", strconv.Itoa(nextEpoch))
+	return store.SetMetadata(attachBeadID, beadmeta.ControlEpochMetadataKey, strconv.Itoa(nextEpoch))
 }
 
 func existingAttachIDMapping(store beads.Store, recipe *formula.Recipe, rootBeadID string, root beads.Bead) (map[string]string, error) {
@@ -413,7 +423,7 @@ func existingAttachIDMapping(store beads.Store, recipe *formula.Recipe, rootBead
 		return idMapping, nil
 	}
 	all, err := store.List(beads.ListQuery{
-		Metadata: map[string]string{"gc.root_bead_id": rootBeadID},
+		Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: rootBeadID},
 		TierMode: beads.TierBoth,
 	})
 	if err != nil {
@@ -423,7 +433,7 @@ func existingAttachIDMapping(store beads.Store, recipe *formula.Recipe, rootBead
 		if bead.Metadata["molecule_failed"] == "true" {
 			continue
 		}
-		ref := strings.TrimSpace(bead.Metadata["gc.step_ref"])
+		ref := strings.TrimSpace(bead.Metadata[beadmeta.StepRefMetadataKey])
 		if ref == "" {
 			ref = strings.TrimSpace(bead.Ref)
 		}
@@ -441,7 +451,7 @@ func existingAttachIDMapping(store beads.Store, recipe *formula.Recipe, rootBead
 
 func attachStepRefs(step formula.RecipeStep) []string {
 	refs := make([]string, 0, 2)
-	if ref := strings.TrimSpace(step.Metadata["gc.step_ref"]); ref != "" {
+	if ref := strings.TrimSpace(step.Metadata[beadmeta.StepRefMetadataKey]); ref != "" {
 		refs = append(refs, ref)
 	}
 	if id := strings.TrimSpace(step.ID); id != "" {
@@ -514,6 +524,12 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 	embeddedDeps := make(map[string]bool)
 	pendingAssignees := make(map[string]string)
 	graphWorkflow := preservesGraphActionTypes(recipe)
+	fenceGraphWorkflow := graphWorkflow && !opts.DeferAssignees
+	externalDepsByStep, err := groupExternalDeps(opts.ExternalDeps)
+	if err != nil {
+		return nil, err
+	}
+	recipeParentByStep := recipeParentDeps(recipe.Deps)
 
 	for i, step := range recipe.Steps {
 		// For RootOnly recipes, only create the root bead.
@@ -542,6 +558,16 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			}
 			embeddedDeps[dep.StepID+"|"+dep.DependsOnID+"|"+dep.Type] = true
 		}
+		for _, dep := range externalDepsByStep[step.ID] {
+			if dep.Type == "parent-child" {
+				continue
+			}
+			if dep.Type == "blocks" {
+				b.Needs = append(b.Needs, dep.DependsOnID)
+			} else {
+				b.Needs = append(b.Needs, dep.Type+":"+dep.DependsOnID)
+			}
+		}
 		// Root bead overrides.
 		if step.IsRoot {
 			if !opts.PreserveRootType && !preserveExecutableRootType(step) {
@@ -551,17 +577,17 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			if opts.Title != "" {
 				b.Title = formula.Substitute(opts.Title, vars)
 			}
-			if opts.ParentID != "" && step.Metadata["gc.kind"] != "workflow" {
+			if opts.ParentID != "" && step.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindWorkflow {
 				b.ParentID = opts.ParentID
 			}
 			if b.Metadata == nil {
 				b.Metadata = make(map[string]string, 4)
 			}
 			if recipe.ContentHash != "" {
-				b.Metadata["gc.formula_hash"] = recipe.ContentHash
+				b.Metadata[beadmeta.FormulaHashMetadataKey] = recipe.ContentHash
 			}
 			if recipe.FormulaSource != "" {
-				b.Metadata["gc.formula_source"] = recipe.FormulaSource
+				b.Metadata[beadmeta.FormulaSourceMetadataKey] = recipe.FormulaSource
 			}
 			if opts.IdempotencyKey != "" {
 				b.Metadata["idempotency_key"] = opts.IdempotencyKey
@@ -584,19 +610,25 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 					break
 				}
 			}
+			for _, dep := range externalDepsByStep[step.ID] {
+				if b.ParentID == "" && recipeParentByStep[step.ID] == "" && dep.Type == "parent-child" && dep.DependsOnID != "" {
+					b.ParentID = dep.DependsOnID
+					break
+				}
+			}
 			// Set Ref to the step ID suffix (after the formula name prefix).
 			b.Ref = step.ID
 			if b.Metadata == nil {
 				b.Metadata = make(map[string]string, 1)
 			}
-			if b.Metadata["gc.step_ref"] == "" {
-				b.Metadata["gc.step_ref"] = step.ID
+			if b.Metadata[beadmeta.StepRefMetadataKey] == "" {
+				b.Metadata[beadmeta.StepRefMetadataKey] = step.ID
 			}
 
-			if graphWorkflow || step.Metadata["gc.kind"] != "" {
-				if b.Metadata["gc.root_bead_id"] == "" {
+			if graphWorkflow || step.Metadata[beadmeta.KindMetadataKey] != "" {
+				if b.Metadata[beadmeta.RootBeadIDMetadataKey] == "" {
 					if rootBeadID, ok := idMapping[recipe.Steps[0].ID]; ok && rootBeadID != "" {
-						b.Metadata["gc.root_bead_id"] = rootBeadID
+						b.Metadata[beadmeta.RootBeadIDMetadataKey] = rootBeadID
 					}
 				}
 			}
@@ -608,7 +640,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 					if b.Metadata == nil {
 						b.Metadata = make(map[string]string, 1)
 					}
-					b.Metadata["gc.logical_bead_id"] = logicalBeadID
+					b.Metadata[beadmeta.LogicalBeadIDMetadataKey] = logicalBeadID
 				}
 			}
 
@@ -619,6 +651,9 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 				pendingAssignees[step.ID] = b.Assignee
 				b.Assignee = ""
 			}
+		}
+		if fenceGraphWorkflow {
+			fenceGraphWorkflowBead(&b)
 		}
 
 		// Catch unresolved {{...}} in the bead title — the field agents see
@@ -679,6 +714,24 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			}
 		}
 	}
+	for stepID, deps := range externalDepsByStep {
+		if recipeParentByStep[stepID] != "" {
+			continue
+		}
+		fromID, fromOK := idMapping[stepID]
+		if !fromOK {
+			continue
+		}
+		for _, dep := range deps {
+			if dep.Type != "parent-child" {
+				continue
+			}
+			if err := store.DepAdd(fromID, dep.DependsOnID, dep.Type); err != nil {
+				markFailed(store, createdIDs)
+				return nil, fmt.Errorf("wiring external dep %s->%s: %w", stepID, dep.DependsOnID, err)
+			}
+		}
+	}
 
 	if graphWorkflow {
 		for stepID, assignee := range pendingAssignees {
@@ -692,6 +745,19 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			if err := store.Update(beadID, beads.UpdateOpts{Assignee: &assignee}); err != nil {
 				markFailed(store, createdIDs)
 				return nil, fmt.Errorf("assigning graph step %q: %w", stepID, err)
+			}
+		}
+	}
+
+	if fenceGraphWorkflow {
+		for _, step := range recipe.Steps {
+			beadID := idMapping[step.ID]
+			if beadID == "" {
+				continue
+			}
+			if err := activateFencedGraphWorkflowBead(store, beadID); err != nil {
+				markFailed(store, createdIDs)
+				return nil, fmt.Errorf("activating graph step %q: %w", step.ID, err)
 			}
 		}
 	}
@@ -806,17 +872,17 @@ func InstantiateFragment(ctx context.Context, store beads.Store, recipe *formula
 		if b.Metadata == nil {
 			b.Metadata = make(map[string]string, 2)
 		}
-		if b.Metadata["gc.step_ref"] == "" {
-			b.Metadata["gc.step_ref"] = step.ID
+		if b.Metadata[beadmeta.StepRefMetadataKey] == "" {
+			b.Metadata[beadmeta.StepRefMetadataKey] = step.ID
 		}
-		b.Metadata["gc.root_bead_id"] = opts.RootID
+		b.Metadata[beadmeta.RootBeadIDMetadataKey] = opts.RootID
 		b.Ref = step.ID
 
 		if logicalStepID, ok := logicalRecipeStepID(step); ok {
 			if logicalBeadID, exists := idMapping[logicalStepID]; exists {
-				b.Metadata["gc.logical_bead_id"] = logicalBeadID
+				b.Metadata[beadmeta.LogicalBeadIDMetadataKey] = logicalBeadID
 			} else if logicalBeadID := existingLogicalBeadIDs[logicalStepID]; logicalBeadID != "" {
-				b.Metadata["gc.logical_bead_id"] = logicalBeadID
+				b.Metadata[beadmeta.LogicalBeadIDMetadataKey] = logicalBeadID
 			}
 		}
 
@@ -962,10 +1028,10 @@ func preservesGraphActionTypes(recipe *formula.Recipe) bool {
 		return false
 	}
 	root := recipe.Steps[0]
-	if root.Metadata["gc.kind"] == "workflow" {
+	if root.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflow {
 		return true
 	}
-	return root.Metadata["gc.attempt"] != "" && root.Metadata["gc.step_ref"] != ""
+	return root.Metadata[beadmeta.AttemptMetadataKey] != "" && root.Metadata[beadmeta.StepRefMetadataKey] != ""
 }
 
 // stepToBead converts a RecipeStep to a Bead with variable substitution.
@@ -999,7 +1065,7 @@ func stepToBead(step formula.RecipeStep, vars map[string]string, priorityOverrid
 }
 
 func preserveExecutableRootType(step formula.RecipeStep) bool {
-	switch step.Metadata["gc.kind"] {
+	switch step.Metadata[beadmeta.KindMetadataKey] {
 	case "workflow", "wisp":
 		return true
 	default:
@@ -1008,7 +1074,7 @@ func preserveExecutableRootType(step formula.RecipeStep) bool {
 }
 
 func validateTimeoutMetadataVars(stepID string, metadata map[string]string) error {
-	for _, key := range []string{"gc.step_timeout", "gc.check_timeout"} {
+	for _, key := range []string{beadmeta.StepTimeoutMetadataKey, beadmeta.CheckTimeoutMetadataKey} {
 		raw := metadata[key]
 		if raw == "" {
 			continue
@@ -1042,8 +1108,62 @@ func deferBeadRouting(b *beads.Bead) {
 		b.Metadata[DeferredAssigneeMetadataKey] = b.Assignee
 		b.Assignee = ""
 	}
-	deferBeadMetadataValue(b, "gc.routed_to", DeferredRoutedToMetadataKey)
-	deferBeadMetadataValue(b, "gc.execution_routed_to", DeferredExecutionRoutedToMetadataKey)
+	deferBeadMetadataValue(b, beadmeta.RoutedToMetadataKey, DeferredRoutedToMetadataKey)
+	deferBeadMetadataValue(b, beadmeta.ExecutionRoutedToMetadataKey, DeferredExecutionRoutedToMetadataKey)
+}
+
+func fenceGraphWorkflowBead(b *beads.Bead) {
+	ensureBeadMetadata(b)
+	b.Metadata[InstantiatingMetadataKey] = "true"
+	deferBeadRouting(b)
+}
+
+func activateFencedGraphWorkflowBead(store beads.Store, id string) error {
+	b, err := store.Get(id)
+	if err != nil {
+		return err
+	}
+	update := deferredRoutingActivationUpdate(b)
+	if update.Assignee == nil && update.Type == nil && len(update.Metadata) == 0 {
+		return nil
+	}
+	return store.Update(id, update)
+}
+
+func deferredRoutingActivationUpdate(b beads.Bead) beads.UpdateOpts {
+	update := beads.UpdateOpts{}
+	metadata := map[string]string{}
+	if assignee := b.Metadata[DeferredAssigneeMetadataKey]; assignee != "" {
+		if b.Assignee != assignee {
+			update.Assignee = &assignee
+		}
+		metadata[DeferredAssigneeMetadataKey] = ""
+	}
+	if routedTo := b.Metadata[DeferredRoutedToMetadataKey]; routedTo != "" {
+		if b.Metadata[beadmeta.RoutedToMetadataKey] != routedTo {
+			metadata[beadmeta.RoutedToMetadataKey] = routedTo
+		}
+		metadata[DeferredRoutedToMetadataKey] = ""
+	}
+	if executionRoutedTo := b.Metadata[DeferredExecutionRoutedToMetadataKey]; executionRoutedTo != "" {
+		if b.Metadata[beadmeta.ExecutionRoutedToMetadataKey] != executionRoutedTo {
+			metadata[beadmeta.ExecutionRoutedToMetadataKey] = executionRoutedTo
+		}
+		metadata[DeferredExecutionRoutedToMetadataKey] = ""
+	}
+	if typ := b.Metadata[DeferredTypeMetadataKey]; typ != "" {
+		if b.Type != typ {
+			update.Type = &typ
+		}
+		metadata[DeferredTypeMetadataKey] = ""
+	}
+	if b.Metadata[InstantiatingMetadataKey] != "" {
+		metadata[InstantiatingMetadataKey] = ""
+	}
+	if len(metadata) > 0 {
+		update.Metadata = metadata
+	}
+	return update
 }
 
 func deferBeadMetadataValue(b *beads.Bead, sourceKey, deferredKey string) {
@@ -1062,7 +1182,7 @@ func ensureBeadMetadata(b *beads.Bead) {
 	}
 }
 
-const formulaVarMetadataPrefix = "gc.var."
+const formulaVarMetadataPrefix = beadmeta.FormulaVarPrefix
 
 // stampFormulaVars records non-empty formula input vars on the root bead as
 // gc.var.<name> metadata so they are discoverable from the parent alone
@@ -1194,13 +1314,16 @@ func unresolvedTitleValidationErrorsWithVars(recipe *formula.Recipe, opts Option
 // error path.
 func markFailed(store beads.Store, ids []string) {
 	for _, id := range ids {
-		_ = store.SetMetadata(id, "molecule_failed", "true")
+		_ = store.SetMetadataBatch(id, map[string]string{
+			"molecule_failed":        "true",
+			InstantiatingMetadataKey: "",
+		})
 	}
 }
 
 func logicalRecipeStepID(step formula.RecipeStep) (string, bool) {
-	kind := step.Metadata["gc.kind"]
-	if attempt := step.Metadata["gc.attempt"]; attempt != "" {
+	kind := step.Metadata[beadmeta.KindMetadataKey]
+	if attempt := step.Metadata[beadmeta.AttemptMetadataKey]; attempt != "" {
 		// v1 patterns: kind-specific suffix stripping.
 		switch kind {
 		case "run", "scope":
@@ -1230,7 +1353,7 @@ func logicalRecipeStepID(step formula.RecipeStep) (string, bool) {
 			return trimmed, true
 		}
 	}
-	if logicalID := step.Metadata["gc.ralph_step_id"]; logicalID != "" {
+	if logicalID := step.Metadata[beadmeta.RalphStepIDMetadataKey]; logicalID != "" {
 		switch kind {
 		case "run", "check", "scope":
 			return logicalID, true
@@ -1256,7 +1379,7 @@ func trimAttemptSuffix(id, suffix string) (string, bool) {
 
 func existingLogicalBeadIDIndex(store beads.Store, rootID string) (map[string]string, error) {
 	all, err := store.List(beads.ListQuery{
-		Metadata: map[string]string{"gc.root_bead_id": rootID},
+		Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: rootID},
 		TierMode: beads.TierBoth,
 	})
 	if err != nil {
@@ -1264,18 +1387,18 @@ func existingLogicalBeadIDIndex(store beads.Store, rootID string) (map[string]st
 	}
 	index := make(map[string]string)
 	for _, bead := range all {
-		switch bead.Metadata["gc.kind"] {
+		switch bead.Metadata[beadmeta.KindMetadataKey] {
 		case "ralph", "retry":
 		default:
 			continue
 		}
-		if bead.ID != rootID && bead.Metadata["gc.root_bead_id"] != rootID {
+		if bead.ID != rootID && bead.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID {
 			continue
 		}
-		if stepRef := bead.Metadata["gc.step_ref"]; stepRef != "" {
+		if stepRef := bead.Metadata[beadmeta.StepRefMetadataKey]; stepRef != "" {
 			index[stepRef] = bead.ID
 		}
-		if stepID := bead.Metadata["gc.step_id"]; stepID != "" {
+		if stepID := bead.Metadata[beadmeta.StepIDMetadataKey]; stepID != "" {
 			index[stepID] = bead.ID
 		}
 	}

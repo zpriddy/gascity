@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/events"
@@ -18,11 +20,13 @@ import (
 // It maintains an in-memory index of active convergence beads (bead ID →
 // target agent) to avoid O(n) scans on every tick. The index is populated
 // once at startup and maintained on state transitions via SetMetadata.
-// No mutex is needed — single-writer event loop.
+// No mutex is needed — single-writer event loop. indexReady is an atomic
+// flag for safe cross-goroutine reads of the ready state (e.g. test pollers).
 type convergenceStoreAdapter struct {
 	store              beads.Store
 	formulaSearchPaths []string          // search paths for formula compilation in PourWisp
 	activeIndex        map[string]string // bead ID → target agent; nil until populateIndex
+	indexReady         atomic.Bool       // true once populateIndex has completed
 }
 
 var _ convergence.Store = (*convergenceStoreAdapter)(nil)
@@ -49,6 +53,7 @@ func (a *convergenceStoreAdapter) populateIndex() error {
 		}
 	}
 	a.activeIndex = idx
+	a.indexReady.Store(true)
 	return nil
 }
 
@@ -184,10 +189,10 @@ func (a *convergenceStoreAdapter) pourWisp(parentID, formula, idempotencyKey str
 	}
 	isGraphV2, _, err := graphv2.IsGraphV2Formula(formula, a.formulaSearchPaths)
 	if err != nil {
-		return "", fmt.Errorf("checking graph.v2 contract for convergence wisp %q: %w", formula, err)
+		return "", fmt.Errorf("checking formulas v2 contract for convergence wisp %q: %w", formula, err)
 	}
 	if isGraphV2 {
-		return "", fmt.Errorf("convergence wisps do not support graph.v2 formula %q; use a non-graph formula until convergence has an explicit input convoy target", formula)
+		return "", fmt.Errorf("convergence wisps do not support v2 formula %q; use a v1 formula until convergence has an explicit input convoy target", formula)
 	}
 	result, err := molecule.Cook(context.Background(), a.store, formula, a.formulaSearchPaths, molecule.Options{
 		Vars:           cookVars,
@@ -215,11 +220,11 @@ func (a *convergenceStoreAdapter) activateDeferredAssignees(id string) error {
 		update.Assignee = &assignee
 	}
 	metadata := map[string]string{}
-	if routedTo := b.Metadata[molecule.DeferredRoutedToMetadataKey]; routedTo != "" && b.Metadata["gc.routed_to"] != routedTo {
-		metadata["gc.routed_to"] = routedTo
+	if routedTo := b.Metadata[molecule.DeferredRoutedToMetadataKey]; routedTo != "" && b.Metadata[beadmeta.RoutedToMetadataKey] != routedTo {
+		metadata[beadmeta.RoutedToMetadataKey] = routedTo
 	}
-	if executionRoutedTo := b.Metadata[molecule.DeferredExecutionRoutedToMetadataKey]; executionRoutedTo != "" && b.Metadata["gc.execution_routed_to"] != executionRoutedTo {
-		metadata["gc.execution_routed_to"] = executionRoutedTo
+	if executionRoutedTo := b.Metadata[molecule.DeferredExecutionRoutedToMetadataKey]; executionRoutedTo != "" && b.Metadata[beadmeta.ExecutionRoutedToMetadataKey] != executionRoutedTo {
+		metadata[beadmeta.ExecutionRoutedToMetadataKey] = executionRoutedTo
 	}
 	if typ := b.Metadata[molecule.DeferredTypeMetadataKey]; typ != "" && b.Type != typ {
 		update.Type = &typ

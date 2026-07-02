@@ -173,6 +173,17 @@ func (e *Editor) loadForEdit() (*config.City, error) {
 	return cfg, nil
 }
 
+// LoadRaw returns the raw (pre-expansion, site-bound) city config — the exact
+// basis the mutation gate uses for provenance. UpdateAgent/DeleteAgent decide
+// pack-derived-ness via AgentOrigin(raw, expanded, name) where raw comes from
+// loadForEdit; read paths that surface provenance (e.g. pack_derived on
+// GET /agents) call this so the read agrees with the 409 gate instead of
+// re-parsing city.toml independently. The returned config is a fresh snapshot
+// the caller owns; it carries no pack-expanded agents.
+func (e *Editor) LoadRaw() (*config.City, error) {
+	return e.loadForEdit()
+}
+
 // write persists city.toml first, then .gc/site.toml. A crash between the
 // two writes leaves city.toml with rig paths stripped while .gc/site.toml
 // retains its previous state — producing an orphan legacy/unbound rig
@@ -542,15 +553,48 @@ func isAgentPatchOnlyIdentity(p config.AgentPatch) bool {
 	return true
 }
 
+// resolveAgentTomlTarget resolves a convention agent.toml path through any
+// symlink so atomic rewrites land on the checked-in target instead of replacing
+// the link entry. A non-symlink path is returned cleaned; a missing or dangling
+// link resolves to its would-be target so a suspend can still create it.
+func resolveAgentTomlTarget(fs fsys.FS, agentTomlPath, name string) (string, error) {
+	target, err := fsys.ResolveSymlinks(fs, agentTomlPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving agents/%s/agent.toml: %w", name, err)
+	}
+	return target, nil
+}
+
+// removeAgentTomlConvention clears the durable agent.toml convention content.
+// When agent.toml is a symlink into a checked-in target, the resolved target is
+// removed so the durable content is cleared at its real location; the operator's
+// link is intentionally left in place (edits act on the target, not the link).
+// A now-dangling link is treated as "no durable config" by every reader and is
+// rewritten through on the next suspend. Missing files are not an error.
+func removeAgentTomlConvention(fs fsys.FS, agentTomlPath, name string) error {
+	target, err := resolveAgentTomlTarget(fs, agentTomlPath, name)
+	if err != nil {
+		return err
+	}
+	if err := fs.Remove(target); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing agents/%s/agent.toml: %w", name, err)
+	}
+	return nil
+}
+
 // WriteLocalDiscoveredAgentSuspended writes the suspended state to
 // agents/<name>/agent.toml using an atomic temp-file rename. When
 // suspended is false and the file would become empty (no other fields),
-// it is removed instead.
+// the durable content is cleared instead.
 //
 // Decoding into map[string]any (rather than a typed struct) preserves
 // any user-set fields the caller didn't ask about. TOML comments and
 // key ordering are not preserved — that is a limitation of the
 // underlying decode/encode round trip, not this helper.
+//
+// Writes and removals resolve a symlinked agent.toml to its checked-in target
+// first, so a linked config is updated/cleared at the target rather than having
+// the link replaced by a regular file (the ga-lurp5d symlink-clobber class).
 func WriteLocalDiscoveredAgentSuspended(fs fsys.FS, cityRoot string, agent config.Agent, suspended bool) error {
 	agentTomlPath := filepath.Join(cityRoot, "agents", agent.Name, "agent.toml")
 
@@ -576,17 +620,18 @@ func WriteLocalDiscoveredAgentSuspended(fs fsys.FS, cityRoot string, agent confi
 	}
 
 	if len(values) == 0 {
-		if err := fs.Remove(agentTomlPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removing agents/%s/agent.toml: %w", agent.Name, err)
-		}
-		return nil
+		return removeAgentTomlConvention(fs, agentTomlPath, agent.Name)
 	}
 
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(values); err != nil {
 		return fmt.Errorf("encoding agents/%s/agent.toml: %w", agent.Name, err)
 	}
-	if err := fsys.WriteFileAtomic(fs, agentTomlPath, buf.Bytes(), 0o644); err != nil {
+	writePath, err := resolveAgentTomlTarget(fs, agentTomlPath, agent.Name)
+	if err != nil {
+		return err
+	}
+	if err := fsys.WriteFileAtomic(fs, writePath, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("writing agents/%s/agent.toml: %w", agent.Name, err)
 	}
 	return nil
@@ -770,7 +815,11 @@ func WriteLocalDiscoveredAgentConfig(fs fsys.FS, cityRoot string, agent config.A
 	if err := toml.NewEncoder(&buf).Encode(values); err != nil {
 		return cleanupFreshScaffold(fmt.Errorf("encoding agents/%s/agent.toml: %w", agent.Name, err))
 	}
-	if err := fsys.WriteFileAtomic(fs, filepath.Join(agentDir, "agent.toml"), buf.Bytes(), 0o644); err != nil {
+	writePath, err := resolveAgentTomlTarget(fs, filepath.Join(agentDir, "agent.toml"), agent.Name)
+	if err != nil {
+		return cleanupFreshScaffold(err)
+	}
+	if err := fsys.WriteFileAtomic(fs, writePath, buf.Bytes(), 0o644); err != nil {
 		return cleanupFreshScaffold(fmt.Errorf("writing agents/%s/agent.toml: %w", agent.Name, err))
 	}
 	return nil
@@ -849,17 +898,18 @@ func writeLocalDiscoveredAgentUpdate(fs fsys.FS, cityRoot string, agent config.A
 	// An empty merged convention config means there is no durable agent.toml
 	// content to preserve; the prompt scaffold still defines the agent.
 	if len(values) == 0 {
-		if err := fs.Remove(agentTomlPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removing agents/%s/agent.toml: %w", agent.Name, err)
-		}
-		return nil
+		return removeAgentTomlConvention(fs, agentTomlPath, agent.Name)
 	}
 
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(values); err != nil {
 		return fmt.Errorf("encoding agents/%s/agent.toml: %w", agent.Name, err)
 	}
-	if err := fsys.WriteFileAtomic(fs, agentTomlPath, buf.Bytes(), 0o644); err != nil {
+	writePath, err := resolveAgentTomlTarget(fs, agentTomlPath, agent.Name)
+	if err != nil {
+		return err
+	}
+	if err := fsys.WriteFileAtomic(fs, writePath, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("writing agents/%s/agent.toml: %w", agent.Name, err)
 	}
 	return nil
@@ -1201,6 +1251,7 @@ type ProviderUpdate struct {
 	Env                map[string]string // nil = not set, non-nil = additive merge
 	OptionsSchemaMerge *string
 	OptionsSchema      []config.ProviderOption // nil = not set, non-nil = replace
+	OptionDefaults     map[string]string       // nil = not set, non-nil = additive merge
 }
 
 // CreateProvider adds a new city-level provider to the config.
@@ -1216,6 +1267,23 @@ func (e *Editor) CreateProvider(name string, spec config.ProviderSpec) error {
 		cfg.Providers[name] = spec
 		return nil
 	})
+}
+
+// mergeStringMapInto additively merges src into dst, lazily allocating dst
+// when it is nil. Keys present in src overwrite those in dst; an empty src
+// leaves dst unchanged. It returns the (possibly newly allocated) destination
+// so callers can assign it back onto the target field.
+func mergeStringMapInto(dst, src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]string, len(src))
+	}
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // UpdateProvider partially updates an existing city-level provider.
@@ -1266,20 +1334,14 @@ func (e *Editor) UpdateProvider(name string, patch ProviderUpdate) error {
 		if patch.ReadyDelayMs != nil {
 			spec.ReadyDelayMs = *patch.ReadyDelayMs
 		}
-		if len(patch.Env) > 0 {
-			if spec.Env == nil {
-				spec.Env = make(map[string]string, len(patch.Env))
-			}
-			for k, v := range patch.Env {
-				spec.Env[k] = v
-			}
-		}
+		spec.Env = mergeStringMapInto(spec.Env, patch.Env)
 		if patch.OptionsSchemaMerge != nil {
 			spec.OptionsSchemaMerge = *patch.OptionsSchemaMerge
 		}
 		if patch.OptionsSchema != nil {
 			spec.OptionsSchema = append([]config.ProviderOption(nil), patch.OptionsSchema...)
 		}
+		spec.OptionDefaults = mergeStringMapInto(spec.OptionDefaults, patch.OptionDefaults)
 		cfg.Providers[name] = spec
 		return nil
 	})
