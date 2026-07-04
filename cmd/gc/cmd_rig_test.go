@@ -2684,6 +2684,78 @@ func TestDoRigAdd_AdoptExistingBeads(t *testing.T) {
 	}
 }
 
+// TestDoRigAdd_AdoptDoltRigUnderMysqlCityPreservesBackend is the regression for
+// az-of4: adopting a dolt-backed rig under a mysql-backed HQ must NOT cascade
+// the city's mysql store over the rig's .beads/metadata.json. A dolt rig under a
+// mysql HQ is a supported topology (per-rig config), so --adopt must register it
+// as-is. Before the fix, initDirIfReadyManagedMysql rewrote metadata.json to the
+// city's mysql database.
+func TestDoRigAdd_AdoptDoltRigUnderMysqlCityPreservesBackend(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
+	// City HQ is mysql-backed.
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityMeta := `{"backend":"mysql","database":"anthony_beads","mysql_host":"127.0.0.1","mysql_port":"3306","mysql_user":"root","mysql_database":"anthony_beads"}`
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(cityMeta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Adopted rig is dolt-backed (different backend than the city).
+	rigPath := filepath.Join(t.TempDir(), "kit")
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rigMeta := `{"backend":"dolt","database":"kit","dolt_database":"kit","dolt_mode":"server","issue_prefix":"kit","project_id":"fe287c97-0196-4379-9de0-25d4104189fe"}`
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "metadata.json"), []byte(rigMeta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "config.yaml"), []byte("issue_prefix: kit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail loudly if the mysql cascade is ever invoked for this adopt — the fix
+	// must skip it entirely. (A faked init keeps the test off any real bd binary.)
+	bdi := &fakeBdInit{}
+	prevBd := defaultBdMysqlInit
+	defer func() { defaultBdMysqlInit = prevBd }()
+	defaultBdMysqlInit = bdi.run
+
+	t.Setenv("GC_DOLT", "skip")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "kit", "", false, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd --adopt returned %d, stderr: %s", code, stderr.String())
+	}
+
+	// The rig's metadata.json must still declare dolt — not be clobbered to mysql.
+	metaBytes, err := os.ReadFile(filepath.Join(rigPath, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Backend string `json:"backend"`
+	}
+	if err := json.Unmarshal(metaBytes, &got); err != nil {
+		t.Fatalf("rig metadata.json no longer parses: %v\n%s", err, metaBytes)
+	}
+	if !strings.EqualFold(got.Backend, "dolt") {
+		t.Fatalf("az-of4 regression: rig backend clobbered to %q (want dolt); metadata.json:\n%s", got.Backend, metaBytes)
+	}
+
+	// The mysql cascade must not have run.
+	if len(bdi.calls) != 0 {
+		t.Fatalf("az-of4 regression: mysql bd init cascaded over adopted dolt rig (%d calls)", len(bdi.calls))
+	}
+
+	// User should be warned that the divergent backend was preserved.
+	if !strings.Contains(stderr.String(), "preserving the rig's existing store") {
+		t.Errorf("expected a preserve-backend warning on stderr, got: %s", stderr.String())
+	}
+}
+
 func TestDoRigAdd_AdoptRequiresMetadataJSON(t *testing.T) {
 	cityPath := t.TempDir()
 	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")

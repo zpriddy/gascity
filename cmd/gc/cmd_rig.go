@@ -515,10 +515,19 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 			return config.Rig{}, 1
 		}
 		if cityUsesBdStoreContract(cityPath) {
-			deferred, err = initDirIfReady(cityPath, rigPath, prefix)
-			if err != nil {
-				fmt.Fprintf(stderr, "gc rig add: %v\n", err) //nolint:errcheck // best-effort stderr
-				return config.Rig{}, 1
+			if adoptPreservesDivergentBackend(cityPath, rigPath, stderr) {
+				// az-of4: the adopted rig already holds a store whose backend
+				// differs from this mysql city's. --adopt registers an existing
+				// store as-is; it must never re-point it. Skip the cascade so the
+				// rig keeps its own backend (a dolt rig under a mysql HQ is a
+				// supported topology via per-rig config).
+				deferred = false
+			} else {
+				deferred, err = initDirIfReady(cityPath, rigPath, prefix)
+				if err != nil {
+					fmt.Fprintf(stderr, "gc rig add: %v\n", err) //nolint:errcheck // best-effort stderr
+					return config.Rig{}, 1
+				}
 			}
 		}
 		w("  Adopted existing beads database")
@@ -961,6 +970,27 @@ func waitForRigStoreAccessible(cityPath, rigPath string, timeout time.Duration) 
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+// adoptPreservesDivergentBackend reports whether adopting rigPath under a mysql
+// city must preserve the rig's own backend instead of cascading the city's
+// mysql store over it (az-of4). It returns true only when the city is mysql
+// backed AND the adopted rig already declares a complete store with a different,
+// non-empty backend (e.g. dolt). When true, it warns on stderr. It returns false
+// for matching/empty backends so the normal adopt cascade (and ga-fg1ht3 type
+// registration) still runs. Scoped to --adopt on purpose: `gc beads city
+// use-mysql` intentionally converts rigs dolt->mysql and must not be blocked.
+func adoptPreservesDivergentBackend(cityPath, rigPath string, stderr io.Writer) bool {
+	if !cityUsesMySQLBackend(cityPath) {
+		return false
+	}
+	existing := scopeDeclaredBackend(rigPath)
+	if existing == "" || strings.EqualFold(existing, "mysql") {
+		return false
+	}
+	fmt.Fprintf(stderr, "gc rig add: --adopt: rig declares backend %q but city backend is mysql; "+ //nolint:errcheck // best-effort stderr
+		"preserving the rig's existing store (not cascading mysql over it)\n", existing)
+	return true
 }
 
 func prepareRigAdoptProviderState(cityPath, rigPath string) error {

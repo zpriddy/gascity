@@ -604,6 +604,28 @@ func cityUsesMySQLBackend(cityPath string) bool {
 	return strings.EqualFold(strings.TrimSpace(meta.Backend), "mysql")
 }
 
+// scopeDeclaredBackend returns the backend declared in scopeRoot/.beads/metadata.json
+// via a minimal raw read of the `backend` field (mirrors cityUsesMySQLBackend's
+// approach so callers in cascade paths don't pull in the strict contract
+// validator). Returns "" when the file is absent, unreadable, or declares no
+// backend.
+func scopeDeclaredBackend(scopeRoot string) string {
+	if strings.TrimSpace(scopeRoot) == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(scopeRoot, ".beads", "metadata.json"))
+	if err != nil {
+		return ""
+	}
+	var meta struct {
+		Backend string `json:"backend"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(meta.Backend)
+}
+
 func rawBeadsProviderForScope(scopeRoot, cityPath string) string {
 	runtimeCityPath := cityPath
 	if runtimeCityPath == "" {
